@@ -1,26 +1,31 @@
 """
-agents/unified_executor.py  (SAC refactor)
-──────────────────────────────────────────
-Thin execution layer that sits between the SAC agent and the environment.
+agents/unified_executor.py  (SAC refactor, MC-kNN temporal-exclusion patch)
+─────────────────────────────────────────────────────────────────────────────
+Thin execution layer that sits between the agent and the environment.
 
-What changed vs the World Model version:
-  REMOVED  — MCTSPlanner reference and 10-step rollout
-  REMOVED  — conviction filter (SAC's temperature handles decisiveness)
-  KEPT     — StateAggregator
-  KEPT     — position/PnL tracking and commission model
-  KEPT     — get_status() and get_state() signatures (live_unified.py compatible)
-  CHANGED  — step() calls agent.select_action() instead of planner.search_best_action()
+CHANGES IN THIS REVISION
+───────────────────────────
+step() accepts an optional `episode_id` kwarg. When supplied (training
+calls main_mcknn.py's run_epoch will pass it; eval/live calls leave it
+None), it is forwarded — along with the current `tick` — to
+agent.select_action() as query_tick/query_episode_id, enabling
+MCKNNMemory's temporal exclusion. For SACAgent this kwarg is simply
+unused (SACAgent.select_action doesn't accept it... see note below).
 
-Conviction filter note:
-  In the World Model you needed a hard 45% filter because entropy was
-  uncontrolled. SAC's temperature α regulates this automatically — when
-  the model is uncertain, α is high and probabilities are spread; when
-  confident, α is low and the argmax is clear. You can optionally re-add
-  a soft filter here (e.g., skip LONG/SHORT if max_prob < 0.35) once you
-  observe the trained conviction distribution, but don't hard-code it
-  during training or it corrupts the reward signal.
+Backward-compat note: SACAgent.select_action() does NOT have
+query_tick/query_episode_id/min_tick_gap parameters. To keep this
+executor usable for BOTH agent types without an isinstance check, the
+call below only passes the extra kwargs when episode_id is not None
+AND the agent advertises support for them (duck-typed via hasattr on
+the bound method's __code__ co_varnames — see _agent_supports_temporal_args).
+If the agent doesn't support them, they're silently dropped, so nothing
+changes for SAC.
+
+Everything else (position/PnL tracking, commission model, get_status())
+is unchanged from the prior revision.
 """
 
+import inspect
 import torch
 import numpy as np
 import collections
@@ -29,14 +34,24 @@ from agents.state_aggregator import StateAggregator
 COMMISSION = 0.00015  # Matches training — do not change without retraining
 MAX_HOLD_TICKS = 32
 
+
+def _agent_supports_temporal_args(agent) -> bool:
+    try:
+        params = inspect.signature(agent.select_action).parameters
+        return "query_tick" in params and "query_episode_id" in params
+    except (TypeError, ValueError):
+        return False
+
+
 class UnifiedExecutor:
     """
-    Wraps a SACAgent for step-by-step interaction with market data.
+    Wraps an agent (SACAgent or MCKNNAgent) for step-by-step interaction
+    with market data.
 
     Parameters
     ----------
     name        : identifier used for logging and checkpoint naming
-    agent       : SACAgent instance (already loaded/initialised)
+    agent       : agent instance (already loaded/initialised)
     paces       : pace tuple forwarded to StateAggregator (must match training)
     deterministic: use argmax policy (live) vs sampled policy (training)
     """
@@ -44,15 +59,16 @@ class UnifiedExecutor:
     def __init__(
         self,
         name:          str,
-        agent,                          # SACAgent — avoids circular import
+        agent,
         paces: tuple = (1, 4, 16, 64),
         deterministic: bool  = False,
-        num_indicators: int = 6, # Added num_indicators
+        num_indicators: int = 6,
     ):
         self.name          = name
         self.agent         = agent
-        self.aggregator    = StateAggregator(paces, num_indicators=num_indicators) # Pass num_indicators
+        self.aggregator    = StateAggregator(paces, num_indicators=num_indicators)
         self.deterministic = deterministic
+        self._agent_supports_temporal = _agent_supports_temporal_args(agent)
 
         # Position state
         self.inventory     = collections.deque(maxlen=1)
@@ -84,7 +100,7 @@ class UnifiedExecutor:
         return {"position": side_val, "unrealized_pnl": u_pnl}
 
     def get_state(self, indicators: np.ndarray, price: float) -> np.ndarray:
-        """Build and return the current 92-d state vector."""
+        """Build and return the current state vector."""
         self.aggregator.update(indicators)
         portfolio_info = self.portfolio_info(price)
         return self.aggregator.get_state(portfolio_info)
@@ -97,11 +113,27 @@ class UnifiedExecutor:
         else:
             return torch.tensor([False, False, True, True])  # in-pos: CLOSE or HOLD
 
-    def step(self, indicators, price, tick, epsilon=0.0):
+    def _select_action(self, state, deterministic, action_mask, episode_id):
+        """
+        Calls agent.select_action(), passing query_tick/query_episode_id
+        only if the agent actually supports them (MCKNNAgent does;
+        SACAgent does not) and only if the caller supplied an episode_id
+        (i.e. opted in to temporal exclusion — typically training calls
+        only, not live/eval).
+        """
+        if self._agent_supports_temporal and episode_id is not None:
+            return self.agent.select_action(
+                state, deterministic=deterministic, action_mask=action_mask,
+                query_tick=self.tick, query_episode_id=episode_id,
+            )
+        return self.agent.select_action(
+            state, deterministic=deterministic, action_mask=action_mask,
+        )
+
+    def step(self, indicators, price, tick, epsilon=0.0, episode_id=None):
         self.tick = tick
         state = self.get_state(indicators, price)
 
-        # In unified_executor.py, at the start of step():
         ATR_IDX = 4  # ATR_Scaled in the indicators array
         if self.current_side is None and abs(indicators[ATR_IDX]) > 2.0:
             self.last_probs = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
@@ -123,11 +155,9 @@ class UnifiedExecutor:
         if not self.deterministic and epsilon > 0 and np.random.random() < epsilon:
             valid_actions = mask.nonzero().squeeze(-1).tolist()
             action = np.random.choice(valid_actions)
-            _, probs = self.agent.select_action(state, deterministic=False)
+            _, probs = self._select_action(state, False, None, episode_id)
         else:
-            action, probs = self.agent.select_action(
-                state, deterministic=self.deterministic, action_mask=mask
-            )
+            action, probs = self._select_action(state, self.deterministic, mask, episode_id)
 
         self.last_probs = probs
         reward = self._execute(action, price)
@@ -144,14 +174,14 @@ class UnifiedExecutor:
             if self.current_side is None:
                 self.inventory.append(price * (1 + COMMISSION))
                 self.current_side = 'LONG'
-                self._entry_tick = self.tick  # always self.tick, never getattr fallback
+                self._entry_tick = self.tick
         elif action == 1:  # SHORT
             if self.current_side == 'LONG':
                 reward = self._close(price)
             if self.current_side is None:
                 self.inventory.append(price * (1 - COMMISSION))
                 self.current_side = 'SHORT'
-                self._entry_tick = self.tick  # same
+                self._entry_tick = self.tick
         elif action == 2:
             if self.current_side is not None:
                 reward = self._close(price)

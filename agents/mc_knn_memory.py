@@ -4,38 +4,39 @@ agents/mc_knn_memory.py
 Monte Carlo k-NN memory bank — the non-parametric analogue of DualCritic
 in critic.py.
 
-Mapping vs the SAC critic
-──────────────────────────
-  SAC critic.py            MC-kNN equivalent (this file)
-  ─────────────────────────────────────────────────────────────────────
-  QNetwork(state)->Q(s,a)  MCKNNMemory.query(state) -> per-action vote
-  DualCritic (Q1,Q2 min)   no bootstrapping; "Q" is replaced by stored
-                            ground-truth discounted returns from rollouts
-  forward() one pass       k-NN search over the memory bank (brute-force
-                            Euclidean — see distance metric note below)
-  min_q() pessimism        no min-of-two; pessimism instead comes from
-                            averaging neighbor returns rather than trusting
-                            a single nearest neighbor
+CHANGES IN THIS REVISION (fixes integrity-check findings)
+───────────────────────────────────────────────────────────
+1. TEMPORAL EXCLUSION (the main fix)
+   pre_training.py's diagnostic showed median nearest-neighbor distance
+   of 0.0 across the indicator-derived state stream — i.e. many states
+   are near-duplicates of other states close in time (flat/low-vol
+   stretches, slow-pace (42/90) windows barely moving tick-to-tick).
+   Combined with multi-epoch training over the same fixed historical
+   sequence, this meant a query at tick T could retrieve a neighbor
+   that is effectively "itself" from a few ticks away / a previous
+   epoch's pass over the same period — leaking the future outcome of
+   (almost) the same moment back into its own vote. This explains the
+   ~20-30x gap between train P/L (+2,348%) and val P/L (+79-135%).
 
-Why state-only storage, action as a column (not concatenated)?
-  Same reasoning as the SAC critic: discrete action spaces let us store
-  one state vector and tag it with whichever action was actually taken
-  at that tick, plus the realised MC return for that (state, action)
-  pair. A query returns a vote distribution over all 4 actions in one
-  k-NN search, mirroring the critic's one-forward-pass-per-state design.
+   Fix: every stored row now carries a `tick` (and `episode_id`).
+   query() accepts an optional `query_tick` / `query_episode_id` and
+   `min_tick_gap`; any stored row from the same episode whose tick is
+   within `min_tick_gap` of the query tick is excluded from voting.
+   This is opt-in (defaults preserve old behaviour when tick info is
+   not supplied) but commit_episode/query call sites have been updated
+   to always supply it — see episode_buffer.py and diagnostic_mcknn.py.
 
-Distance metric
-  Plain Euclidean distance on the raw 92-d state vector, unweighted.
-  Brute-force (no KD-tree/ball-tree) — simplest and correct; the memory
-  bank is bounded by periodic stratified pruning (see prune()) rather
-  than an indexing structure, so brute-force kNN remains tractable.
+2. CAPPED KERNEL WEIGHT (secondary fix)
+   The old inverse-distance kernel `1/(dist+EPS_DIST)` with
+   EPS_DIST=1e-3 let a single near-duplicate neighbor (dist≈0) produce
+   a weight ~1000x larger than a "normal" 10th-nearest neighbor
+   (median dist ≈ 3.4 in the pre-training diagnostic), i.e. roughly a
+   3,000:1 weight ratio for one vote vs the rest combined. Even with
+   temporal exclusion in place as the primary defence, this is capped
+   independently so a single neighbor — temporally distant or not —
+   can never dominate the vote by more than MAX_WEIGHT_RATIO.
 
-Vote aggregation
-  For each of the k nearest neighbors, weight = inverse-distance kernel
-  × sign-and-magnitude of that neighbor's stored MC return. Weights are
-  summed per action; the action with the highest summed weight wins.
-  This is the weighted-majority-vote design (vs argmax-of-mean-return,
-  vs full softmax) chosen for this refactor.
+3. Distance metric, vote aggregation, pruning: unchanged.
 """
 
 import numpy as np
@@ -46,8 +47,9 @@ EPS = 1e-8
 
 class MCKNNMemory:
     """
-    Growable bank of (state, action, mc_return) triples with k-NN query
-    and periodic stratified downsampling.
+    Growable bank of (state, action, mc_return, tick, episode_id) rows
+    with k-NN query, temporal-exclusion, capped-weight voting, and
+    periodic stratified downsampling.
 
     Unlike DualCritic this holds no learnable parameters — "training"
     means appending more (state, action, return) triples and occasionally
@@ -61,6 +63,9 @@ class MCKNNMemory:
         k: int = 25,
         max_size: int = 200_000,
         signal_threshold: float = 0.0005,
+        eps_dist: float = 1e-3,
+        max_weight_ratio: float = 50.0,
+        min_tick_gap: int = 0,
     ):
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -68,17 +73,34 @@ class MCKNNMemory:
         self.max_size = max_size
         self.signal_threshold = signal_threshold
 
+        # ── Kernel-weight cap config ────────────────────────────────────
+        # EPS_DIST is still a floor (anti-div-by-zero), but the dominant
+        # protection against any single neighbor swamping the vote is now
+        # max_weight_ratio: after computing raw inverse-distance kernel
+        # weights, we clip every weight to at most
+        # max_weight_ratio * median(weight) for that query, so a
+        # dist≈0 duplicate can outvote a "normal" neighbor by at most
+        # max_weight_ratio:1, not ~3,000:1.
+        self.eps_dist = eps_dist
+        self.max_weight_ratio = max_weight_ratio
+
+        # ── Temporal-exclusion default (can be overridden per query) ────
+        self.min_tick_gap = min_tick_gap
+
         # Pre-allocate growable arrays; track a logical size separately
         # from physical capacity to avoid per-append reallocation.
         self._cap = 4096
         self._size = 0
-        self.states  = np.zeros((self._cap, state_dim), dtype=np.float32)
-        self.actions = np.zeros(self._cap, dtype=np.int64)
-        self.returns = np.zeros(self._cap, dtype=np.float32)
+        self.states     = np.zeros((self._cap, state_dim), dtype=np.float32)
+        self.actions    = np.zeros(self._cap, dtype=np.int64)
+        self.returns    = np.zeros(self._cap, dtype=np.float32)
+        self.ticks      = np.zeros(self._cap, dtype=np.int64)
+        self.episode_id = np.zeros(self._cap, dtype=np.int64)
 
         # Diagnostics
         self.n_commits = 0
         self.n_prunes  = 0
+        self._next_episode_id = 0
 
     # ── Capacity management ────────────────────────────────────────────────
 
@@ -86,41 +108,69 @@ class MCKNNMemory:
         if self._size + min_extra <= self._cap:
             return
         new_cap = max(self._cap * 2, self._size + min_extra)
-        new_states  = np.zeros((new_cap, self.state_dim), dtype=np.float32)
-        new_actions = np.zeros(new_cap, dtype=np.int64)
-        new_returns = np.zeros(new_cap, dtype=np.float32)
-        new_states[:self._size]  = self.states[:self._size]
-        new_actions[:self._size] = self.actions[:self._size]
-        new_returns[:self._size] = self.returns[:self._size]
+        new_states     = np.zeros((new_cap, self.state_dim), dtype=np.float32)
+        new_actions    = np.zeros(new_cap, dtype=np.int64)
+        new_returns    = np.zeros(new_cap, dtype=np.float32)
+        new_ticks      = np.zeros(new_cap, dtype=np.int64)
+        new_episode_id = np.zeros(new_cap, dtype=np.int64)
+        new_states[:self._size]     = self.states[:self._size]
+        new_actions[:self._size]    = self.actions[:self._size]
+        new_returns[:self._size]    = self.returns[:self._size]
+        new_ticks[:self._size]      = self.ticks[:self._size]
+        new_episode_id[:self._size] = self.episode_id[:self._size]
         self.states, self.actions, self.returns = new_states, new_actions, new_returns
+        self.ticks, self.episode_id = new_ticks, new_episode_id
         self._cap = new_cap
 
     def __len__(self) -> int:
         return self._size
 
-    # ── Commit: bulk-insert a full episode's worth of (s, a, G) ─────────────
+    # ── Commit: bulk-insert a full episode's worth of (s, a, G, tick) ───────
 
     def commit_episode(
         self,
         states: np.ndarray,
         actions: np.ndarray,
         mc_returns: np.ndarray,
+        ticks: np.ndarray = None,
+        episode_id: int = None,
     ):
         """
-        Append an entire episode's backfilled (state, action, G_t) triples
-        in one call. This is the kNN analogue of replay_buffer.push() but
-        operates on whole episodes since full-episode MC returns require
-        the episode to have already finished and been backfilled (see
-        episode_buffer.py).
+        Append an entire episode's backfilled (state, action, G_t, tick)
+        rows in one call.
+
+        ticks       : per-row tick index within the episode. If None,
+                      falls back to 0..n-1 (positional) — temporal
+                      exclusion still works in this fallback, it just
+                      assumes rows were committed in tick order, which
+                      is always true since EpisodeBuffer.add() appends
+                      sequentially.
+        episode_id  : integer episode tag. If None, an auto-incrementing
+                      id is assigned so two different commit_episode()
+                      calls are never treated as the same episode
+                      (important: cross-episode temporal exclusion is
+                      NOT intended — only "this happened a few ticks
+                      ago in the SAME pass" should be excluded; states
+                      from a different historical period that happen to
+                      be numerically similar are legitimate signal).
         """
         n = len(states)
         if n == 0:
             return
+        if episode_id is None:
+            episode_id = self._next_episode_id
+        self._next_episode_id = max(self._next_episode_id, episode_id + 1)
+
+        if ticks is None:
+            ticks = np.arange(n, dtype=np.int64)
+
         self._grow(n)
         s = slice(self._size, self._size + n)
-        self.states[s]  = states.astype(np.float32)
-        self.actions[s] = actions.astype(np.int64)
-        self.returns[s] = mc_returns.astype(np.float32)
+        self.states[s]     = states.astype(np.float32)
+        self.actions[s]    = actions.astype(np.int64)
+        self.returns[s]    = mc_returns.astype(np.float32)
+        self.ticks[s]      = np.asarray(ticks, dtype=np.int64)
+        self.episode_id[s] = episode_id
         self._size += n
         self.n_commits += 1
 
@@ -148,10 +198,6 @@ class MCKNNMemory:
         signal_idx = np.flatnonzero(signal_mask)
         noise_idx  = np.flatnonzero(~signal_mask)
 
-        # Target composition: up to half signal, remainder noise — same
-        # 50/50 signal/noise spirit as ReplayBuffer.sample()'s n_signal /
-        # n_noise split, but applied to what we KEEP rather than what we
-        # sample for a batch.
         n_signal_keep = min(len(signal_idx), target_size // 2)
         n_noise_keep  = target_size - n_signal_keep
 
@@ -166,69 +212,107 @@ class MCKNNMemory:
         keep_idx = np.concatenate([keep_signal, keep_noise])
         keep_idx.sort()
 
-        self.states[:len(keep_idx)]  = self.states[keep_idx]
-        self.actions[:len(keep_idx)] = self.actions[keep_idx]
-        self.returns[:len(keep_idx)] = self.returns[keep_idx]
+        self.states[:len(keep_idx)]     = self.states[keep_idx]
+        self.actions[:len(keep_idx)]    = self.actions[keep_idx]
+        self.returns[:len(keep_idx)]    = self.returns[keep_idx]
+        self.ticks[:len(keep_idx)]      = self.ticks[keep_idx]
+        self.episode_id[:len(keep_idx)] = self.episode_id[keep_idx]
         self._size = len(keep_idx)
         self.n_prunes += 1
 
     # ── k-NN query ────────────────────────────────────────────────────────
 
-    def query(self, state: np.ndarray, k: int = None, action_mask=None):
+    def query(self, state: np.ndarray, k: int = None, action_mask=None,
+              query_tick: int = None, query_episode_id: int = None,
+              min_tick_gap: int = None):
         """
         Find the k nearest neighbors (plain Euclidean, unweighted) to
-        `state` and return a weighted-majority-vote distribution over
-        actions plus diagnostic info.
+        `state`, EXCLUDING any stored row from the same episode whose
+        tick lies within `min_tick_gap` of `query_tick` (temporal
+        exclusion — see module docstring), then return a capped-weight
+        majority-vote distribution over actions plus diagnostic info.
+
+        Parameters
+        ----------
+        query_tick, query_episode_id, min_tick_gap
+            Optional. If query_tick/query_episode_id are None, no
+            temporal exclusion is applied (back-compatible with old
+            callers). min_tick_gap defaults to self.min_tick_gap when
+            not supplied.
 
         Returns
         -------
         action      : int, the winning action (highest vote weight)
         vote_probs  : np.ndarray (action_dim,), vote-share per action
-                      (sums to 1; NOT a calibrated softmax — see note in
-                      mc_knn_policy.py). Populates the same `probs` slot
-                      that Actor.act() used to fill, so live.py's
-                      probability bars keep working unmodified.
+                      (sums to 1; NOT a calibrated softmax).
         info        : dict with neighbor_returns, neighbor_actions,
-                      neighbor_dists, vote_margin (winner minus runner-up
-                      weight, used by diagnostics as the kNN analogue of
-                      critic disagreement)
+                      neighbor_dists, vote_margin, vote_raw,
+                      n_excluded_temporal (diagnostic: how many bank
+                      rows were excluded by the temporal filter — useful
+                      for spotting whether the filter is actually doing
+                      anything on a given dataset).
         """
         if k is None:
             k = self.k
+        if min_tick_gap is None:
+            min_tick_gap = self.min_tick_gap
+
         if self._size == 0:
-            # No data yet — caller should fall back to a safe default
-            # (HOLD), exactly as the cold-start case for SAC's actor
-            # before any training would also be near-uniform.
             probs = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
             return 3, probs, {
                 "neighbor_returns": np.array([]),
                 "neighbor_actions": np.array([]),
                 "neighbor_dists":   np.array([]),
                 "vote_margin": 0.0,
+                "vote_raw": np.zeros(self.action_dim),
+                "n_excluded_temporal": 0,
             }
 
-        k = min(k, self._size)
-        diffs = self.states[:self._size] - state[None, :]
+        # ── Build the candidate pool, applying temporal exclusion ────────
+        valid = np.ones(self._size, dtype=bool)
+        n_excluded = 0
+        if (query_tick is not None and query_episode_id is not None
+                and min_tick_gap > 0):
+            same_ep = self.episode_id[:self._size] == query_episode_id
+            too_close = np.abs(self.ticks[:self._size] - query_tick) < min_tick_gap
+            excluded = same_ep & too_close
+            n_excluded = int(excluded.sum())
+            valid &= ~excluded
+
+        cand_idx_all = np.flatnonzero(valid)
+        if len(cand_idx_all) == 0:
+            # Degenerate case: everything excluded (e.g. tiny bank +
+            # large min_tick_gap) — fall back to using the full bank
+            # rather than returning a meaningless cold-start HOLD.
+            cand_idx_all = np.arange(self._size)
+            n_excluded = 0
+
+        k_eff = min(k, len(cand_idx_all))
+        cand_states = self.states[cand_idx_all]
+        diffs = cand_states - state[None, :]
         dists = np.sqrt(np.sum(diffs * diffs, axis=1))
 
-        nn_idx = np.argpartition(dists, k - 1)[:k]
-        # sort the k by distance (argpartition doesn't guarantee order)
-        nn_idx = nn_idx[np.argsort(dists[nn_idx])]
+        nn_local = np.argpartition(dists, k_eff - 1)[:k_eff]
+        nn_local = nn_local[np.argsort(dists[nn_local])]
+        nn_idx   = cand_idx_all[nn_local]
 
-        nn_dists   = dists[nn_idx]
+        nn_dists   = dists[nn_local]
         nn_actions = self.actions[nn_idx]
         nn_returns = self.returns[nn_idx]
 
-        # Inverse-distance kernel weight; EPS_DIST is a floor (not just an
-        # anti-div-by-zero epsilon) so a near-duplicate neighbor doesn't
-        # produce an exploding weight that swamps every other neighbor's
-        # vote. Without this floor, vote_margin can blow up to ~1/EPS
-        # whenever a live state nearly matches a stored one (e.g. a flat
-        # market repeating indicator values) — this was caught by an
-        # end-to-end smoke test producing vote_margin ~6e8 on synthetic
-        # data with repeated near-identical states.
-        EPS_DIST = 1e-3
-        kernel_w = 1.0 / (nn_dists + EPS_DIST)
+        # ── Inverse-distance kernel with a capped weight ratio ───────────
+        # Raw kernel weight (floor still present for numerical safety),
+        # then clipped so no single neighbor's |weight| can exceed
+        # max_weight_ratio times the median |weight| among this query's
+        # neighbors. This bounds the influence of any one neighbor —
+        # whether it's a near-duplicate from temporal leakage we failed
+        # to exclude, or a legitimate but unusually close historical
+        # match — to a sane multiple of a "typical" neighbor's say.
+        kernel_w = 1.0 / (nn_dists + self.eps_dist)
+        med_w = np.median(kernel_w) + EPS
+        cap = self.max_weight_ratio * med_w
+        kernel_w = np.minimum(kernel_w, cap)
+
         vote_weight = kernel_w * nn_returns   # signed: losing trades vote AGAINST that action
 
         vote = np.zeros(self.action_dim, dtype=np.float64)
@@ -238,13 +322,9 @@ class MCKNNMemory:
                 vote[a] = vote_weight[mask].sum()
 
         if action_mask is not None:
-            # action_mask is a bool tensor/array, True = valid.
             invalid = ~np.asarray(action_mask, dtype=bool)
             vote[invalid] = -np.inf
 
-        # Convert raw signed vote weights into a non-negative vote-share
-        # distribution for display purposes (mirrors probs shape from
-        # Actor.act()) without claiming probabilistic calibration.
         finite_vote = np.where(np.isfinite(vote), vote, 0.0)
         shifted = finite_vote - finite_vote.min() + EPS
         if action_mask is not None:
@@ -264,6 +344,7 @@ class MCKNNMemory:
             "neighbor_dists":   nn_dists,
             "vote_margin":      vote_margin,
             "vote_raw":         vote,
+            "n_excluded_temporal": n_excluded,
         }
         return action, vote_probs.astype(np.float32), info
 
@@ -275,13 +356,19 @@ class MCKNNMemory:
             states=self.states[:self._size],
             actions=self.actions[:self._size],
             returns=self.returns[:self._size],
+            ticks=self.ticks[:self._size],
+            episode_id=self.episode_id[:self._size],
             state_dim=self.state_dim,
             action_dim=self.action_dim,
             k=self.k,
             max_size=self.max_size,
             signal_threshold=self.signal_threshold,
+            eps_dist=self.eps_dist,
+            max_weight_ratio=self.max_weight_ratio,
+            min_tick_gap=self.min_tick_gap,
             n_commits=self.n_commits,
             n_prunes=self.n_prunes,
+            next_episode_id=self._next_episode_id,
         )
 
     @classmethod
@@ -293,13 +380,29 @@ class MCKNNMemory:
             k=int(data["k"]),
             max_size=int(data["max_size"]),
             signal_threshold=float(data["signal_threshold"]),
+            eps_dist=float(data["eps_dist"]) if "eps_dist" in data else 1e-3,
+            max_weight_ratio=float(data["max_weight_ratio"]) if "max_weight_ratio" in data else 50.0,
+            min_tick_gap=int(data["min_tick_gap"]) if "min_tick_gap" in data else 0,
         )
         n = len(data["states"])
         mem._grow(n)
         mem.states[:n]  = data["states"]
         mem.actions[:n] = data["actions"]
         mem.returns[:n] = data["returns"]
+        if "ticks" in data:
+            mem.ticks[:n] = data["ticks"]
+        else:
+            # Loading an old checkpoint saved before this revision —
+            # we have no real tick info, so temporal exclusion simply
+            # won't fire for this legacy data (min_tick_gap default 0
+            # at query time keeps behaviour identical until retrained).
+            mem.ticks[:n] = 0
+        if "episode_id" in data:
+            mem.episode_id[:n] = data["episode_id"]
+        else:
+            mem.episode_id[:n] = -1  # never matches any live query_episode_id
         mem._size = n
         mem.n_commits = int(data["n_commits"])
         mem.n_prunes  = int(data["n_prunes"])
+        mem._next_episode_id = int(data["next_episode_id"]) if "next_episode_id" in data else 0
         return mem

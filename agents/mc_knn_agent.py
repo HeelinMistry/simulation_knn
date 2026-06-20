@@ -4,47 +4,15 @@ agents/mc_knn_agent.py
 Top-level agent object — drop-in structural replacement for
 agents/sac_agent.py's SACAgent.
 
-Mapping vs sac_agent.py
-──────────────────────────
-  SACAgent.__init__(state_dim, action_dim, hidden_dim, lr_actor,        MCKNNAgent.__init__ takes
-    lr_critic, gamma, tau, target_entropy, device)                      state_dim, action_dim, k,
-                                                                          max_size, gamma — no
-                                                                          learning rates, tau, or
-                                                                          target_entropy since there
-                                                                          is nothing to anneal.
-  SACAgent.select_action(state, deterministic, action_mask)             MCKNNAgent.select_action
-                                                                          — IDENTICAL signature.
-  SACAgent.update(replay_buffer, batch_size)                            MCKNNAgent.update(episode_
-                                                                          buffer) — called once per
-                                                                          EPISODE (at episode end),
-                                                                          not once per N ticks,
-                                                                          because MC returns need
-                                                                          the full episode first.
-  SACAgent.save(path, replay_buffer)                                    MCKNNAgent.save(path) —
-                                                                          saves the memory bank
-                                                                          (.npz) instead of network
-                                                                          weights (.pt).
-  SACAgent.load(path, replay_buffer)                                    MCKNNAgent.load(path) —
-                                                                          loads the memory bank.
-  SACAgent.actor / SACAgent.critic attributes used directly by          MCKNNAgent.actor exposes a
-    diagnostic.py / live.py (agent.critic(s) for Q-values, etc.)         thin compatibility shim;
-                                                                          MCKNNAgent.critic raises
-                                                                          NotImplementedError with a
-                                                                          clear message pointing at
-                                                                          the kNN-analogue
-                                                                          diagnostics instead, since
-                                                                          there is no Q-network.
-  SACAgent.training_steps, last_alpha, last_entropy, etc.                MCKNNAgent exposes
-                                                                          analogous diagnostics:
-                                                                          n_episodes_committed,
-                                                                          last_vote_margin, bank_size,
-                                                                          last_n_prunes — same
-                                                                          "diagnostics bookkeeping"
-                                                                          spirit, different fields.
-
-No actor/critic optimisers, no entropy temperature, no target network —
-none of that machinery exists for a memory-based method, so those
-attributes are simply absent rather than stubbed.
+CHANGES IN THIS REVISION
+───────────────────────────
+__init__ now accepts and forwards eps_dist / max_weight_ratio /
+min_tick_gap to MCKNNMemory (see mc_knn_memory.py docstring for what
+each one fixes). select_action() accepts optional query_tick /
+query_episode_id / min_tick_gap and forwards them to the policy/memory
+so the caller (unified_executor.py / main_mcknn.py) can opt in to
+temporal exclusion during training without changing the public
+select_action signature's required arguments.
 """
 
 import os
@@ -63,6 +31,9 @@ class MCKNNAgent:
         max_size:   int = 200_000,
         gamma:      float = 0.97,
         signal_threshold: float = 0.0005,
+        eps_dist: float = 1e-3,
+        max_weight_ratio: float = 50.0,
+        min_tick_gap: int = 100,
         device: str = None,   # accepted, unused — keeps call sites unchanged
     ):
         self.state_dim  = state_dim
@@ -73,6 +44,8 @@ class MCKNNAgent:
         self.memory = MCKNNMemory(
             state_dim=state_dim, action_dim=action_dim,
             k=k, max_size=max_size, signal_threshold=signal_threshold,
+            eps_dist=eps_dist, max_weight_ratio=max_weight_ratio,
+            min_tick_gap=min_tick_gap,
         )
         self.actor = MCKNNPolicy(self.memory, action_dim=action_dim)
 
@@ -84,6 +57,7 @@ class MCKNNAgent:
 
         print(f"[MCKNNAgent] state_dim={state_dim} action_dim={action_dim} "
               f"k={k} max_size={max_size:,} gamma={gamma}  "
+              f"max_weight_ratio={max_weight_ratio} min_tick_gap={min_tick_gap}  "
               f"(no GPU/optimiser — memory bank only)")
 
     # ── critic shim: explicit failure instead of silent wrong behaviour ─────
@@ -97,12 +71,16 @@ class MCKNNAgent:
             "the kNN-analogue replacements."
         )
 
-    # ── Public API — matches SACAgent.select_action exactly ─────────────────
+    # ── Public API — matches SACAgent.select_action, plus optional temporal args ──
 
     def select_action(self, state: np.ndarray, deterministic: bool = False,
-                      action_mask=None):
-        return self.actor.act(state, deterministic=deterministic,
-                              device=self.device, action_mask=action_mask)
+                      action_mask=None, query_tick: int = None,
+                      query_episode_id: int = None, min_tick_gap: int = None):
+        return self.actor.act(
+            state, deterministic=deterministic, device=self.device,
+            action_mask=action_mask, query_tick=query_tick,
+            query_episode_id=query_episode_id, min_tick_gap=min_tick_gap,
+        )
 
     # ── Update — called once per finished episode, not once per N ticks ─────
 
@@ -125,8 +103,6 @@ class MCKNNAgent:
 
     def save(self, path: str = "outcomes/mc_knn_agent.npz", episode_buffer=None):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        # episode_buffer is accepted (mirrors SACAgent.save's replay_buffer
-        # kwarg) but normally empty at save time since update() flushes it.
         if episode_buffer is not None and len(episode_buffer) > 0:
             episode_buffer.end_episode_and_commit(self.memory)
         self.memory.save(path)

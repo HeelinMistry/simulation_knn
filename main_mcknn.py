@@ -31,6 +31,20 @@ Structural diff vs main_sac.py
 
 Year-boundary safety, reward shaping (compute_shaped_reward) — identical
 to main_sac.py, copied verbatim, since both are algorithm-agnostic.
+
+INTEGRITY-CHECK FIX (this revision)
+─────────────────────────────────────
+A pre-training diagnostic found near-zero nearest-neighbor distances
+among states (flat/low-vol stretches + slow 42/90 paces barely moving
+tick-to-tick), and since `episode_buffer` is a single long-lived object
+reused across every training epoch, a query at tick i in epoch N+1
+could retrieve a memory-bank row committed at tick i (or a few ticks
+away) in epoch N — voting on essentially its own near-future outcome.
+This explained a ~20-30x train/val P/L gap. Fixed via MIN_TICK_GAP
+(temporal exclusion in MCKNNMemory.query, keyed on the buffer's stable
+episode_id) and MAX_WEIGHT_RATIO (caps how much any single neighbor's
+inverse-distance kernel weight can dominate a vote). See
+mc_knn_memory.py / episode_buffer.py docstrings for full detail.
 """
 
 import time
@@ -74,6 +88,26 @@ BANK_MAX_SIZE    = 200_000      # memory bank cap before stratified pruning kick
 K_NEIGHBORS      = 25
 GAMMA            = 0.97
 SIGNAL_THRESHOLD = 0.0005       # matches replay_buffer.py's SIGNAL_THRESHOLD
+
+# ── Integrity-check fixes (see mc_knn_memory.py docstring) ───────────────────
+# MIN_TICK_GAP: a query at tick i excludes any same-episode bank row whose
+#   tick is within this many ticks of i. Pre-training's diagnostic found
+#   near-zero nearest-neighbor distances (median NN dist = 0.0) driven by
+#   flat/low-vol stretches and the slow 42/90 paces barely changing
+#   tick-to-tick, and combined with multi-epoch training over the same
+#   fixed historical sequence this meant a query could vote on what was
+#   essentially its own future outcome. 100 ticks (~16.7 days at 4h candles)
+#   comfortably covers the slowest pace (90) plus its window, so a
+#   "genuinely different market moment" can still be found just outside
+#   this gap while ticks close enough to be near-duplicates are excluded.
+MIN_TICK_GAP     = 100
+# MAX_WEIGHT_RATIO: caps any single neighbor's kernel weight at this
+#   multiple of the median neighbor weight for a given query, so even a
+#   near-zero-distance neighbor that slips past temporal exclusion (e.g.
+#   a genuine repeat pattern from a different historical period) can't
+#   single-handedly dominate the vote the way the old uncapped
+#   1/(dist+1e-3) kernel allowed (~3,000:1 observed in practice).
+MAX_WEIGHT_RATIO = 50.0
 
 # Logging
 LOG_EVERY_TICKS  = 500
@@ -162,7 +196,21 @@ def run_epoch(executor: UnifiedExecutor, df: pd.DataFrame,
         price      = prices_arr[i]
 
         action, probs, realised_pnl, s_t = executor.step(
-            indicators, price, tick=i, epsilon=epsilon
+            indicators, price, tick=i, epsilon=epsilon,
+            # Pass the episode_buffer's stable id only during TRAINING
+            # passes. This is what lets MCKNNMemory's temporal exclusion
+            # work: as long as `episode_buffer` is the same long-lived
+            # object reused across epochs (it is — see main(), it's
+            # constructed once outside the epoch loop) and
+            # EpisodeBuffer.end_episode_and_commit() keeps the id stable
+            # across commits, a query at tick i in epoch N+1 will
+            # correctly exclude the row committed at tick i (or nearby)
+            # in epoch N, closing the leak identified in the integrity
+            # check. Val passes intentionally pass None: they never
+            # write to the memory bank (train=False), so there's nothing
+            # for them to leak into, and they SHOULD be allowed to query
+            # whatever the bank already contains without exclusion.
+            episode_id=(episode_buffer.episode_id if train else None),
         )
 
         action_counts[action] += 1
@@ -246,6 +294,7 @@ def main():
         state_dim=STATE_DIM, action_dim=ACTION_DIM,
         k=K_NEIGHBORS, max_size=BANK_MAX_SIZE, gamma=GAMMA,
         signal_threshold=SIGNAL_THRESHOLD,
+        min_tick_gap=MIN_TICK_GAP, max_weight_ratio=MAX_WEIGHT_RATIO,
     )
     agent.load(CHECKPOINT_PATH)
 

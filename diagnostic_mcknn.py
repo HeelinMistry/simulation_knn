@@ -1396,3 +1396,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# python diagnostic_mcknn.py --split val --checkpoint outcomes/mc_knn_agent_best.npz

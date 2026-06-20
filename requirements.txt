@@ -5,3 +5,5 @@ matplotlib
 arcade
 requests
 torch
+scipy
+binance-bulk-downloader
