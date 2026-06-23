@@ -5,8 +5,8 @@ Monte Carlo k-NN "actor" — drop-in replacement for models/actor.py's
 Actor class, with the same act()/get_action() call signature so
 unified_executor.py needs minimal edits.
 
-CHANGES IN THIS REVISION
-───────────────────────────
+REVISION 2 — TEMPORAL EXCLUSION FIX
+────────────────────────────────────────
 get_action()/act() now accept optional query_tick / query_episode_id /
 min_tick_gap kwargs and simply forward them to MCKNNMemory.query() —
 see mc_knn_memory.py and episode_buffer.py docstrings for why this

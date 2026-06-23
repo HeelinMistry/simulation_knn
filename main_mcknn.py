@@ -3,50 +3,69 @@ main_mcknn.py
 ─────────────
 Headless training loop for the Monte Carlo k-NN trading agent.
 
-Structural diff vs main_sac.py
+REVISION HISTORY (high level)
 ────────────────────────────────
-  KEPT IDENTICAL: candle timeframe, epoch structure (one epoch = one full
-    pass through train_df), regime-balanced val split (2022 bear + 2025
-    mixed), directional-collapse / bear-floor saving criteria, SHORT
-    collapse hard-stop, early-stopping patience logic, epoch print format,
-    one-step-lag reward bookkeeping pattern.
+  v1: structural port of main_sac.py to MCKNNAgent/EpisodeBuffer.
+  v2: MIN_TICK_GAP + MAX_WEIGHT_RATIO fix for same-pass near-duplicate
+      voting (see mc_knn_memory.py).
+  v3 (THIS REVISION): two further integrity-check fixes —
 
-  CHANGED: ReplayBuffer -> EpisodeBuffer (per-episode, not per-step).
-  CHANGED: agent.update(replay_buffer, batch_size) called every
-    UPDATE_EVERY ticks  →  agent.update(episode_buffer) called ONCE per
-    epoch, after the full pass, because true full-episode MC returns
-    can't be computed mid-episode (see episode_buffer.py docstring).
-  CHANGED: UPDATES_PER_STEP, BATCH_SIZE, LR, TAU, lr_actor/lr_critic,
-    target_entropy — all removed; nothing to tune since there's no
-    gradient descent. Replaced by K (neighbors) and BUFFER_CAPACITY
-    (memory bank max_size) as the new tunable knobs.
-  CHANGED: epsilon-greedy schedule kept (EPSILON_START/END/DECAY) since
-    unified_executor.py's epsilon branch is unchanged and still useful
-    for diversifying which (state, action) pairs get stored in the bank
-    during training, even though there's no entropy-driven exploration
-    pressure anymore.
-  REMOVED: agent.last_alpha / last_entropy / last_critic_loss /
-    last_actor_loss prints — replaced with agent.last_bank_size /
-    n_episodes_committed / last_n_prunes, the kNN-analogue diagnostics.
+  1. PURGED + EMBARGOED WALK-FORWARD CV (walkforward.py)
+     The old VAL_YEARS=[2022, 2025] split is a hard calendar boundary,
+     but several features (rolling(200) indicators, pace-90 aggregator
+     history) are NOT memoryless across that boundary — a val-window
+     state can statistically depend on train-window data a few weeks
+     earlier. MIN_TICK_GAP doesn't fix this: it only stops a query from
+     voting on a near-duplicate of itself committed during the SAME
+     training pass, not from training on data whose feature windows
+     overlap the val window at all.
 
-Year-boundary safety, reward shaping (compute_shaped_reward) — identical
-to main_sac.py, copied verbatim, since both are algorithm-agnostic.
+     Fix: generate_purged_folds() carves the full 2019-2026 dataset
+     into several walk-forward folds, each with a purge buffer removed
+     from train immediately before the val window and an embargo
+     buffer removed immediately after it, sized to the worst-case
+     feature lookback across ALL timeframes in use. We now run a
+     cross-validation pass across these folds (fresh agent per fold,
+     short training run) and report the DISTRIBUTION of val P/L across
+     folds — a single number from one split told us nothing about
+     whether performance was a property of the strategy or of one
+     historical path; a spread across independent folds does.
 
-INTEGRITY-CHECK FIX (this revision)
-─────────────────────────────────────
-A pre-training diagnostic found near-zero nearest-neighbor distances
-among states (flat/low-vol stretches + slow 42/90 paces barely moving
-tick-to-tick), and since `episode_buffer` is a single long-lived object
-reused across every training epoch, a query at tick i in epoch N+1
-could retrieve a memory-bank row committed at tick i (or a few ticks
-away) in epoch N — voting on essentially its own near-future outcome.
-This explained a ~20-30x train/val P/L gap. Fixed via MIN_TICK_GAP
-(temporal exclusion in MCKNNMemory.query, keyed on the buffer's stable
-episode_id) and MAX_WEIGHT_RATIO (caps how much any single neighbor's
-inverse-distance kernel weight can dominate a vote). See
-mc_knn_memory.py / episode_buffer.py docstrings for full detail.
+     The final DEPLOYABLE checkpoint is then trained the same way as
+     before (full epoch loop, early stopping, directional/bear-floor
+     saving criteria) but using the LAST fold's purge/val/embargo
+     layout for its validation signal, so even the production model's
+     val metric is leak-free.
+
+  2. MULTI-TIMEFRAME HIERARCHICAL CONTEXT (multi_timeframe_state.py)
+     Optional 15m/1h context vectors, precomputed and aligned onto the
+     4h decision timeline with a strict no-lookahead guard, concatenated
+     into the state via UnifiedExecutor's new `extra_context` param.
+     This both uses the finer-grained data available and reduces the
+     near-duplicate-state density that the pre_training.py diagnostic
+     flagged, since flat/quiet 4h stretches don't have to look flat on
+     the 15m/1h signal too.
+
+Everything NOT explicitly mentioned above (epoch structure, one-step-lag
+reward bookkeeping, SHORT collapse hard-stop, episode-level MC return
+backfill via agent.update(), epsilon-greedy schedule) is unchanged from
+the prior revision.
+
+RAW DATA LAYOUT (this revision)
+───────────────────────────────────
+data/raw/ is now organized per-timeframe:
+    data/raw/15m/*.csv
+    data/raw/1h/*.csv
+    data/raw/4h/*.csv
+Each folder holds plain (already-extracted) Binance-kline CSVs covering
+that timeframe's full history. data_manager.update_master_data(timeframe)
+/ update_all_timeframes() merge + compute indicators for each into
+data/processed/XRPUSDT_<timeframe>_master_processed.csv. Unlike the old
+zip-based flow, these plain CSVs are NEVER deleted by the pipeline — see
+data/preprocessing.py / data/data_manager.py docstrings.
 """
 
+import os
 import time
 
 import numpy as np
@@ -55,7 +74,9 @@ import pandas as pd
 from agents.episode_buffer import EpisodeBuffer
 from agents.mc_knn_agent import MCKNNAgent
 from agents.unified_executor import UnifiedExecutor
-from data.data_manager import update_master_data
+from data.data_manager import update_master_data, update_all_timeframes
+from walkforward import generate_purged_folds, compute_required_lookback_ticks, summarize_folds
+from multi_timeframe_state import build_multi_timeframe_context
 
 # ─────────────────────────────────────────────
 # Configuration
@@ -67,14 +88,46 @@ BEST_PATH        = "outcomes/mc_knn_agent_best.npz"
 FEATURES   = ["RSI_Scaled", "MACD_Scaled", "BB_Scaled",
               "OBV_Scaled", "ATR_Scaled", "MeanDev_Scaled"]
 PACES      = (1, 6, 42, 90)
-STATE_DIM  = (len(FEATURES) * 2 * len(PACES)) + 2
 ACTION_DIM = 4
 
-# ── Regime-balanced split — must match diagnostic_mcknn.py exactly ───────────
-VAL_YEARS   = [2022, 2025]   # bear + recent out-of-sample
-BEAR_YEAR   = 2022
+# ── Multi-timeframe context (optional — set ENABLE_MULTI_TIMEFRAME=False
+#    to fall back to the original 4h-only state, e.g. if 15m/1h raw data
+#    isn't available yet).
+#
+#    Raw data layout (data_manager.py): data/raw/15m/*.csv,
+#    data/raw/1h/*.csv, data/raw/4h/*.csv — each folder holds plain CSV
+#    files covering that timeframe's full history. update_all_timeframes()
+#    merges + computes indicators for each into the paths below. ──────────
+ENABLE_MULTI_TIMEFRAME = True
+PRIMARY_TIMEFRAME = "4h"
+CONTEXT_TIMEFRAMES = ("15m", "1h")
+TIMEFRAME_MASTER_CSVS = {
+    tf: f"data/processed/XRPUSDT_{tf}_master_processed.csv"
+    for tf in CONTEXT_TIMEFRAMES
+}
+CONTEXT_PACES = (1, 4, 16)   # smaller/fewer than the primary 4h PACES —
+                             # context blocks capture intraday texture,
+                             # not a second copy of the slow trend view
 
-# Training hyperparameters
+CONTEXT_DIM_PER_TIMEFRAME = len(FEATURES) * 2 * len(CONTEXT_PACES)
+N_CONTEXT_TIMEFRAMES = len(TIMEFRAME_MASTER_CSVS) if ENABLE_MULTI_TIMEFRAME else 0
+STATE_DIM_WITH_CONTEXT    = (len(FEATURES) * 2 * len(PACES)) \
+                            + (N_CONTEXT_TIMEFRAMES * CONTEXT_DIM_PER_TIMEFRAME) + 2
+STATE_DIM_WITHOUT_CONTEXT = (len(FEATURES) * 2 * len(PACES)) + 2
+
+# Resolved once at runtime in main() depending on whether the 15m/1h
+# master CSVs were actually found — see main() for the fallback logic.
+STATE_DIM = STATE_DIM_WITH_CONTEXT if ENABLE_MULTI_TIMEFRAME else STATE_DIM_WITHOUT_CONTEXT
+
+# ── Walk-forward CV configuration (replaces VAL_YEARS hard split) ───────────
+N_CV_FOLDS        = 6
+CV_EPOCHS         = 3     # short training run per fold — CV is for measuring
+                          # robustness of the APPROACH, not for producing a
+                          # deployable checkpoint (that happens separately,
+                          # see run_final_training())
+MIN_TRAIN_TICKS   = 1000
+
+# Training hyperparameters (final/deployable run)
 NUM_EPOCHS       = 100
 WARMUP_IDX       = 128          # aggregator warm-up rows (= max_pace × max_history)
 
@@ -82,31 +135,14 @@ PATIENCE         = 1            # epochs without improvement before stopping
 WARMUP_EPOCHS    = 2
 MIN_IMPROVE      = 0.005        # val PnL must improve by 0.5 pp to reset patience
 
-# ── MC-kNN specific knobs (replace BUFFER_CAPACITY/BATCH_SIZE/LR/GAMMA/TAU
-#    tuning surface from SAC; gamma is kept since MC returns still discount) ──
-BANK_MAX_SIZE    = 200_000      # memory bank cap before stratified pruning kicks in
+# ── MC-kNN specific knobs ─────────────────────────────────────────────────────
+BANK_MAX_SIZE    = 200_000
 K_NEIGHBORS      = 25
 GAMMA            = 0.97
-SIGNAL_THRESHOLD = 0.0005       # matches replay_buffer.py's SIGNAL_THRESHOLD
+SIGNAL_THRESHOLD = 0.0005
 
 # ── Integrity-check fixes (see mc_knn_memory.py docstring) ───────────────────
-# MIN_TICK_GAP: a query at tick i excludes any same-episode bank row whose
-#   tick is within this many ticks of i. Pre-training's diagnostic found
-#   near-zero nearest-neighbor distances (median NN dist = 0.0) driven by
-#   flat/low-vol stretches and the slow 42/90 paces barely changing
-#   tick-to-tick, and combined with multi-epoch training over the same
-#   fixed historical sequence this meant a query could vote on what was
-#   essentially its own future outcome. 100 ticks (~16.7 days at 4h candles)
-#   comfortably covers the slowest pace (90) plus its window, so a
-#   "genuinely different market moment" can still be found just outside
-#   this gap while ticks close enough to be near-duplicates are excluded.
 MIN_TICK_GAP     = 100
-# MAX_WEIGHT_RATIO: caps any single neighbor's kernel weight at this
-#   multiple of the median neighbor weight for a given query, so even a
-#   near-zero-distance neighbor that slips past temporal exclusion (e.g.
-#   a genuine repeat pattern from a different historical period) can't
-#   single-handedly dominate the vote the way the old uncapped
-#   1/(dist+1e-3) kernel allowed (~3,000:1 observed in practice).
 MAX_WEIGHT_RATIO = 50.0
 
 # Logging
@@ -114,14 +150,8 @@ LOG_EVERY_TICKS  = 500
 SAVE_EVERY_EPOCH = 5
 
 # ── Reward shaping ────────────────────────────────────────────────────────────
-# REWARD_SCALE is kept even though there's no critic to keep in a 2-10
-# range — MC returns are stored and queried in the same units as pushed,
-# so scaling still affects vote-weight magnitudes during k-NN aggregation.
-# Kept identical to main_sac.py so the two algorithms see the same reward
-# signal and any performance gap is attributable to the algorithm, not
-# the reward design.
 REWARD_SCALE    = 100.0
-MICRO_HOLD_COST = 0.000005   # 0.5 bp/tick while in position (variance signal)
+MICRO_HOLD_COST = 0.000005
 EPSILON_START   = 0.10
 EPSILON_END     = 0.01
 
@@ -135,46 +165,54 @@ def compute_shaped_reward(realised_pnl: float,
                           in_position: bool) -> float:
     """Identical to main_sac.py's compute_shaped_reward — copied verbatim."""
     shaped = realised_pnl
-
     if realised_pnl > 0.001:
         shaped += realised_pnl * 0.1
-
     if in_position and is_holding:
         shaped -= MICRO_HOLD_COST
-
     return shaped
 
 
 def run_epoch(executor: UnifiedExecutor, df: pd.DataFrame,
               episode_buffer: EpisodeBuffer, agent: MCKNNAgent,
-              train: bool = True, epsilon: float = 0.0) -> dict:
+              train: bool = True, epsilon: float = 0.0,
+              extra_context_arr: np.ndarray = None,
+              tick_offset: int = 0) -> dict:
     """
     Single deterministic or stochastic pass through df.
 
-    train=True  : push scaled rewards to the episode buffer, then commit
-                  the whole episode's backfilled MC returns to the memory
-                  bank via agent.update() AFTER this function returns
-                  (caller's responsibility — see main(), mirrors how
-                  main_sac.py called agent.update() mid-loop but here
-                  it must happen post-loop).
-    train=False : evaluation only — no buffer writes, no bank commits.
+    NEW PARAMETERS vs prior revision
+    ───────────────────────────────────
+    extra_context_arr : optional (len(df), context_dim) array — e.g.
+                         from multi_timeframe_state.build_multi_timeframe_context()
+                         — aligned 1:1 with df's row order. Row i's
+                         context is concatenated into the state for
+                         df.iloc[i] via UnifiedExecutor.step(extra_context=...).
+    tick_offset        : added to the LOCAL loop index `i` before it's
+                         used as the `tick`/`query_tick` value passed to
+                         executor.step() and episode_buffer.add(). Kept
+                         for completeness/future use (e.g. resuming a
+                         partially-trained fold) but NOT used by
+                         run_cross_validation()/run_final_training()
+                         below, since each fold's EpisodeBuffer already
+                         has its own episode_id which fully isolates it
+                         from every other fold/run — temporal exclusion
+                         only needs to distinguish ticks WITHIN the same
+                         episode_id, and a fold's local positional ticks
+                         (0..n-1) do that correctly since the same
+                         purged train_df is replayed identically each
+                         epoch within that fold.
 
-    Returns the same metrics dict shape as main_sac.py's run_epoch:
-        realised_pnl, n_trades, action_counts, update_count
-    update_count is always 0 here (no per-tick updates exist); kept in
-    the dict so the print/report code downstream needs no changes.
+    Returns the same metrics dict shape as before.
     """
     indicators_arr = df[FEATURES].values.astype(np.float32)
     prices_arr     = df["Close"].values.astype(np.float32)
     n              = len(df)
 
-    # ── Reset executor state ──────────────────────────────────────────────────
     executor.total_reward  = 0.0
     executor.inventory.clear()
     executor.current_side  = None
     executor._entry_tick   = 0
 
-    # Warm up aggregator
     executor.aggregator.tick = 0
     executor.aggregator.warm_up_all(indicators_arr, WARMUP_IDX)
 
@@ -182,35 +220,24 @@ def run_epoch(executor: UnifiedExecutor, df: pd.DataFrame,
     n_trades       = 0
     action_counts  = [0, 0, 0, 0]
 
-    # One-step lag: identical pattern to main_sac.py — we push
-    # (prev_state, prev_action, prev_reward) once we know it, so the
-    # reward correctly belongs to the action that earned it.
-    prev_state  = executor.aggregator.get_state(
-        executor.portfolio_info(prices_arr[WARMUP_IDX])
-    )
+    def _ctx(i):
+        return extra_context_arr[i] if extra_context_arr is not None else None
+
+    prev_state  = executor.get_state(indicators_arr[WARMUP_IDX], prices_arr[WARMUP_IDX],
+                                      extra_context=_ctx(WARMUP_IDX))
     prev_action = None
-    prev_reward = 0.0   # unscaled; scaled at push time
+    prev_reward = 0.0
+    prev_tick   = WARMUP_IDX + tick_offset
 
     for i in range(WARMUP_IDX + 1, n):
         indicators = indicators_arr[i]
         price      = prices_arr[i]
+        abs_tick   = i + tick_offset
 
         action, probs, realised_pnl, s_t = executor.step(
-            indicators, price, tick=i, epsilon=epsilon,
-            # Pass the episode_buffer's stable id only during TRAINING
-            # passes. This is what lets MCKNNMemory's temporal exclusion
-            # work: as long as `episode_buffer` is the same long-lived
-            # object reused across epochs (it is — see main(), it's
-            # constructed once outside the epoch loop) and
-            # EpisodeBuffer.end_episode_and_commit() keeps the id stable
-            # across commits, a query at tick i in epoch N+1 will
-            # correctly exclude the row committed at tick i (or nearby)
-            # in epoch N, closing the leak identified in the integrity
-            # check. Val passes intentionally pass None: they never
-            # write to the memory bank (train=False), so there's nothing
-            # for them to leak into, and they SHOULD be allowed to query
-            # whatever the bank already contains without exclusion.
+            indicators, price, tick=abs_tick, epsilon=epsilon,
             episode_id=(episode_buffer.episode_id if train else None),
+            extra_context=_ctx(i),
         )
 
         action_counts[action] += 1
@@ -228,14 +255,15 @@ def run_epoch(executor: UnifiedExecutor, df: pd.DataFrame,
         if train and prev_action is not None:
             episode_buffer.add(
                 prev_state, prev_action,
-                prev_reward * REWARD_SCALE,   # scaled, same convention as main_sac.py
+                prev_reward * REWARD_SCALE,
+                tick=prev_tick,
             )
 
         prev_state  = s_t
         prev_action = action
-        prev_reward = reward   # carry unscaled; scaled at next push
+        prev_reward = reward
+        prev_tick   = abs_tick
 
-        # ── Console heartbeat (training only) ────────────────────────────────
         if train and (i % LOG_EVERY_TICKS == 0):
             total_ticks = max(i - WARMUP_IDX, 1)
             pct = ", ".join(f"{c/total_ticks:.0%}" for c in action_counts)
@@ -250,12 +278,11 @@ def run_epoch(executor: UnifiedExecutor, df: pd.DataFrame,
         "realised_pnl":  total_realised,
         "n_trades":      n_trades,
         "action_counts": action_counts,
-        "update_count":  0,   # no per-tick updates for MC-kNN
+        "update_count":  0,
     }
 
 
 def _combine_metrics(m1: dict, m2: dict) -> dict:
-    """Identical to main_sac.py — copied verbatim."""
     return {
         "realised_pnl":  m1["realised_pnl"]  + m2["realised_pnl"],
         "n_trades":      m1["n_trades"]       + m2["n_trades"],
@@ -265,33 +292,201 @@ def _combine_metrics(m1: dict, m2: dict) -> dict:
     }
 
 
+def _slice_context(extra_context_arr, mask):
+    if extra_context_arr is None:
+        return None
+    return extra_context_arr[mask]
+
+
 # ─────────────────────────────────────────────
-# Main
+# Walk-forward cross-validation
 # ─────────────────────────────────────────────
 
-def main():
-    df = update_master_data()
+def run_cross_validation(df: pd.DataFrame, extra_context_arr: np.ndarray,
+                          state_dim: int, n_folds: int = N_CV_FOLDS) -> list:
+    """
+    Train a FRESH agent per fold (short CV_EPOCHS run, no checkpoint
+    persistence) and evaluate on that fold's purged+embargoed val
+    window. Returns a list of per-fold result dicts so the caller can
+    compute mean/std across folds — the Monte-Carlo-style "look at the
+    distribution, not one draw" check that a single year-split can't
+    give you.
+    """
+    lookback_ticks = compute_required_lookback_ticks()
+    folds = generate_purged_folds(
+        df, n_folds=n_folds, lookback_ticks=lookback_ticks,
+        min_train_ticks=MIN_TRAIN_TICKS,
+    )
+    summarize_folds(folds, df)
 
-    # ── Load and split data ───────────────────────────────────────────────────
-    df = df[["Open_time", "Close"] + FEATURES].dropna().reset_index(drop=True)
-    df["year"] = pd.to_datetime(df["Open_time"]).dt.year
+    fold_results = []
+    for fold in folds:
+        print(f"\n{'='*62}\n  CV FOLD {fold.fold_id}\n{'='*62}")
 
-    val_mask   = df["year"].isin(VAL_YEARS)
-    train_mask = ~val_mask
+        train_df = df[fold.train_mask].reset_index(drop=True)
+        val_df   = df[fold.val_mask].reset_index(drop=True)
+        train_ctx = _slice_context(extra_context_arr, fold.train_mask)
+        val_ctx   = _slice_context(extra_context_arr, fold.val_mask)
 
-    train_df   = df[train_mask].reset_index(drop=True)
-    val_2022_df = df[df["year"] == 2022].reset_index(drop=True)
-    val_2025_df = df[df["year"] == 2025].reset_index(drop=True)
-    bear_df     = val_2022_df   # 2022 is both val-bear and the bear monitor
+        if len(train_df) <= WARMUP_IDX + 2 or len(val_df) <= WARMUP_IDX + 2:
+            print(f"  ⚠ Fold {fold.fold_id}: too few rows after purge/embargo "
+                  f"(train={len(train_df)}, val={len(val_df)}) — skipping.")
+            continue
 
-    print(f"Train: {len(train_df):,} rows  |  "
-          f"Val 2022: {len(val_2022_df):,}  |  Val 2025: {len(val_2025_df):,}")
-    print(f"Train years: {sorted(df[train_mask]['year'].unique().tolist())}")
-    print(f"Val years:   {VAL_YEARS}")
+        agent = MCKNNAgent(
+            state_dim=state_dim, action_dim=ACTION_DIM,
+            k=K_NEIGHBORS, max_size=BANK_MAX_SIZE, gamma=GAMMA,
+            signal_threshold=SIGNAL_THRESHOLD,
+            min_tick_gap=MIN_TICK_GAP, max_weight_ratio=MAX_WEIGHT_RATIO,
+        )
+        episode_buffer = EpisodeBuffer(gamma=GAMMA)
+        train_executor = UnifiedExecutor(
+            f"CVFold{fold.fold_id}_Train", agent, paces=PACES,
+            deterministic=False, num_indicators=len(FEATURES),
+        )
 
-    # ── Initialise agent and episode buffer ───────────────────────────────────
+        # NOTE: train_df's rows are NOT contiguous in absolute time once
+        # purge/embargo removes a chunk in the middle (everything before
+        # purge_start and everything after embargo_end is concatenated
+        # into one frame). We deliberately do NOT need a tick_offset here
+        # — see run_epoch's docstring on why local positional ticks are
+        # sufficient given each fold gets its own episode_id.
+        for cv_epoch in range(1, CV_EPOCHS + 1):
+            t0 = time.time()
+            run_epoch(train_executor, train_df, episode_buffer, agent,
+                      train=True, epsilon=EPSILON_START,
+                      extra_context_arr=train_ctx)
+            agent.update(episode_buffer)
+            print(f"  CV epoch {cv_epoch}/{CV_EPOCHS}  "
+                  f"bank={len(agent.memory):,}  ({time.time()-t0:.1f}s)")
+
+        val_executor = UnifiedExecutor(
+            f"CVFold{fold.fold_id}_Val", agent, paces=PACES,
+            deterministic=True, num_indicators=len(FEATURES),
+        )
+        _val_buf = EpisodeBuffer(gamma=GAMMA)
+        val_metrics = run_epoch(val_executor, val_df, _val_buf, agent,
+                                train=False, extra_context_arr=val_ctx)
+
+        print(f"  Fold {fold.fold_id} val P/L: {val_metrics['realised_pnl']:+.4%}  "
+              f"trades={val_metrics['n_trades']}")
+        fold_results.append({
+            "fold_id": fold.fold_id,
+            "val_pnl": val_metrics["realised_pnl"],
+            "n_trades": val_metrics["n_trades"],
+            "action_counts": val_metrics["action_counts"],
+        })
+
+    if fold_results:
+        pnls = np.array([r["val_pnl"] for r in fold_results])
+        summary = {
+            "n_folds":          len(fold_results),
+            "mean_val_pnl":     float(pnls.mean()),
+            "std_val_pnl":      float(pnls.std()),
+            "min_val_pnl":      float(pnls.min()),
+            "max_val_pnl":      float(pnls.max()),
+            "n_folds_positive": int((pnls > 0).sum()),
+            "state_dim":        int(state_dim),
+            "multi_timeframe":  bool(extra_context_arr is not None),
+            "lookback_ticks":   int(lookback_ticks),
+            "fold_results":     fold_results,
+        }
+        print(f"\n{'='*62}")
+        print(f"  WALK-FORWARD CV SUMMARY ({len(fold_results)} folds)")
+        print(f"{'='*62}")
+        print(f"  Mean val P/L : {summary['mean_val_pnl']:+.4%}")
+        print(f"  Std  val P/L : {summary['std_val_pnl']:.4%}")
+        print(f"  Min  val P/L : {summary['min_val_pnl']:+.4%}")
+        print(f"  Max  val P/L : {summary['max_val_pnl']:+.4%}")
+        print(f"  Folds positive: {summary['n_folds_positive']}/{summary['n_folds']}")
+        if summary["n_folds"] > 1 and summary["std_val_pnl"] > abs(summary["mean_val_pnl"]):
+            summary["std_exceeds_mean_warning"] = True
+            print("  ⚠ Std exceeds |mean| — performance is NOT consistent "
+                  "across historical periods; treat any single-split result "
+                  "(including the deployable run below) with real skepticism.")
+        else:
+            summary["std_exceeds_mean_warning"] = False
+        print(f"{'='*62}\n")
+
+        # ── Persist so diagnostic_mcknn.py (and anyone else) can report
+        #    this distribution AFTER training, not just in the console
+        #    log — this is the single most informative "is this model
+        #    trustworthy" signal this revision adds, and it was
+        #    previously only ever printed, never saved. ──────────────────
+        import json
+        os.makedirs("outcomes", exist_ok=True)
+        cv_summary_path = "outcomes/walkforward_cv_summary.json"
+        with open(cv_summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"  ✓  CV summary saved → {cv_summary_path}")
+
+    return fold_results
+
+
+# ─────────────────────────────────────────────
+# Final deployable training run
+# ─────────────────────────────────────────────
+
+def run_final_training(df: pd.DataFrame, extra_context_arr: np.ndarray,
+                       state_dim: int):
+    """
+    Train the checkpoint that actually gets deployed (live_mcknn.py /
+    diagnostic_mcknn.py consume this). Uses the SAME purge/embargo
+    discipline as the CV folds — train on everything except the purge+
+    val+embargo block of the LAST walk-forward fold (the most recent
+    val window), so the production model's reported val metric is just
+    as leak-free as the CV folds were, instead of reverting to the old
+    hard year-boundary split.
+    """
+    lookback_ticks = compute_required_lookback_ticks()
+    folds = generate_purged_folds(
+        df, n_folds=N_CV_FOLDS, lookback_ticks=lookback_ticks,
+        min_train_ticks=MIN_TRAIN_TICKS,
+    )
+    final_fold = folds[-1]   # most recent val window = most relevant
+                             # out-of-sample signal for a model going live
+    print(f"\n  Final training fold: val ticks "
+          f"[{final_fold.val_start}:{final_fold.val_end}) "
+          f"(purged region [{final_fold.purge_start}:{final_fold.embargo_end}))")
+
+    train_df = df[final_fold.train_mask].reset_index(drop=True)
+    val_df   = df[final_fold.val_mask].reset_index(drop=True)
+    train_ctx = _slice_context(extra_context_arr, final_fold.train_mask)
+    val_ctx   = _slice_context(extra_context_arr, final_fold.val_mask)
+
+    print(f"  Train: {len(train_df):,} rows  |  Val: {len(val_df):,} rows")
+
+    # ── Persist this fold's exact boundaries + state config. This is
+    #    what closes the diagnostic_mcknn.py alignment gap: its old
+    #    VAL_YEARS=[2022,2025] split was independent of (and could
+    #    overlap) whatever data this checkpoint was actually trained
+    #    and selected on. diagnostic_mcknn.py now reads this file and
+    #    rebuilds the IDENTICAL purge/val/embargo split instead of
+    #    guessing at it via calendar years. ─────────────────────────────
+    import json
+    os.makedirs("outcomes", exist_ok=True)
+    fold_meta = {
+        "val_start":        int(final_fold.val_start),
+        "val_end":          int(final_fold.val_end),
+        "purge_start":      int(final_fold.purge_start),
+        "embargo_end":      int(final_fold.embargo_end),
+        "lookback_ticks":   int(lookback_ticks),
+        "n_folds_used":     int(N_CV_FOLDS),
+        "state_dim":        int(state_dim),
+        "multi_timeframe":  bool(extra_context_arr is not None),
+        "features":         FEATURES,
+        "paces":            list(PACES),
+        "context_paces":    list(CONTEXT_PACES) if extra_context_arr is not None else None,
+        "context_timeframes": list(CONTEXT_TIMEFRAMES) if extra_context_arr is not None else None,
+        "warmup_idx":       int(WARMUP_IDX),
+        "total_rows":       int(len(df)),
+    }
+    with open("outcomes/final_fold_meta.json", "w") as f:
+        json.dump(fold_meta, f, indent=2)
+    print(f"  ✓  Final fold metadata saved → outcomes/final_fold_meta.json")
+
     agent = MCKNNAgent(
-        state_dim=STATE_DIM, action_dim=ACTION_DIM,
+        state_dim=state_dim, action_dim=ACTION_DIM,
         k=K_NEIGHBORS, max_size=BANK_MAX_SIZE, gamma=GAMMA,
         signal_threshold=SIGNAL_THRESHOLD,
         min_tick_gap=MIN_TICK_GAP, max_weight_ratio=MAX_WEIGHT_RATIO,
@@ -299,7 +494,6 @@ def main():
     agent.load(CHECKPOINT_PATH)
 
     episode_buffer = EpisodeBuffer(gamma=GAMMA)
-
     train_executor = UnifiedExecutor(
         "Train", agent, paces=PACES,
         deterministic=False, num_indicators=len(FEATURES)
@@ -310,45 +504,24 @@ def main():
     EPSILON_DECAY = (EPSILON_END / EPSILON_START) ** (1 / 20)
     epsilon       = EPSILON_START
 
-    # ── Training loop ─────────────────────────────────────────────────────────
     for epoch in range(1, NUM_EPOCHS + 1):
         t0 = time.time()
 
-        # ── Training pass: collect the episode, THEN commit MC returns ────────
         train_metrics = run_epoch(
             train_executor, train_df, episode_buffer, agent,
-            train=True, epsilon=epsilon,
+            train=True, epsilon=epsilon, extra_context_arr=train_ctx,
         )
-        # Full-episode MC backfill + commit to the memory bank — this is the
-        # one place the control flow structurally differs from main_sac.py,
-        # which called agent.update() mid-epoch every UPDATE_EVERY ticks.
         agent.update(episode_buffer)
         epsilon = max(EPSILON_END, epsilon * EPSILON_DECAY)
 
-        # ── Val: two separate episodes to avoid year-boundary phantom trades ──
-        val_exec_2022 = UnifiedExecutor(
-            "Val2022", agent, paces=PACES,
+        val_executor = UnifiedExecutor(
+            "Val", agent, paces=PACES,
             deterministic=True, num_indicators=len(FEATURES)
         )
-        val_exec_2025 = UnifiedExecutor(
-            "Val2025", agent, paces=PACES,
-            deterministic=True, num_indicators=len(FEATURES)
-        )
-        # Val passes use a throwaway episode_buffer since train=False means
-        # nothing gets added to it anyway — kept for run_epoch's signature.
         _val_buf = EpisodeBuffer(gamma=GAMMA)
-        m_2022 = run_epoch(val_exec_2022, val_2022_df, _val_buf,
-                           agent, train=False)
-        m_2025 = run_epoch(val_exec_2025, val_2025_df, _val_buf,
-                           agent, train=False)
-        val_metrics = _combine_metrics(m_2022, m_2025)
+        val_metrics = run_epoch(val_executor, val_df, _val_buf, agent,
+                                train=False, extra_context_arr=val_ctx)
 
-        # ── Bear health monitor (same as val 2022, re-use result) ─────────────
-        b_pnl       = m_2022["realised_pnl"]
-        b_short_pct = (m_2022["action_counts"][1] /
-                       max(sum(m_2022["action_counts"]), 1))
-
-        # ── Epoch reporting ───────────────────────────────────────────────────
         elapsed = time.time() - t0
         t_pnl   = train_metrics["realised_pnl"]
         v_pnl   = val_metrics["realised_pnl"]
@@ -361,12 +534,7 @@ def main():
 
         print(f"\n  ── Epoch {epoch} ─────────────────────────────────────────")
         print(f"  Train P/L : {t_pnl:+.4%}  |  trades={train_metrics['n_trades']}")
-        print(f"  Val 2022  : {m_2022['realised_pnl']:+.4%}"
-              f"  |  trades={m_2022['n_trades']}")
-        print(f"  Val 2025  : {m_2025['realised_pnl']:+.4%}"
-              f"  |  trades={m_2025['n_trades']}")
-        print(f"  Val total : {v_pnl:+.4%}  |  trades={val_metrics['n_trades']}")
-        print(f"  Bear P/L  : {b_pnl:+.4%}  |  SHORT={b_short_pct:.0%}")
+        print(f"  Val P/L   : {v_pnl:+.4%}  |  trades={val_metrics['n_trades']}")
         print(f"  Train actions [L/S/C/H]: {pct_str(t_ac)}")
         print(f"  Val   actions [L/S/C/H]: {pct_str(v_ac)}")
         print(f"  MC-kNN bank_size={agent.last_bank_size:,}"
@@ -375,7 +543,6 @@ def main():
               f"  epsilon={epsilon:.4f}")
         print(f"  Time  : {elapsed:.1f}s")
 
-        # ── SHORT collapse hard-stop (identical to main_sac.py) ───────────────
         short_pct_train = t_ac[1] / max(sum(t_ac), 1)
         if epoch > WARMUP_EPOCHS and short_pct_train < 0.03:
             print(f"  ⛔ SHORT collapsed to {short_pct_train:.1%} — stopping")
@@ -383,41 +550,99 @@ def main():
         if epoch > WARMUP_EPOCHS and short_pct_train < 0.05:
             print(f"  ⚠ SHORT at {short_pct_train:.1%} in training — watch")
 
-        # ── Directional saving criterion (identical to main_sac.py) ───────────
         short_pct_val = v_ac[1] / max(sum(v_ac), 1)
         long_pct_val  = v_ac[0] / max(sum(v_ac), 1)
-
         bear_pnl_floor = -0.10
-
         is_directional = short_pct_val >= 0.03 and long_pct_val >= 0.03
 
-        if is_directional and v_pnl > best_val_pnl + MIN_IMPROVE and b_pnl > bear_pnl_floor:
+        if is_directional and v_pnl > best_val_pnl + MIN_IMPROVE and v_pnl > bear_pnl_floor:
             best_val_pnl = v_pnl
             no_improve = 0
             agent.save(BEST_PATH)
-            print(f"  ⭐ New best val P/L: {best_val_pnl:+.4%}  bear={b_pnl:+.4%}"
+            print(f"  ⭐ New best val P/L: {best_val_pnl:+.4%}"
                   f"  (L={long_pct_val:.0%} S={short_pct_val:.0%})")
         elif not is_directional:
             print(f"  ↷ Skipped save — directional collapse"
                   f" (L={long_pct_val:.0%} S={short_pct_val:.0%})")
             no_improve += 1
-        elif b_pnl <= bear_pnl_floor:
-            print(f"  ↷ Skipped save — bear floor breached (bear={b_pnl:+.4%})")
+        elif v_pnl <= bear_pnl_floor:
+            print(f"  ↷ Skipped save — val floor breached (val={v_pnl:+.4%})")
             no_improve += 1
         else:
             no_improve += 1
 
-        # ── Early stopping (identical to main_sac.py) ──────────────────────────
         if epoch >= WARMUP_EPOCHS and no_improve >= PATIENCE:
             print(f"  ⚠ No val improvement for {PATIENCE} epochs — early stop")
             break
 
-        # ── Periodic checkpoint ───────────────────────────────────────────────
         if epoch % SAVE_EVERY_EPOCH == 0:
             agent.save(CHECKPOINT_PATH)
 
     print(f"\n✅ Training complete.  Best val P/L: {best_val_pnl:+.4%}")
     agent.save(CHECKPOINT_PATH)
+
+
+# ─────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────
+
+def main():
+    # ── Primary (4h, decision-timeframe) master data ─────────────────────────
+    df = update_master_data(PRIMARY_TIMEFRAME)
+    df = df[["Open_time", "Close"] + FEATURES].dropna().reset_index(drop=True)
+
+    extra_context_arr = None
+    state_dim = STATE_DIM_WITHOUT_CONTEXT
+
+    if ENABLE_MULTI_TIMEFRAME:
+        try:
+            # Refreshes/builds data/processed/XRPUSDT_<tf>_master_processed.csv
+            # for every context timeframe directly from data/raw/<tf>/*.csv —
+            # raises FileNotFoundError per-timeframe if that raw folder is
+            # missing/empty, which is caught below and treated as "disable
+            # multi-timeframe context, fall back to 4h-only" rather than
+            # aborting the whole run.
+            timeframe_dfs = update_all_timeframes(CONTEXT_TIMEFRAMES)
+            missing = [tf for tf in CONTEXT_TIMEFRAMES if tf not in timeframe_dfs]
+            if missing:
+                raise FileNotFoundError(
+                    f"raw data missing for timeframe(s): {missing} "
+                    f"(expected under data/raw/<timeframe>/*.csv)"
+                )
+
+            timeframe_frames = {
+                tf: tdf[["Open_time"] + FEATURES].dropna().reset_index(drop=True)
+                for tf, tdf in timeframe_dfs.items()
+            }
+
+            print("\nBuilding multi-timeframe context "
+                  f"({', '.join(timeframe_frames.keys())})...")
+            extra_context_arr = build_multi_timeframe_context(
+                df, timeframe_frames, FEATURES, context_paces=CONTEXT_PACES,
+            )
+            state_dim = STATE_DIM_WITH_CONTEXT
+            print(f"  Context array shape: {extra_context_arr.shape}  "
+                  f"(STATE_DIM={state_dim})")
+        except FileNotFoundError as exc:
+            print(f"\n⚠ Multi-timeframe context disabled — {exc}")
+            print("  Falling back to 4h-only state "
+                  f"(STATE_DIM={STATE_DIM_WITHOUT_CONTEXT}). Add raw CSVs under "
+                  f"data/raw/{{{','.join(CONTEXT_TIMEFRAMES)}}}/ to enable it, or "
+                  "set ENABLE_MULTI_TIMEFRAME=False to silence this warning.")
+            extra_context_arr = None
+            state_dim = STATE_DIM_WITHOUT_CONTEXT
+
+    print(f"\nTotal rows: {len(df):,}  |  STATE_DIM={state_dim}")
+    print(f"Date range: {df['Open_time'].iloc[0]} → {df['Open_time'].iloc[-1]}")
+
+    # ── Step 1: walk-forward CV — measure robustness across many
+    #    independent historical periods before trusting any one number ──
+    print(f"\n{'#'*62}\n  STEP 1 — PURGED + EMBARGOED WALK-FORWARD CROSS-VALIDATION\n{'#'*62}")
+    run_cross_validation(df, extra_context_arr, state_dim, n_folds=N_CV_FOLDS)
+
+    # ── Step 2: train the deployable checkpoint ───────────────────────────
+    print(f"\n{'#'*62}\n  STEP 2 — FINAL DEPLOYABLE TRAINING RUN\n{'#'*62}")
+    run_final_training(df, extra_context_arr, state_dim)
 
 
 if __name__ == "__main__":

@@ -61,14 +61,19 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from agents.mc_knn_agent     import MCKNNAgent
 from agents.unified_executor import UnifiedExecutor
-from data.data_manager       import update_master_data
+from data.data_manager       import update_master_data, update_all_timeframes
+from multi_timeframe_state   import build_multi_timeframe_context
 
 # ── Configuration — must match main_mcknn.py exactly ──────────────────────────
 BEST_PATH    = "outcomes/mc_knn_agent_best.npz"
+CV_SUMMARY_PATH = "outcomes/walkforward_cv_summary.json"
 FEATURES     = ["RSI_Scaled", "MACD_Scaled", "BB_Scaled",
                 "OBV_Scaled", "ATR_Scaled", "MeanDev_Scaled"]
 PACES        = (1, 6, 42, 90)
-STATE_DIM    = (len(FEATURES) * 2 * len(PACES)) + 2
+STATE_DIM    = (len(FEATURES) * 2 * len(PACES)) + 2   # legacy 4h-only dim;
+                                                       # used only as the
+                                                       # fallback/comparison
+                                                       # baseline — see main()
 ACTION_DIM   = 4
 ACTION_NAMES  = ["LONG", "SHORT", "CLOSE", "HOLD"]
 ACTION_COLORS = ["#2ecc71", "#e74c3c", "#f39c12", "#95a5a6"]
@@ -77,8 +82,12 @@ GAMMA        = 0.97
 K_NEIGHBORS  = 25
 OUT_DIR      = "outcomes/diagnostics_mcknn"
 
-# ── Regime-balanced split — MUST match main_mcknn.py exactly ─────────────────
-VAL_YEARS   = [2022, 2025]
+# NOTE: the old hard-coded VAL_YEARS=[2022, 2025] split has been removed.
+# See make_splits() below — the "val" split now comes from
+# outcomes/final_fold_meta.json (the EXACT purged walk-forward boundary
+# main_mcknn.py trained the deployed checkpoint against), falling back
+# to a calendar-year split (VAL_YEARS_FALLBACK, defined near make_splits)
+# only if that metadata file is missing, with a loud warning either way.
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -86,10 +95,23 @@ os.makedirs(OUT_DIR, exist_ok=True)
 # Data collection pass
 # ─────────────────────────────────────────────────────────────────────────────
 
-def collect_episode(agent: MCKNNAgent, df: pd.DataFrame, label: str) -> dict:
+def collect_episode(agent: MCKNNAgent, df: pd.DataFrame, label: str,
+                     extra_context_arr: np.ndarray = None) -> dict:
     """
     Full deterministic pass through df.
     Returns a dict of parallel arrays (one entry per tick from WARMUP_IDX+1).
+
+    extra_context_arr : optional (len(df), context_dim) array aligned
+                         1:1 with df's rows — see multi_timeframe_state.py
+                         and main_mcknn.py's run_epoch. REQUIRED if the
+                         loaded checkpoint was trained with multi-timeframe
+                         context (agent.memory.state_dim > 4h-only dim):
+                         without it, executor.step() builds a smaller
+                         state than the bank's stored rows and
+                         agent.memory.query()'s `cand_states - state[None,:]`
+                         raises a shape-mismatch error rather than
+                         silently producing wrong results — see main()
+                         for where this is built/validated.
 
     Field-by-field mapping vs diagnostic.py's collect_episode:
       q1_chosen, q2_chosen, q1_all, q2_all, q_disagreement
@@ -116,11 +138,15 @@ def collect_episode(agent: MCKNNAgent, df: pd.DataFrame, label: str) -> dict:
     executor.aggregator.tick = 0
     executor.aggregator.warm_up_all(indicators_arr, WARMUP_IDX)
 
+    def _ctx(i):
+        return extra_context_arr[i] if extra_context_arr is not None else None
+
     ticks, prices, actions, entropies               = [], [], [], []
     prob_long, prob_short, prob_close, prob_hold    = [], [], [], []
     # kNN analogues of q1_chosen/q2_chosen/q1_all/q2_all/q_disagreement:
     neighbor_return_mean, neighbor_return_std        = [], []
     vote_raw_all, vote_margin_arr                    = [], []
+    n_excluded_arr                                   = []
     raw_features, unrealized_pnl, states_arr        = [], [], []
 
     trades     = []
@@ -132,10 +158,16 @@ def collect_episode(agent: MCKNNAgent, df: pd.DataFrame, label: str) -> dict:
         ind   = indicators_arr[i]
         price = prices_arr[i]
 
-        action, probs, realised_pnl, s_t = executor.step(ind, price, tick=i)
+        action, probs, realised_pnl, s_t = executor.step(
+            ind, price, tick=i, extra_context=_ctx(i),
+        )
 
         # kNN analogue of the critic forward pass: query the memory bank
         # at this exact state to get neighbor return stats + vote info.
+        # No query_tick/query_episode_id here — this is an EVAL-only pass
+        # (matches main_mcknn.py's val passes), so temporal exclusion is
+        # correctly not applied; n_excluded_temporal will read 0 for every
+        # tick, which is expected, not a bug.
         _q_action, _q_probs, q_info = agent.memory.query(s_t, k=K_NEIGHBORS)
         nbr_returns = q_info["neighbor_returns"]
         vote_raw    = q_info["vote_raw"]
@@ -156,6 +188,7 @@ def collect_episode(agent: MCKNNAgent, df: pd.DataFrame, label: str) -> dict:
         neighbor_return_std.append(float(nbr_returns.std()) if len(nbr_returns) else 0.0)
         vote_raw_all.append(np.where(np.isfinite(vote_raw), vote_raw, 0.0).copy())
         vote_margin_arr.append(margin)
+        n_excluded_arr.append(q_info.get("n_excluded_temporal", 0))
 
         raw_features.append(ind.copy())
         unrealized_pnl.append(float(s_t[-1]))
@@ -203,6 +236,7 @@ def collect_episode(agent: MCKNNAgent, df: pd.DataFrame, label: str) -> dict:
     neighbor_return_std  = np.array(neighbor_return_std,  dtype=np.float32)
     vote_raw_all   = np.array(vote_raw_all,   dtype=np.float32)  # (n, action_dim)
     vote_margin_arr = np.array(vote_margin_arr, dtype=np.float32)
+    n_excluded_arr  = np.array(n_excluded_arr,  dtype=np.int32)
     raw_features   = np.array(raw_features,   dtype=np.float32)
     unrealized_pnl = np.array(unrealized_pnl, dtype=np.float32)
     states_arr     = np.array(states_arr,     dtype=np.float32)
@@ -235,6 +269,7 @@ def collect_episode(agent: MCKNNAgent, df: pd.DataFrame, label: str) -> dict:
         "neighbor_return_std":  neighbor_return_std,
         "vote_raw_all":          vote_raw_all,
         "vote_margin":           vote_margin_arr,
+        "n_excluded_temporal":   n_excluded_arr,
         "raw_features":   raw_features,
         "unrealized_pnl": unrealized_pnl,
         "states_arr":     states_arr,
@@ -245,41 +280,125 @@ def collect_episode(agent: MCKNNAgent, df: pd.DataFrame, label: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Data split helper — IDENTICAL to diagnostic.py
+# Data split helper
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# CHANGES IN THIS REVISION — ALIGNMENT FIX
+# ───────────────────────────────────────────
+# The old VAL_YEARS=[2022, 2025] hard split was INDEPENDENT of the
+# purged+embargoed walk-forward split main_mcknn.py's run_final_training()
+# actually uses to train and select BEST_PATH (see walkforward.py).
+# That meant this diagnostic suite could evaluate "val" performance on
+# rows that were actually part of the model's TRAIN set, or exclude rows
+# that were genuinely held out — silently re-introducing the exact kind
+# of leak the walk-forward refactor was built to close, just at the
+# evaluation step instead of training.
+#
+# Fix: main_mcknn.py now writes outcomes/final_fold_meta.json with the
+# EXACT val_start/val_end/purge_start/embargo_end tick boundaries used
+# for the deployed checkpoint. load_final_fold_meta() reads it back and
+# make_splits() rebuilds the identical split. If that file is missing
+# (e.g. you're diagnosing a checkpoint trained before this revision),
+# we fall back to the old year-based split with a loud warning rather
+# than silently producing a possibly-leaky "val" result.
 
-def make_splits(df: pd.DataFrame) -> dict:
-    """Identical to diagnostic.py's make_splits — copied verbatim."""
+FINAL_FOLD_META_PATH = "outcomes/final_fold_meta.json"
+VAL_YEARS_FALLBACK    = [2022, 2025]   # only used if final_fold_meta.json is absent
+
+
+def load_final_fold_meta(path: str = FINAL_FOLD_META_PATH) -> dict | None:
+    if not os.path.exists(path):
+        return None
+    import json
+    with open(path) as f:
+        return json.load(f)
+
+
+def make_splits(df: pd.DataFrame, fold_meta: dict = None,
+                 extra_context_arr: np.ndarray = None) -> tuple:
+    """
+    Build the same splits diagnostic_mcknn.py has always reported
+    (train / a true held-out val / bear regime / bull regime), but the
+    "val" split now comes from the EXACT purged walk-forward fold
+    boundaries the checkpoint was trained against, when available.
+
+    bear_2022 / bull_trend remain calendar-year regime slices for
+    DESCRIPTIVE characterization only (Section 7-style "how does the
+    model behave in a falling vs rising market" reporting) — they are
+    explicitly NOT claimed to be leak-free held-out data and may
+    overlap whatever the model was trained on. Only "val" is the
+    genuine out-of-sample claim; print output labels this distinction
+    explicitly so the two aren't conflated when reading results.
+
+    extra_context_arr : optional, aligned 1:1 with `df`'s rows BEFORE
+    any splitting (same array build_multi_timeframe_context() returns
+    for the full master frame). Sliced here with the IDENTICAL boolean
+    masks used for each data split, so e.g. splits["val"] and
+    contexts["val"] always correspond row-for-row — required for
+    collect_episode() to build states with the right dimensionality
+    when the checkpoint was trained with multi-timeframe context.
+
+    Returns (splits_dict, contexts_dict). contexts_dict values are None
+    wherever extra_context_arr was None (i.e. context disabled).
+    """
     df = df.copy()
     df["_year"] = pd.to_datetime(df["Open_time"], errors="coerce").dt.year
 
-    val_mask   = df["_year"].isin(VAL_YEARS)
-    train_mask = ~val_mask
+    bear_mask = (df["_year"] == 2022).values
+    bull_mask = (df["_year"].isin([2020, 2021, 2024])).values
+    bear_df = df[bear_mask].drop(columns=["_year"]).reset_index(drop=True)
+    bull_df = df[bull_mask].drop(columns=["_year"]).reset_index(drop=True)
 
-    train_df    = df[train_mask].drop(columns=["_year"]).reset_index(drop=True)
-    val_2022_df = df[df["_year"] == 2022].drop(columns=["_year"]).reset_index(drop=True)
-    val_2025_df = df[df["_year"] == 2025].drop(columns=["_year"]).reset_index(drop=True)
+    if fold_meta is not None:
+        n = len(df)
+        val_start = fold_meta["val_start"]
+        val_end   = fold_meta["val_end"]
+        purge_start = fold_meta["purge_start"]
+        embargo_end = fold_meta["embargo_end"]
 
-    bear_df = df[df["_year"] == 2022].drop(columns=["_year"]).reset_index(drop=True)
-    bull_df = df[df["_year"].isin([2020, 2021, 2024])].drop(
-                 columns=["_year"]).reset_index(drop=True)
+        val_mask   = np.zeros(n, dtype=bool)
+        val_mask[val_start:val_end] = True
+        train_mask = np.ones(n, dtype=bool)
+        train_mask[purge_start:embargo_end] = False
 
-    train_years = sorted(df[train_mask]["_year"].dropna().unique().tolist())
-    val_years   = sorted(df[val_mask]["_year"].dropna().unique().tolist())
+        train_df = df[train_mask].drop(columns=["_year"]).reset_index(drop=True)
+        val_df   = df[val_mask].drop(columns=["_year"]).reset_index(drop=True)
 
-    print(f"  Train: {len(train_df):,} rows  |  years: {train_years}")
-    print(f"  Val 2022: {len(val_2022_df):,} rows  |  "
-          f"Val 2025: {len(val_2025_df):,} rows  |  years: {val_years}")
-    print(f"  Bear holdout (2022):          {len(bear_df):,} rows")
-    print(f"  Bull holdout (2020+2021+2024): {len(bull_df):,} rows\n")
+        print(f"  ✓  Using EXACT purged walk-forward split from "
+              f"{FINAL_FOLD_META_PATH} (leak-free, matches training):")
+        print(f"      Train: {len(train_df):,} rows  |  Val (held-out): {len(val_df):,} rows  "
+              f"|  purged/embargoed: {(embargo_end - purge_start) - len(val_df):,} rows")
+    else:
+        print(f"  ⚠  {FINAL_FOLD_META_PATH} not found — falling back to "
+              f"calendar-year split {VAL_YEARS_FALLBACK}. This split is "
+              f"NOT guaranteed leak-free against rolling-window features; "
+              f"re-run main_mcknn.py's training (this revision or later) "
+              f"to get a verified leak-free val window.")
+        val_mask   = df["_year"].isin(VAL_YEARS_FALLBACK).values
+        train_mask = ~val_mask
+        train_df = df[train_mask].drop(columns=["_year"]).reset_index(drop=True)
+        val_df   = df[val_mask].drop(columns=["_year"]).reset_index(drop=True)
 
-    return {
+    print(f"  Bear regime characterization (2022, DESCRIPTIVE ONLY — "
+          f"may overlap train): {len(bear_df):,} rows")
+    print(f"  Bull regime characterization (2020+2021+2024, DESCRIPTIVE "
+          f"ONLY — may overlap train): {len(bull_df):,} rows\n")
+
+    splits = {
         "train":      train_df,
-        "val_2022":   val_2022_df,
-        "val_2025":   val_2025_df,
+        "val":        val_df,
         "bear_2022":  bear_df,
         "bull_trend": bull_df,
     }
+
+    contexts = {k: None for k in splits}
+    if extra_context_arr is not None:
+        contexts["train"]      = extra_context_arr[train_mask]
+        contexts["val"]        = extra_context_arr[val_mask]
+        contexts["bear_2022"]  = extra_context_arr[bear_mask]
+        contexts["bull_trend"] = extra_context_arr[bull_mask]
+
+    return splits, contexts
 
 
 def _empty_episode(label: str) -> dict:
@@ -294,6 +413,7 @@ def _empty_episode(label: str) -> dict:
         "neighbor_return_mean": empty, "neighbor_return_std": empty,
         "vote_raw_all": np.zeros((0, 4), dtype=np.float32),
         "vote_margin": empty,
+        "n_excluded_temporal": np.array([], dtype=np.int32),
         "raw_features": np.zeros((0, 6), dtype=np.float32),
         "unrealized_pnl": empty,
         "states_arr": np.zeros((0, STATE_DIM), dtype=np.float32),
@@ -1136,13 +1256,22 @@ def write_summary(ep: dict, agent: MCKNNAgent, pnls):
     n      = len(ep["ticks"])
     label  = ep["label"]
 
+    mem = agent.memory
     lines = []
     lines.append("=" * 62)
     lines.append(f"  MC-kNN DIAGNOSTIC SUMMARY — {label.upper()}")
     lines.append(f"  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append(f"  Memory bank size: {len(agent.memory):,}")
+    lines.append(f"  Memory bank size: {len(mem):,}")
     lines.append(f"  Episodes committed: {agent.n_episodes_committed}")
-    lines.append(f"  k (neighbors): {agent.memory.k}")
+    lines.append(f"  k (neighbors): {mem.k}")
+    # ── Integrity-check config (eps_dist/max_weight_ratio/min_tick_gap)
+    #    surfaced explicitly — these are now part of the model's actual
+    #    behavior and weren't visible anywhere in diagnostics before. ───
+    lines.append(f"  state_dim: {mem.state_dim}  "
+                 f"(multi_timeframe={'yes' if mem.state_dim > STATE_DIM else 'no'})")
+    lines.append(f"  eps_dist: {getattr(mem, 'eps_dist', 'n/a')}  "
+                 f"max_weight_ratio: {getattr(mem, 'max_weight_ratio', 'n/a')}  "
+                 f"min_tick_gap (default): {getattr(mem, 'min_tick_gap', 'n/a')}")
     lines.append("=" * 62)
 
     if n == 0:
@@ -1159,6 +1288,11 @@ def write_summary(ep: dict, agent: MCKNNAgent, pnls):
     best_vote_action = ep["vote_raw_all"].argmax(axis=1)
     lines.append(f"  Policy match to best-vote:   "
                  f"{(best_vote_action == ep['actions']).mean():.1%}")
+    if "n_excluded_temporal" in ep and len(ep["n_excluded_temporal"]):
+        mean_excl = float(ep["n_excluded_temporal"].mean())
+        lines.append(f"  Mean n_excluded_temporal:    {mean_excl:.2f}  "
+                     f"(expected ≈0 for eval passes — nonzero would mean "
+                     f"query_tick/query_episode_id were unexpectedly set)")
 
     lines.append("\n── ACTION DISTRIBUTION ────────────────────────────────────")
     for j, aname in enumerate(ACTION_NAMES):
@@ -1312,77 +1446,170 @@ def main():
     print(f"  Output dir : {OUT_DIR}")
     print(f"{sep}\n")
 
-    # ── Load agent ────────────────────────────────────────────────────────────
+    # ── ALIGNMENT FIX: read main_mcknn.py's persisted fold/state metadata
+    #    BEFORE constructing the agent, so we build the agent (and any
+    #    multi-timeframe context) to match what the checkpoint actually
+    #    expects, instead of hardcoding STATE_DIM=50 and silently
+    #    breaking — or worse, silently misinterpreting — a checkpoint
+    #    trained with multi-timeframe context. ─────────────────────────
+    fold_meta = load_final_fold_meta()
+    if fold_meta is not None:
+        expected_state_dim = fold_meta["state_dim"]
+        uses_context       = fold_meta["multi_timeframe"]
+        print(f"  Loaded {FINAL_FOLD_META_PATH}: "
+              f"state_dim={expected_state_dim}  multi_timeframe={uses_context}")
+    else:
+        expected_state_dim = STATE_DIM   # legacy 4h-only fallback
+        uses_context       = False
+        print(f"  ⚠  No {FINAL_FOLD_META_PATH} found — assuming legacy "
+              f"4h-only state_dim={STATE_DIM}. If the checkpoint was "
+              f"actually trained with multi-timeframe context, loading "
+              f"will fail with a shape-mismatch error in MCKNNMemory.query().")
+
+    # ── Load agent FIRST — MCKNNMemory.load() restores the bank's true
+    #    state_dim from the .npz file regardless of what we pass here,
+    #    so we use it as the authoritative cross-check below rather than
+    #    trusting fold_meta blindly (e.g. if you're diagnosing an older
+    #    checkpoint that predates final_fold_meta.json). ─────────────────
     agent = MCKNNAgent(
-        state_dim=STATE_DIM, action_dim=ACTION_DIM,
+        state_dim=expected_state_dim, action_dim=ACTION_DIM,
         k=K_NEIGHBORS, max_size=200_000, gamma=GAMMA,
     )
     agent.load(args.checkpoint)
+    actual_state_dim = agent.memory.state_dim
+    if actual_state_dim != expected_state_dim:
+        print(f"  ⚠  Checkpoint's actual state_dim={actual_state_dim} differs "
+              f"from expected {expected_state_dim} (from {FINAL_FOLD_META_PATH if fold_meta else 'legacy default'}). "
+              f"Using the checkpoint's real value — context will be "
+              f"{'enabled' if actual_state_dim > STATE_DIM else 'disabled'} accordingly.")
+    uses_context = actual_state_dim > STATE_DIM  # ground truth from the bank itself
 
-    # ── Load data and build splits ────────────────────────────────────────────
-    print("Loading data...")
+    # ── Load data ─────────────────────────────────────────────────────────────
+    print("\nLoading data...")
     df = update_master_data()
     df = df[["Open_time", "Close"] + FEATURES].dropna().reset_index(drop=True)
-    splits = make_splits(df)
 
-    # ── Random baseline on each val year separately ───────────────────────────
-    print("Random policy baseline (val 2022 — bear market):")
-    random_policy_baseline(splits["val_2022"])
-    print("Random policy baseline (val 2025 — recent mixed):")
-    random_policy_baseline(splits["val_2025"])
+    extra_context_arr = None
+    if uses_context:
+        context_paces      = fold_meta.get("context_paces") if fold_meta else None
+        context_timeframes = fold_meta.get("context_timeframes") if fold_meta else None
+        if context_paces is None or context_timeframes is None:
+            raise RuntimeError(
+                "Checkpoint requires multi-timeframe context "
+                f"(state_dim={actual_state_dim} > {STATE_DIM}) but "
+                f"{FINAL_FOLD_META_PATH} doesn't record context_paces/"
+                "context_timeframes — cannot reconstruct a matching state. "
+                "Re-run main_mcknn.py training (this revision) to regenerate it."
+            )
+        print(f"  Building multi-timeframe context for {context_timeframes} "
+              f"(paces={context_paces}) to match checkpoint state_dim={actual_state_dim}...")
+        timeframe_dfs = update_all_timeframes(tuple(context_timeframes))
+        missing = [tf for tf in context_timeframes if tf not in timeframe_dfs]
+        if missing:
+            raise FileNotFoundError(
+                f"Checkpoint requires context timeframe(s) {missing} but raw "
+                f"data is missing under data/raw/<timeframe>/*.csv — cannot "
+                f"evaluate this checkpoint without it."
+            )
+        timeframe_frames = {
+            tf: tdf[["Open_time"] + FEATURES].dropna().reset_index(drop=True)
+            for tf, tdf in timeframe_dfs.items()
+        }
+        extra_context_arr = build_multi_timeframe_context(
+            df, timeframe_frames, FEATURES, context_paces=tuple(context_paces),
+        )
+        rebuilt_dim = (len(FEATURES) * 2 * len(PACES)) + extra_context_arr.shape[1] + 2
+        if rebuilt_dim != actual_state_dim:
+            raise RuntimeError(
+                f"Rebuilt state_dim={rebuilt_dim} doesn't match checkpoint's "
+                f"actual state_dim={actual_state_dim} — context_paces/"
+                f"context_timeframes recorded in {FINAL_FOLD_META_PATH} no "
+                f"longer match this codebase's FEATURES/PACES. Diagnostics "
+                f"would silently misalign states if run anyway — aborting."
+            )
+        print(f"  ✓  Context shape {extra_context_arr.shape} confirmed to "
+              f"match checkpoint (total state_dim={rebuilt_dim}).")
+
+    splits, contexts = make_splits(df, fold_meta=fold_meta,
+                                    extra_context_arr=extra_context_arr)
+
+    # ── Surface the walk-forward CV robustness distribution — the most
+    #    informative "should I trust this" signal this revision adds,
+    #    previously only ever printed during training and then lost. ────
+    cv_summary = None
+    if os.path.exists(CV_SUMMARY_PATH):
+        import json
+        with open(CV_SUMMARY_PATH) as f:
+            cv_summary = json.load(f)
+        print(f"\n{'='*62}")
+        print(f"  WALK-FORWARD CV SUMMARY (from training — {CV_SUMMARY_PATH})")
+        print(f"{'='*62}")
+        print(f"  Folds run     : {cv_summary['n_folds']}  "
+              f"({cv_summary['n_folds_positive']} positive)")
+        print(f"  Mean val P/L  : {cv_summary['mean_val_pnl']:+.4%}")
+        print(f"  Std  val P/L  : {cv_summary['std_val_pnl']:.4%}")
+        print(f"  Range         : {cv_summary['min_val_pnl']:+.4%} → "
+              f"{cv_summary['max_val_pnl']:+.4%}")
+        if cv_summary.get("std_exceeds_mean_warning"):
+            print(f"  ⚠ Std exceeds |mean| across folds — this single "
+                  f"checkpoint's val result below may not generalize; "
+                  f"treat it as one draw from a noisy distribution, not "
+                  f"a reliable point estimate.")
+        print(f"{'='*62}\n")
+    else:
+        print(f"\n  ⚠  No {CV_SUMMARY_PATH} found — walk-forward CV "
+              f"robustness metrics unavailable. Run main_mcknn.py's "
+              f"full main() (not just run_final_training) to generate it.\n")
+
+    # ── Random baseline on the genuine held-out val window ────────────────────
+    print("Random policy baseline (held-out val window):")
+    random_policy_baseline(splits["val"])
     print()
 
-    # ── Bear / bull regime episodes ───────────────────────────────────────────
+    # ── Bear / bull regime episodes (descriptive only) ────────────────────────
     dash62 = "-" * 62
     eq62   = "=" * 62
     if not args.no_regime:
         for regime_label in ["bear_2022", "bull_trend"]:
             print("\n" + dash62)
-            print(f"  Regime episode: {regime_label.upper()}")
+            print(f"  Regime episode (DESCRIPTIVE ONLY): {regime_label.upper()}")
             print(dash62)
-            ep = collect_episode(agent, splits[regime_label], regime_label)
+            ep = collect_episode(agent, splits[regime_label], regime_label,
+                                 extra_context_arr=contexts[regime_label])
             print(f"  Ticks: {len(ep['ticks']):,}  |  Trades: {len(ep['trades']):,}")
             pnls = plot_trade_outcomes(ep)
             write_summary(ep, agent, pnls)
 
-    # ── Val: each year as a separate episode — no year-boundary phantom trades ─
+    # ── Val: the genuine leak-free held-out diagnostic ─────────────────────────
     if args.split in ("val", "both"):
-        ep_2022 = None
-        ep_2025 = None
-        for val_label, val_key in [("val_2022", "val_2022"),
-                                    ("val_2025", "val_2025")]:
-            print("\n" + dash62)
-            print(f"  Full diagnostic: {val_label.upper()}")
-            print(dash62)
-            ep = collect_episode(agent, splits[val_key], val_label)
-            print(f"  Ticks: {len(ep['ticks']):,}  |  Trades: {len(ep['trades']):,}")
-            print("\n  Generating plots...")
-            pnls = run_full_suite(agent, ep)
-            print()
-            write_summary(ep, agent, pnls)
-            if val_key == "val_2022":
-                ep_2022 = ep
-            else:
-                ep_2025 = ep
+        print("\n" + dash62)
+        print("  Full diagnostic: VAL (held-out)")
+        print(dash62)
+        ep = collect_episode(agent, splits["val"], "val",
+                             extra_context_arr=contexts["val"])
+        print(f"  Ticks: {len(ep['ticks']):,}  |  Trades: {len(ep['trades']):,}")
+        print("\n  Generating plots...")
+        pnls = run_full_suite(agent, ep)
+        print()
+        write_summary(ep, agent, pnls)
 
-        # ── Combined val summary (matches training loop v_pnl) ────────────────
-        if ep_2022 is not None and ep_2025 is not None:
-            pnl_2022 = sum(t["pnl"] for t in ep_2022["trades"])
-            pnl_2025 = sum(t["pnl"] for t in ep_2025["trades"])
-            n_2022   = len(ep_2022["trades"])
-            n_2025   = len(ep_2025["trades"])
-            print("\n  ── Val combined (matches training loop) " + "-" * 20)
-            print(f"  Val 2022 P/L : {pnl_2022:+.4%}  |  trades={n_2022}")
-            print(f"  Val 2025 P/L : {pnl_2025:+.4%}  |  trades={n_2025}")
-            print(f"  Val total    : {pnl_2022 + pnl_2025:+.4%}"
-                  f"  |  trades={n_2022 + n_2025}")
+        if ep["trades"]:
+            n_excl_mean = float(ep["n_excluded_temporal"].mean()) if len(ep["n_excluded_temporal"]) else 0.0
+            print(f"\n  ── Held-out val confirmation " + "-" * 30)
+            print(f"  Val P/L      : {sum(t['pnl'] for t in ep['trades']):+.4%}  "
+                  f"|  trades={len(ep['trades'])}")
+            print(f"  Mean n_excluded_temporal per query: {n_excl_mean:.2f} "
+                  f"(expected ≈0 — this is an eval pass, exclusion is a "
+                  f"training-time mechanism; a nonzero value here would "
+                  f"indicate query_tick/query_episode_id were unexpectedly set)")
 
     # ── Train full diagnostic ─────────────────────────────────────────────────
     if args.split in ("train", "both"):
         print("\n" + dash62)
         print("  Full diagnostic: TRAIN")
         print(dash62)
-        ep = collect_episode(agent, splits["train"], "train")
+        ep = collect_episode(agent, splits["train"], "train",
+                             extra_context_arr=contexts["train"])
         print(f"  Ticks: {len(ep['ticks']):,}  |  Trades: {len(ep['trades']):,}")
         print("\n  Generating plots...")
         pnls = run_full_suite(agent, ep)

@@ -4,15 +4,15 @@ agents/mc_knn_agent.py
 Top-level agent object — drop-in structural replacement for
 agents/sac_agent.py's SACAgent.
 
-CHANGES IN THIS REVISION
-───────────────────────────
-__init__ now accepts and forwards eps_dist / max_weight_ratio /
-min_tick_gap to MCKNNMemory (see mc_knn_memory.py docstring for what
-each one fixes). select_action() accepts optional query_tick /
-query_episode_id / min_tick_gap and forwards them to the policy/memory
-so the caller (unified_executor.py / main_mcknn.py) can opt in to
-temporal exclusion during training without changing the public
-select_action signature's required arguments.
+REVISION 2 — TEMPORAL EXCLUSION FIX
+────────────────────────────────────────
+__init__ now accepts and forwards min_tick_gap to MCKNNMemory (see
+mc_knn_memory.py docstring for what this fixes). select_action()
+accepts optional query_tick / query_episode_id / min_tick_gap and
+forwards them to the policy/memory so the caller (unified_executor.py
+/ main_mcknn.py) can opt in to temporal exclusion during training
+without changing the public select_action signature's required
+arguments.
 """
 
 import os
@@ -31,8 +31,6 @@ class MCKNNAgent:
         max_size:   int = 200_000,
         gamma:      float = 0.97,
         signal_threshold: float = 0.0005,
-        eps_dist: float = 1e-3,
-        max_weight_ratio: float = 50.0,
         min_tick_gap: int = 100,
         device: str = None,   # accepted, unused — keeps call sites unchanged
     ):
@@ -44,7 +42,6 @@ class MCKNNAgent:
         self.memory = MCKNNMemory(
             state_dim=state_dim, action_dim=action_dim,
             k=k, max_size=max_size, signal_threshold=signal_threshold,
-            eps_dist=eps_dist, max_weight_ratio=max_weight_ratio,
             min_tick_gap=min_tick_gap,
         )
         self.actor = MCKNNPolicy(self.memory, action_dim=action_dim)
@@ -57,7 +54,7 @@ class MCKNNAgent:
 
         print(f"[MCKNNAgent] state_dim={state_dim} action_dim={action_dim} "
               f"k={k} max_size={max_size:,} gamma={gamma}  "
-              f"max_weight_ratio={max_weight_ratio} min_tick_gap={min_tick_gap}  "
+              f"min_tick_gap={min_tick_gap}  "
               f"(no GPU/optimiser — memory bank only)")
 
     # ── critic shim: explicit failure instead of silent wrong behaviour ─────

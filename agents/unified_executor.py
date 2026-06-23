@@ -1,38 +1,59 @@
 """
-agents/unified_executor.py  (SAC refactor, MC-kNN temporal-exclusion patch)
+agents/unified_executor.py  (SAC refactor, MC-kNN temporal-exclusion +
+                              multi-timeframe context patch)
 ─────────────────────────────────────────────────────────────────────────────
 Thin execution layer that sits between the agent and the environment.
 
 CHANGES IN THIS REVISION
 ───────────────────────────
-step() accepts an optional `episode_id` kwarg. When supplied (training
-calls main_mcknn.py's run_epoch will pass it; eval/live calls leave it
-None), it is forwarded — along with the current `tick` — to
-agent.select_action() as query_tick/query_episode_id, enabling
-MCKNNMemory's temporal exclusion. For SACAgent this kwarg is simply
-unused (SACAgent.select_action doesn't accept it... see note below).
+1. (carried over) step()/select_action() temporal-exclusion plumbing
+   for MCKNNMemory — unchanged from the prior revision, see below.
+
+2. NEW: step() accepts an optional `extra_context` vector — a
+   precomputed, leakage-safe multi-timeframe context block (e.g. from
+   multi_timeframe_state.build_multi_timeframe_context()) for THIS
+   exact tick. When supplied, get_state() concatenates it into the
+   state vector AFTER the primary aggregator's market vector and
+   BEFORE the 2 portfolio features, so:
+     - diagnostic_mcknn.py's `ep["states_arr"][:, feat_idx]` for
+       feat_idx in range(len(FEATURES)) still correctly indexes the
+       first pace's raw-indicator block (unaffected — that block's
+       position hasn't moved),
+     - `s_t[-1]` (unrealized PnL) and `s_t[-2]` (position side) are
+       still the last two state dimensions regardless of how much
+       extra context is inserted in between.
+   This is purely an executor-level concatenation; all the actual
+   multi-timeframe alignment/leakage-prevention work happens upstream
+   in multi_timeframe_state.py — this file just plugs the result in.
+   If `extra_context` is never passed, behaviour is byte-for-byte
+   identical to the previous revision (4h-only state).
 
 Backward-compat note: SACAgent.select_action() does NOT have
 query_tick/query_episode_id/min_tick_gap parameters. To keep this
 executor usable for BOTH agent types without an isinstance check, the
 call below only passes the extra kwargs when episode_id is not None
-AND the agent advertises support for them (duck-typed via hasattr on
-the bound method's __code__ co_varnames — see _agent_supports_temporal_args).
-If the agent doesn't support them, they're silently dropped, so nothing
-changes for SAC.
+AND the agent advertises support for them (duck-typed via
+inspect.signature — see _agent_supports_temporal_args). If the agent
+doesn't support them, they're silently dropped, so nothing changes
+for SAC.
 
 Everything else (position/PnL tracking, commission model, get_status())
 is unchanged from the prior revision.
 """
 
 import inspect
-import torch
 import numpy as np
 import collections
 from agents.state_aggregator import StateAggregator
 
 COMMISSION = 0.00015  # Matches training — do not change without retraining
 MAX_HOLD_TICKS = 32
+
+# ── numpy-only note ──────────────────────────────────────────────────────────
+# This executor has ZERO torch dependency end-to-end: action masks are
+# plain numpy bool arrays, consumed by MCKNNMemory.query() via
+# np.asarray(action_mask, dtype=bool). (A torch dependency briefly crept
+# back into _get_action_mask() in an earlier edit pass — reverted here.)
 
 
 def _agent_supports_temporal_args(agent) -> bool:
@@ -99,19 +120,42 @@ class UnifiedExecutor:
 
         return {"position": side_val, "unrealized_pnl": u_pnl}
 
-    def get_state(self, indicators: np.ndarray, price: float) -> np.ndarray:
-        """Build and return the current state vector."""
+    def get_state(self, indicators: np.ndarray, price: float,
+                  extra_context: np.ndarray = None) -> np.ndarray:
+        """
+        Build and return the current state vector.
+
+        Layout: [primary 4h aggregator market vector] + [extra_context,
+        if provided] + [portfolio: position, unrealized_pnl].
+        Portfolio features are always last regardless of extra_context,
+        so any code indexing `state[-2:]` or `state[-1]` for portfolio
+        info (e.g. diagnostic_mcknn.py's unrealized_pnl extraction)
+        keeps working unmodified whether or not multi-timeframe context
+        is in use.
+        """
         self.aggregator.update(indicators)
         portfolio_info = self.portfolio_info(price)
-        return self.aggregator.get_state(portfolio_info)
+        # StateAggregator.get_state() always appends a 2-dim portfolio
+        # block (zeros if portfolio_info=None) — strip it here since we
+        # build the real portfolio_vec ourselves below and need control
+        # over where it sits relative to extra_context.
+        market_vec = self.aggregator.get_state(portfolio_info=None)[:-2]
+        portfolio_vec = np.array([
+            portfolio_info["position"], portfolio_info["unrealized_pnl"],
+        ], dtype=np.float32)
+
+        if extra_context is not None:
+            extra_context = np.asarray(extra_context, dtype=np.float32)
+            return np.concatenate([market_vec, extra_context, portfolio_vec])
+        return np.concatenate([market_vec, portfolio_vec])
 
     # ── Core step ────────────────────────────────────────────────────────────
 
-    def _get_action_mask(self) -> torch.Tensor:
+    def _get_action_mask(self) -> np.ndarray:
         if self.current_side is None:
-            return torch.tensor([True, True, False, True])  # flat: no CLOSE
+            return np.array([True, True, False, True])  # flat: no CLOSE
         else:
-            return torch.tensor([False, False, True, True])  # in-pos: CLOSE or HOLD
+            return np.array([False, False, True, True])  # in-pos: CLOSE or HOLD
 
     def _select_action(self, state, deterministic, action_mask, episode_id):
         """
@@ -130,14 +174,15 @@ class UnifiedExecutor:
             state, deterministic=deterministic, action_mask=action_mask,
         )
 
-    def step(self, indicators, price, tick, epsilon=0.0, episode_id=None):
+    def step(self, indicators, price, tick, epsilon=0.0, episode_id=None,
+             extra_context: np.ndarray = None):
         self.tick = tick
-        state = self.get_state(indicators, price)
+        state = self.get_state(indicators, price, extra_context=extra_context)
 
         ATR_IDX = 4  # ATR_Scaled in the indicators array
         if self.current_side is None and abs(indicators[ATR_IDX]) > 2.0:
             self.last_probs = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-            return 3, self.last_probs, 0.0, self.get_state(indicators, price)
+            return 3, self.last_probs, 0.0, self.get_state(indicators, price, extra_context=extra_context)
 
         if self.current_side is not None:
             u_pnl = self.portfolio_info(price)["unrealized_pnl"]
@@ -153,7 +198,7 @@ class UnifiedExecutor:
         mask = self._get_action_mask()
 
         if not self.deterministic and epsilon > 0 and np.random.random() < epsilon:
-            valid_actions = mask.nonzero().squeeze(-1).tolist()
+            valid_actions = np.flatnonzero(mask).tolist()
             action = np.random.choice(valid_actions)
             _, probs = self._select_action(state, False, None, episode_id)
         else:

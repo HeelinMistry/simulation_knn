@@ -3,9 +3,30 @@ live_mcknn.py
 ───────────────
 Visual backtest + live inference runner for the MC-kNN trading agent.
 
+CHANGES IN THIS REVISION — ALIGNMENT FIX
+─────────────────────────────────────────────
+This file previously hardcoded STATE_DIM=50 (4h-only) and never fetched
+or built 15m/1h context. main_mcknn.py can now train checkpoints with
+multi-timeframe context (STATE_DIM=122), and loading one of those here
+unmodified would crash inside MCKNNMemory.query()'s
+`cand_states - state[None, :]` (122 vs 50 dims) — or worse, if you'd
+also disabled context everywhere, would silently run the wrong-shaped
+agent against a checkpoint that no longer matches.
+
+Fix: after loading the checkpoint, we read agent.memory.state_dim (the
+bank's OWN ground truth, restored by MCKNNMemory.load() regardless of
+what we pass the constructor) and decide whether multi-timeframe
+context is required. If so, we fetch 15m/1h candles from Binance
+alongside the primary 4h candles, build the same context the model was
+trained on (multi_timeframe_state.py), and validate the combined
+dimension matches before launching — see _fetch_and_prepare_context()
+and main() below. Live polling (_update_live) refetches and rebuilds
+this context on every new candle, mirroring how it already rebuilds
+the primary aggregator from scratch each cycle.
+
 Mapping vs live.py
 ─────────────────────
-EVERYTHING in this file is structurally identical to live.py except:
+EVERYTHING else in this file is structurally identical to live.py except:
   - import agents.sac_agent.SACAgent  -> agents.mc_knn_agent.MCKNNAgent
   - CHECKPOINT_PATH default .pt -> .npz
   - _load_agent(): no .eval()/.requires_grad_(False) calls (nothing to
@@ -49,6 +70,7 @@ import requests
 from agents.mc_knn_agent     import MCKNNAgent
 from agents.unified_executor import UnifiedExecutor
 from data.preprocessing      import preprocess_indicators_data
+from multi_timeframe_state   import build_timeframe_context, align_to_primary
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration  (must match main_mcknn.py exactly)
@@ -65,10 +87,31 @@ FEATURES         = ["RSI_Scaled", "MACD_Scaled", "BB_Scaled",
                     "OBV_Scaled", "ATR_Scaled", "MeanDev_Scaled"]
 NUM_INDICATORS   = len(FEATURES)
 PACES     = (1, 6, 42, 90)
-STATE_DIM = (NUM_INDICATORS * 2 * len(PACES)) + 2
+STATE_DIM = (NUM_INDICATORS * 2 * len(PACES)) + 2   # legacy 4h-only dim;
+                                                     # see main()'s
+                                                     # uses_context check
 ACTION_DIM       = 4
 ACTION_NAMES     = {0: "LONG", 1: "SHORT", 2: "CLOSE", 3: "HOLD"}
 K_NEIGHBORS      = 25
+
+# ── Multi-timeframe context — MUST match main_mcknn.py's CONTEXT_PACES /
+#    CONTEXT_TIMEFRAMES exactly, or a context-trained checkpoint's bank
+#    won't line up with what gets built here. Only used if the loaded
+#    checkpoint's state_dim indicates it needs context — see main(). ──────
+CONTEXT_TIMEFRAMES = ("15m", "1h")
+CONTEXT_PACES      = (1, 4, 16)
+CONTEXT_WINDOW     = 8     # MultiPaceAgent max_history default
+# How many raw candles to fetch per context timeframe so that, AFTER
+# indicator rolling windows (up to 200 ticks) and the context
+# aggregator's own warm-up (max(200, max(CONTEXT_PACES)*CONTEXT_WINDOW))
+# are both satisfied, there's still enough history left to cover the
+# full calendar span of the primary WARMUP_CANDLES (600 × 4h ≈ 100 days)
+# — e.g. 15m has 96 candles/day, so 100 days + ~400 buffer candles for
+# the two warm-up stages comfortably covers it.
+CONTEXT_WARMUP_CANDLES = {
+    "15m": 100 * 96 + 600,
+    "1h":  100 * 24 + 600,
+}
 
 CHECKPOINT_PATH  = "outcomes/mc_knn_agent_best.npz"
 LOG_DIR          = "outcomes/live_logs_mcknn"
@@ -108,22 +151,98 @@ def _parse_klines(data: list) -> pd.DataFrame:
     return df
 
 
-def get_candles(symbol: str, limit: int = WARMUP_CANDLES) -> pd.DataFrame | None:
+def get_candles(symbol: str, limit: int = WARMUP_CANDLES,
+                interval: str = CANDLE_INTERVAL) -> pd.DataFrame | None:
     """
-    Fetch the latest `limit` closed candles for symbol+USDT.
-    Always drops the last row (currently forming candle).
+    Fetch the latest `limit` closed candles for symbol+USDT at the given
+    interval. Always drops the last row (currently forming candle).
     Returns None on any network error.
+
+    `interval` defaults to the primary CANDLE_INTERVAL (4h) so every
+    existing call site (which didn't pass it) is unaffected; the new
+    multi-timeframe context fetch passes interval="15m"/"1h" explicitly.
     """
     url = (f"{BINANCE_API_URL}v3/klines"
-           f"?symbol={symbol}&interval={CANDLE_INTERVAL}&limit={limit + 1}")
+           f"?symbol={symbol}&interval={interval}&limit={limit + 1}")
     try:
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         df = _parse_klines(r.json())
         return df.iloc[:-1].reset_index(drop=True)   # drop the forming candle
     except Exception as exc:
-        log.error(f"Binance fetch error: {exc}")
+        log.error(f"Binance fetch error ({interval}): {exc}")
         return None
+
+
+def fetch_and_build_context(symbol: str, primary_df: pd.DataFrame) -> np.ndarray | None:
+    """
+    Fetch 15m/1h candles, compute their indicators, and build the
+    leakage-safe multi-timeframe context aligned onto primary_df's 4h
+    ticks — the live-data equivalent of main_mcknn.py's
+    build_multi_timeframe_context() call, using the SAME
+    CONTEXT_TIMEFRAMES/CONTEXT_PACES so a checkpoint trained with
+    context gets the exact same state shape here.
+
+    Returns None (with a logged reason) if any context timeframe's
+    fetch or indicator pass fails — callers treat this as "context
+    unavailable right now", which the caller in main()/_update_live()
+    surfaces loudly rather than silently falling back to a 4h-only
+    state that wouldn't match the checkpoint's expected dimensionality.
+    """
+    timeframe_frames = {}
+    for tf in CONTEXT_TIMEFRAMES:
+        limit = CONTEXT_WARMUP_CANDLES.get(tf, 5000)
+        log.info(f"Fetching {limit} {tf} candles for context ({symbol})...")
+        raw = get_candles(symbol, limit=limit, interval=tf)
+        if raw is None:
+            log.error(f"Context fetch failed for {tf} — cannot build "
+                      f"multi-timeframe state.")
+            return None
+        ind_df = apply_indicators_no_min_rows(raw)
+        if ind_df is None or len(ind_df) < 300:
+            log.error(f"Too few {tf} rows after indicators "
+                      f"({0 if ind_df is None else len(ind_df)}) — need "
+                      f"≥300 for context warm-up. Increase "
+                      f"CONTEXT_WARMUP_CANDLES['{tf}'].")
+            return None
+        timeframe_frames[tf] = ind_df[["Open_time"] + FEATURES]
+        log.info(f"  {tf}: {len(ind_df)} rows after indicators "
+                 f"({ind_df['Open_time'].iloc[0]} → {ind_df['Open_time'].iloc[-1]})")
+
+    try:
+        aligned_blocks = []
+        for tf, tf_df in timeframe_frames.items():
+            ctx = build_timeframe_context(
+                tf_df, FEATURES, paces=CONTEXT_PACES, window=CONTEXT_WINDOW,
+            )
+            aligned = align_to_primary(primary_df, ctx, prefix=f"ctx_{tf}_")
+            aligned_blocks.append(aligned.values)
+            log.info(f"  Aligned {tf} context: {aligned.shape[1]} dims "
+                     f"over {len(aligned):,} primary ticks")
+        return np.concatenate(aligned_blocks, axis=1).astype(np.float32)
+    except (ValueError, AssertionError) as exc:
+        log.error(f"Context build failed: {exc}")
+        return None
+
+
+def apply_indicators_no_min_rows(raw_df: pd.DataFrame) -> pd.DataFrame | None:
+    """
+    Same as apply_indicators() but without the WARMUP_IDX+2 minimum-row
+    check, which is specific to the PRIMARY timeframe's warm-up
+    requirement and too strict for context timeframes (which have their
+    own, separate warm-up sizing — see build_timeframe_context()'s
+    warmup_idx default). Used only for 15m/1h context candles.
+    """
+    tmp = os.path.join(LOG_DIR, "_live_tmp_ctx.csv")
+    try:
+        raw_df.to_csv(tmp, index=False)
+        return preprocess_indicators_data(tmp, tmp)
+    except Exception as exc:
+        log.error(f"Context indicator calculation failed: {exc}")
+        return None
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def apply_indicators(raw_df: pd.DataFrame) -> pd.DataFrame | None:
@@ -195,6 +314,7 @@ class LiveWindow(arcade.Window):
         executor:     UnifiedExecutor,
         symbol:       str,
         mode:         str = "backtest",      # "backtest" | "live"
+        extra_context_arr: np.ndarray = None,
     ):
         title = f"MC-kNN {'Backtest' if mode == 'backtest' else 'LIVE'}  —  {symbol}  4h"
         super().__init__(WIN_W, WIN_H, title, update_rate=1 / 60)
@@ -203,6 +323,13 @@ class LiveWindow(arcade.Window):
         self.executor = executor
         self.symbol   = symbol
         self.mode     = mode
+
+        # ── Multi-timeframe context (None if checkpoint is 4h-only) ──────────
+        # Aligned 1:1 with self.df's rows. In live mode, _update_live()
+        # refetches and rebuilds this on every new candle alongside the
+        # primary aggregator rebuild — see fetch_and_build_context().
+        self.extra_context_arr = extra_context_arr
+        self.uses_context = extra_context_arr is not None
 
         # Price range for Y-mapping (cached)
         self._price_min = float(df["Close"].min())
@@ -282,10 +409,13 @@ class LiveWindow(arcade.Window):
 
         # MC-kNN inference (same call shape as the SAC version's
         # executor.step — see unified_executor.py: agent-agnostic)
+        extra_ctx = (self.extra_context_arr[self.current_tick]
+                    if self.uses_context else None)
         action, probs, realised_pnl, _state = self.executor.step(
             indicators=ind,
             price=float(row["Close"]),
             tick=self.current_tick,
+            extra_context=extra_ctx,
         )
 
         # Track PnL
@@ -364,6 +494,22 @@ class LiveWindow(arcade.Window):
         self._price_min = float(self.df["Close"].min())
         self._price_max = float(self.df["Close"].max())
         self._n_display = new_len
+
+        # ── Refetch + rebuild multi-timeframe context to match the new
+        #    df, same pattern as the aggregator rebuild below. If the
+        #    checkpoint needs context and this fails, we skip stepping
+        #    forward entirely rather than feed the agent a wrong-shaped
+        #    state — better to miss a cycle than query
+        #    MCKNNMemory.query() with mismatched dims or silently fall
+        #    back to a state the model was never trained on. ──────────────
+        if self.uses_context:
+            new_ctx = fetch_and_build_context(self.symbol, self.df)
+            if new_ctx is None or len(new_ctx) != new_len:
+                log.warning("Context refetch failed or misaligned — "
+                           "skipping this cycle, will retry next.")
+                self._next_candle_ts += CANDLE_SECONDS
+                return
+            self.extra_context_arr = new_ctx
 
         # Rebuild the aggregator from scratch with the new full dataset
         ind_arr = self.df[FEATURES].values.astype(np.float32)
@@ -574,6 +720,13 @@ def _load_agent() -> MCKNNAgent:
     .requires_grad_(False) calls — there are no nn.Module parameters
     to freeze; the memory bank is read-only by construction once loaded
     (query() never mutates state).
+
+    NOTE: the state_dim passed to the constructor here is just a
+    placeholder — agent.load() replaces self.memory entirely with
+    MCKNNMemory.load(npz_path), which restores the BANK'S OWN saved
+    state_dim regardless of what we pass. main() reads
+    agent.memory.state_dim AFTER this call to decide whether
+    multi-timeframe context needs to be fetched — see main() below.
     """
     agent = MCKNNAgent(state_dim=STATE_DIM, action_dim=ACTION_DIM, k=K_NEIGHBORS)
     agent.load(CHECKPOINT_PATH)
@@ -622,11 +775,43 @@ def main():
     log.info("Loading MC-kNN agent...")
     agent = _load_agent()
 
-    # ── Fetch data ────────────────────────────────────────────────────────────
+    # ── ALIGNMENT FIX: determine whether this checkpoint needs
+    #    multi-timeframe context from its OWN bank state_dim (ground
+    #    truth, restored by agent.load()), not from a hardcoded
+    #    constant — see module docstring. ─────────────────────────────────
+    actual_state_dim = agent.memory.state_dim
+    uses_context = actual_state_dim > STATE_DIM
+    log.info(f"Checkpoint state_dim={actual_state_dim}  "
+             f"(multi_timeframe={'yes' if uses_context else 'no'})")
+
+    # ── Fetch primary (4h) data ────────────────────────────────────────────────
     df = _fetch_and_prepare(symbol)
     if df is None:
-        log.error("Could not fetch/process data. Exiting.")
+        log.error("Could not fetch/process primary data. Exiting.")
         return
+
+    extra_context_arr = None
+    if uses_context:
+        log.info(f"Fetching multi-timeframe context {CONTEXT_TIMEFRAMES} "
+                 f"to match checkpoint state_dim={actual_state_dim}...")
+        extra_context_arr = fetch_and_build_context(symbol, df)
+        if extra_context_arr is None:
+            log.error("Could not build multi-timeframe context, but this "
+                      "checkpoint requires it. Exiting rather than running "
+                      "with a wrong-shaped state.")
+            return
+        rebuilt_dim = STATE_DIM + extra_context_arr.shape[1]
+        if rebuilt_dim != actual_state_dim:
+            log.error(
+                f"Rebuilt state_dim={rebuilt_dim} doesn't match checkpoint's "
+                f"actual state_dim={actual_state_dim} — CONTEXT_PACES/"
+                f"CONTEXT_TIMEFRAMES in this file no longer match what the "
+                f"checkpoint was trained with. Exiting rather than running "
+                f"misaligned states through inference."
+            )
+            return
+        log.info(f"  ✓  Context shape {extra_context_arr.shape} confirmed "
+                 f"to match checkpoint (total state_dim={rebuilt_dim}).")
 
     # ── Build executor ────────────────────────────────────────────────────────
     executor = UnifiedExecutor(
@@ -644,6 +829,7 @@ def main():
         executor=executor,
         symbol=symbol,
         mode=args.mode,
+        extra_context_arr=extra_context_arr,
     )
 
     log.info(f"  Data range: {df['Open_time'].iloc[0]} → {df['Open_time'].iloc[-1]}")

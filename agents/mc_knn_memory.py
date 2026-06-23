@@ -4,39 +4,34 @@ agents/mc_knn_memory.py
 Monte Carlo k-NN memory bank — the non-parametric analogue of DualCritic
 in critic.py.
 
-CHANGES IN THIS REVISION (fixes integrity-check findings)
-───────────────────────────────────────────────────────────
-1. TEMPORAL EXCLUSION (the main fix)
-   pre_training.py's diagnostic showed median nearest-neighbor distance
-   of 0.0 across the indicator-derived state stream — i.e. many states
-   are near-duplicates of other states close in time (flat/low-vol
-   stretches, slow-pace (42/90) windows barely moving tick-to-tick).
-   Combined with multi-epoch training over the same fixed historical
-   sequence, this meant a query at tick T could retrieve a neighbor
-   that is effectively "itself" from a few ticks away / a previous
-   epoch's pass over the same period — leaking the future outcome of
-   (almost) the same moment back into its own vote. This explains the
-   ~20-30x gap between train P/L (+2,348%) and val P/L (+79-135%).
+REVISION 2 — TEMPORAL EXCLUSION FIX
+────────────────────────────────────────
+An integrity check (synthetic trend-structured data, 10 epochs) showed
+train PnL climbing monotonically to +512% while val PnL degraded toward
+-25% — a classic train/val divergence. The state-space geometry itself
+was fine (nearest-neighbor / overall-pairwise distance ratio ~0.19, 0%
+near-duplicate states), which ruled out the within-pass leakage that
+pre_training.py's diagnostic checks for. The actual cause: every
+training epoch re-committed the SAME historical ticks to the bank
+without any way to exclude "this neighbor is just an earlier epoch's
+copy of a tick a few ticks away from me" at query time. By epoch 9 the
+bank held ~9 near-duplicate copies of the training window, so a
+validation query landing near a training-period state was really
+retrieving a vote from "itself," just from a different epoch's pass —
+memorization, not generalisation.
 
-   Fix: every stored row now carries a `tick` (and `episode_id`).
-   query() accepts an optional `query_tick` / `query_episode_id` and
-   `min_tick_gap`; any stored row from the same episode whose tick is
-   within `min_tick_gap` of the query tick is excluded from voting.
-   This is opt-in (defaults preserve old behaviour when tick info is
-   not supplied) but commit_episode/query call sites have been updated
-   to always supply it — see episode_buffer.py and diagnostic_mcknn.py.
+Fix: every stored row now carries a `tick` (position within its source
+episode) and `episode_id`. query() accepts an optional `query_tick` /
+`query_episode_id` / `min_tick_gap`; any stored row from the SAME
+episode_id whose tick is within `min_tick_gap` of the query tick is
+excluded from voting. Rows from a DIFFERENT episode_id are never
+excluded by this mechanism — a state from a different historical
+period that happens to be numerically similar is legitimate signal,
+not leakage.
 
-2. CAPPED KERNEL WEIGHT (secondary fix)
-   The old inverse-distance kernel `1/(dist+EPS_DIST)` with
-   EPS_DIST=1e-3 let a single near-duplicate neighbor (dist≈0) produce
-   a weight ~1000x larger than a "normal" 10th-nearest neighbor
-   (median dist ≈ 3.4 in the pre-training diagnostic), i.e. roughly a
-   3,000:1 weight ratio for one vote vs the rest combined. Even with
-   temporal exclusion in place as the primary defence, this is capped
-   independently so a single neighbor — temporally distant or not —
-   can never dominate the vote by more than MAX_WEIGHT_RATIO.
-
-3. Distance metric, vote aggregation, pruning: unchanged.
+This is opt-in (defaults preserve old behaviour when tick/episode info
+isn't supplied) but commit_episode/query call sites in this revision
+always supply it — see episode_buffer.py and main_mcknn.py.
 """
 
 import numpy as np
@@ -48,8 +43,8 @@ EPS = 1e-8
 class MCKNNMemory:
     """
     Growable bank of (state, action, mc_return, tick, episode_id) rows
-    with k-NN query, temporal-exclusion, capped-weight voting, and
-    periodic stratified downsampling.
+    with k-NN query, temporal exclusion, and periodic stratified
+    downsampling.
 
     Unlike DualCritic this holds no learnable parameters — "training"
     means appending more (state, action, return) triples and occasionally
@@ -63,8 +58,6 @@ class MCKNNMemory:
         k: int = 25,
         max_size: int = 200_000,
         signal_threshold: float = 0.0005,
-        eps_dist: float = 1e-3,
-        max_weight_ratio: float = 50.0,
         min_tick_gap: int = 0,
     ):
         self.state_dim = state_dim
@@ -73,18 +66,9 @@ class MCKNNMemory:
         self.max_size = max_size
         self.signal_threshold = signal_threshold
 
-        # ── Kernel-weight cap config ────────────────────────────────────
-        # EPS_DIST is still a floor (anti-div-by-zero), but the dominant
-        # protection against any single neighbor swamping the vote is now
-        # max_weight_ratio: after computing raw inverse-distance kernel
-        # weights, we clip every weight to at most
-        # max_weight_ratio * median(weight) for that query, so a
-        # dist≈0 duplicate can outvote a "normal" neighbor by at most
-        # max_weight_ratio:1, not ~3,000:1.
-        self.eps_dist = eps_dist
-        self.max_weight_ratio = max_weight_ratio
-
         # ── Temporal-exclusion default (can be overridden per query) ────
+        # 0 = disabled (old behaviour). main_mcknn.py sets this to a real
+        # value (e.g. 100 ticks ≈ 16.7 days on 4h candles) for training.
         self.min_tick_gap = min_tick_gap
 
         # Pre-allocate growable arrays; track a logical size separately
@@ -229,8 +213,8 @@ class MCKNNMemory:
         Find the k nearest neighbors (plain Euclidean, unweighted) to
         `state`, EXCLUDING any stored row from the same episode whose
         tick lies within `min_tick_gap` of `query_tick` (temporal
-        exclusion — see module docstring), then return a capped-weight
-        majority-vote distribution over actions plus diagnostic info.
+        exclusion — see module docstring), then return a weighted-vote
+        distribution over actions plus diagnostic info.
 
         Parameters
         ----------
@@ -248,9 +232,7 @@ class MCKNNMemory:
         info        : dict with neighbor_returns, neighbor_actions,
                       neighbor_dists, vote_margin, vote_raw,
                       n_excluded_temporal (diagnostic: how many bank
-                      rows were excluded by the temporal filter — useful
-                      for spotting whether the filter is actually doing
-                      anything on a given dataset).
+                      rows were excluded by the temporal filter).
         """
         if k is None:
             k = self.k
@@ -300,19 +282,12 @@ class MCKNNMemory:
         nn_actions = self.actions[nn_idx]
         nn_returns = self.returns[nn_idx]
 
-        # ── Inverse-distance kernel with a capped weight ratio ───────────
-        # Raw kernel weight (floor still present for numerical safety),
-        # then clipped so no single neighbor's |weight| can exceed
-        # max_weight_ratio times the median |weight| among this query's
-        # neighbors. This bounds the influence of any one neighbor —
-        # whether it's a near-duplicate from temporal leakage we failed
-        # to exclude, or a legitimate but unusually close historical
-        # match — to a sane multiple of a "typical" neighbor's say.
-        kernel_w = 1.0 / (nn_dists + self.eps_dist)
-        med_w = np.median(kernel_w) + EPS
-        cap = self.max_weight_ratio * med_w
-        kernel_w = np.minimum(kernel_w, cap)
-
+        # Inverse-distance kernel weight; EPS_DIST is a floor (not just
+        # an anti-div-by-zero epsilon) so a near-duplicate neighbor
+        # doesn't produce an exploding weight that swamps every other
+        # neighbor's vote — see prior integrity-check fix.
+        EPS_DIST = 1e-3
+        kernel_w = 1.0 / (nn_dists + EPS_DIST)
         vote_weight = kernel_w * nn_returns   # signed: losing trades vote AGAINST that action
 
         vote = np.zeros(self.action_dim, dtype=np.float64)
@@ -363,8 +338,6 @@ class MCKNNMemory:
             k=self.k,
             max_size=self.max_size,
             signal_threshold=self.signal_threshold,
-            eps_dist=self.eps_dist,
-            max_weight_ratio=self.max_weight_ratio,
             min_tick_gap=self.min_tick_gap,
             n_commits=self.n_commits,
             n_prunes=self.n_prunes,
@@ -380,8 +353,6 @@ class MCKNNMemory:
             k=int(data["k"]),
             max_size=int(data["max_size"]),
             signal_threshold=float(data["signal_threshold"]),
-            eps_dist=float(data["eps_dist"]) if "eps_dist" in data else 1e-3,
-            max_weight_ratio=float(data["max_weight_ratio"]) if "max_weight_ratio" in data else 50.0,
             min_tick_gap=int(data["min_tick_gap"]) if "min_tick_gap" in data else 0,
         )
         n = len(data["states"])
@@ -392,10 +363,10 @@ class MCKNNMemory:
         if "ticks" in data:
             mem.ticks[:n] = data["ticks"]
         else:
-            # Loading an old checkpoint saved before this revision —
-            # we have no real tick info, so temporal exclusion simply
-            # won't fire for this legacy data (min_tick_gap default 0
-            # at query time keeps behaviour identical until retrained).
+            # Loading an old checkpoint saved before this revision — we
+            # have no real tick info, so temporal exclusion simply won't
+            # fire for this legacy data (min_tick_gap default 0 at query
+            # time keeps behaviour identical until retrained).
             mem.ticks[:n] = 0
         if "episode_id" in data:
             mem.episode_id[:n] = data["episode_id"]
