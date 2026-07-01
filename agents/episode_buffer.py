@@ -3,22 +3,23 @@ agents/episode_buffer.py
 ─────────────────────────
 Per-episode transition collector + Monte Carlo return backfill.
 
-REVISION 2 — TEMPORAL EXCLUSION FIX
-────────────────────────────────────────
+CHANGES IN THIS REVISION
+───────────────────────────
 add() now optionally takes a `tick` (the absolute tick index in the
 underlying DataFrame, e.g. main_mcknn.py's loop variable `i`) and the
 buffer is tagged with an `episode_id`. Both are threaded through to
 MCKNNMemory.commit_episode() so the memory bank can apply temporal
-exclusion at query time (see mc_knn_memory.py docstring) — i.e. a query
-made while replaying this same historical pass cannot retrieve a
-neighbor that is really "itself" from a handful of ticks earlier or
-from an earlier epoch's pass over the same period, which was the cause
-of the train/val divergence found by the integrity check (train PnL
-climbing to +512% while val PnL degraded toward -25% over 10 epochs).
+exclusion at query time (see mc_knn_memory.py docstring) — i.e. a
+query made while replaying this same historical pass cannot retrieve
+a neighbor that is really "itself" from a handful of ticks earlier,
+which was the dominant cause of the train/val performance gap found
+in the integrity check (near-zero nearest-neighbor distances in
+pre_training.py's diagnostic + repeated multi-epoch passes over the
+same fixed historical sequence).
 
 If `tick` is never supplied to add(), behaviour is unchanged from the
-previous revision (positional 0..n-1 ticks, single fallback episode_id)
-— fully backward compatible.
+previous revision (positional 0..n-1 ticks, single fallback episode_id) —
+fully backward compatible.
 
 Why this still can't be incremental like the old replay buffer
   G_t depends on ALL future rewards in the episode, so no (state, action)
