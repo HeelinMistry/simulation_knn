@@ -34,6 +34,8 @@ class MCKNNAgent:
         eps_dist: float = 1e-3,
         max_weight_ratio: float = 50.0,
         min_tick_gap: int = 100,
+        block_weights: np.ndarray = None,
+        dim_scale_floor: float = 1e-3,
         device: str = None,   # accepted, unused — keeps call sites unchanged
     ):
         self.state_dim  = state_dim
@@ -46,6 +48,7 @@ class MCKNNAgent:
             k=k, max_size=max_size, signal_threshold=signal_threshold,
             eps_dist=eps_dist, max_weight_ratio=max_weight_ratio,
             min_tick_gap=min_tick_gap,
+            block_weights=block_weights, dim_scale_floor=dim_scale_floor,
         )
         self.actor = MCKNNPolicy(self.memory, action_dim=action_dim)
 
@@ -58,6 +61,7 @@ class MCKNNAgent:
         print(f"[MCKNNAgent] state_dim={state_dim} action_dim={action_dim} "
               f"k={k} max_size={max_size:,} gamma={gamma}  "
               f"max_weight_ratio={max_weight_ratio} min_tick_gap={min_tick_gap}  "
+              f"weighted_distance={'custom block_weights' if block_weights is not None else 'uniform (std-normalized only)'}  "
               f"(no GPU/optimiser — memory bank only)")
 
     # ── critic shim: explicit failure instead of silent wrong behaviour ─────

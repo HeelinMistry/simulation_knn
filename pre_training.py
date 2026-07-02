@@ -126,6 +126,36 @@ states, used_context = build_state_space(df)
 print(f"\nn_states {len(states)}  dim {states.shape[1]}  "
       f"(multi_timeframe_context={'YES' if used_context else 'NO — 4h-only'})")
 
+# ── Weighted-distance scale (mirrors mc_knn_memory.py's fix) ─────────────────
+# Build the SAME block_weights / per-dimension std normalization
+# MCKNNMemory now applies in query() — see mc_knn_memory.py's
+# _recompute_dim_scale() docstring. Keeping the constants below in sync
+# with main_mcknn.py's PRIMARY_BLOCK_WEIGHT/CONTEXT_BLOCK_WEIGHT/
+# PORTFOLIO_BLOCK_WEIGHT is the caller's responsibility (this script is
+# intentionally standalone rather than importing main_mcknn.py).
+PRIMARY_BLOCK_WEIGHT   = 1.0
+CONTEXT_BLOCK_WEIGHT   = 0.5
+PORTFOLIO_BLOCK_WEIGHT = 2.0
+
+primary_dim = len(FEATURES) * 2 * len(PACES)
+portfolio_dim = 2
+if used_context:
+    context_dim = states.shape[1] - primary_dim - portfolio_dim
+    block_weights = np.concatenate([
+        np.full(primary_dim, PRIMARY_BLOCK_WEIGHT, dtype=np.float32),
+        np.full(context_dim, CONTEXT_BLOCK_WEIGHT, dtype=np.float32),
+        np.full(portfolio_dim, PORTFOLIO_BLOCK_WEIGHT, dtype=np.float32),
+    ])
+else:
+    block_weights = np.concatenate([
+        np.full(primary_dim, PRIMARY_BLOCK_WEIGHT, dtype=np.float32),
+        np.full(portfolio_dim, PORTFOLIO_BLOCK_WEIGHT, dtype=np.float32),
+    ])
+
+dim_scale_floor = 1e-3
+dim_std = np.maximum(np.std(states, axis=0), dim_scale_floor).astype(np.float32)
+effective_weight = (block_weights / dim_std).astype(np.float32)
+
 # ── Nearest-neighbor distance distribution ───────────────────────────────────
 # BUG FIX (carried over from prior revision): `sample = states[np.random.choice(...)]`
 # copies VALUES into a new array with no memory of which original row each
@@ -145,42 +175,74 @@ sample_idx = np.random.choice(len(states), n_sample, replace=False)
 sample = states[sample_idx]
 
 from scipy.spatial.distance import cdist
-d = cdist(sample, states)
-for row, orig_idx in enumerate(sample_idx):
-    d[row, orig_idx] = np.inf   # exclude true self-distance, not a guessed column
 
-nn_dist = np.sort(d, axis=1)[:, :10]  # 10 nearest per query (self now excluded)
-print('median nearest-neighbor dist:', np.median(nn_dist[:, 0]))
-print('median 10th-NN dist:', np.median(nn_dist[:, 9]))
-print('overall pairwise dist median:', np.median(d[np.isfinite(d)]))
-ratio = np.median(nn_dist[:, 0]) / np.median(d[np.isfinite(d)])
-print('ratio (NN/overall) -- want this << 1:', ratio)
+
+def _ratio_report(label: str, sample_w: np.ndarray, states_w: np.ndarray) -> float:
+    """Run the NN/overall ratio check on (optionally pre-weighted) vectors
+    — weighting vectors before cdist is mathematically equivalent to a
+    diagonal-weighted Euclidean distance, no need for a custom metric."""
+    d = cdist(sample_w, states_w)
+    for row, orig_idx in enumerate(sample_idx):
+        d[row, orig_idx] = np.inf
+    nn_dist = np.sort(d, axis=1)[:, :10]
+    overall_median = np.median(d[np.isfinite(d)])
+    nn_median = np.median(nn_dist[:, 0])
+    ratio = nn_median / overall_median
+    print(f"\n[{label}]")
+    print('  median nearest-neighbor dist:', nn_median)
+    print('  median 10th-NN dist:', np.median(nn_dist[:, 9]))
+    print('  overall pairwise dist median:', overall_median)
+    print('  ratio (NN/overall) -- want this << 1:', ratio)
+    near_dup_threshold = 0.05 * overall_median / 12.7 if overall_median > 0 else 0.05
+    frac = (nn_dist[:, 0] < near_dup_threshold).mean()
+    print(f'  fraction with near-duplicate (dist < {near_dup_threshold:.3f}): {frac:.1%}')
+    return ratio
+
+
+ratio_unweighted = _ratio_report("UNWEIGHTED (raw Euclidean, prior behavior)",
+                                  sample, states)
+ratio_weighted = _ratio_report(
+    "WEIGHTED (block_weights / per-dim std — matches mc_knn_memory.py's fix)",
+    sample * effective_weight[None, :], states * effective_weight[None, :],
+)
+
+print(f"\n{'='*62}")
+print(f"  WEIGHTED-DISTANCE FIX CHECK")
+print(f"{'='*62}")
+print(f"  Unweighted ratio : {ratio_unweighted:.4f}")
+print(f"  Weighted ratio   : {ratio_weighted:.4f}")
+if ratio_weighted < ratio_unweighted:
+    print(f"  ✓  Weighting IMPROVED the ratio "
+          f"({ratio_unweighted:.4f} → {ratio_weighted:.4f}) — context dims "
+          f"are diluting less under the new distance metric.")
+else:
+    print(f"  ⚠  Weighting did NOT improve the ratio "
+          f"({ratio_unweighted:.4f} → {ratio_weighted:.4f}) — current "
+          f"PRIMARY_BLOCK_WEIGHT/CONTEXT_BLOCK_WEIGHT/PORTFOLIO_BLOCK_WEIGHT "
+          f"values may need tuning, or the issue isn't purely a scale/"
+          f"dilution problem (see Layer 3 — value regression — in the "
+          f"generalized framework discussion if this persists).")
+print(f"{'='*62}")
 
 # ── Genuine near-duplicate diagnostic (separate from the self-exclusion fix) ──
-# Even with self-distance correctly excluded, report how many *other* rows
-# sit suspiciously close to each sampled row — this is the actual signal
-# the integrity check needs: are there real near-duplicate states (e.g.
-# from flat/low-vol stretches, or slow paces barely moving tick-to-tick)
-# independent of the self-pairing bug above.
-near_dup_threshold = 0.05  # tune relative to overall pairwise scale above
-frac_with_near_dup = (nn_dist[:, 0] < near_dup_threshold).mean()
-print(f'fraction of sampled states with a near-duplicate '
-      f'(dist < {near_dup_threshold}): {frac_with_near_dup:.1%}')
+# Re-run the near-duplicate check using the WEIGHTED distance, since
+# that's what MCKNNMemory.query() actually uses now — the unweighted
+# number above is reported for comparison only, not as the operative
+# signal for whether MIN_TICK_GAP/retraining decisions are needed.
+d_weighted = cdist(sample * effective_weight[None, :], states * effective_weight[None, :])
+for row, orig_idx in enumerate(sample_idx):
+    d_weighted[row, orig_idx] = np.inf
+nn_dist_weighted = np.sort(d_weighted, axis=1)[:, :10]
+overall_median_weighted = np.median(d_weighted[np.isfinite(d_weighted)])
+near_dup_threshold = 0.05 * overall_median_weighted / 12.7 if overall_median_weighted > 0 else 0.05
+frac_with_near_dup = (nn_dist_weighted[:, 0] < near_dup_threshold).mean()
+
+print(f"\n  Near-duplicate check on WEIGHTED distance "
+      f"(dist < {near_dup_threshold:.3f}): {frac_with_near_dup:.1%} of sampled states")
 if frac_with_near_dup > 0.05:
     print('  ⚠  Meaningful near-duplicate density detected — this is the '
           'mechanism behind train/val leakage in main_mcknn.py; confirm '
           'MIN_TICK_GAP in main_mcknn.py is large enough relative to the '
           'typical gap between duplicate ticks before retraining.')
-    if not used_context:
-        print('  ℹ  This check ran on the 4h-only state space. If '
-              'main_mcknn.py has ENABLE_MULTI_TIMEFRAME=True with raw '
-              '15m/1h data available, re-run this diagnostic with that data '
-              'present — multi-timeframe context is specifically designed '
-              'to reduce this density, and the 4h-only number above may '
-              'overstate the problem the model actually faces.')
 else:
-    print('  ✓  Near-duplicate density is low.'
-          + ('' if used_context else
-             ' (4h-only check — if multi-timeframe context is enabled in '
-             'main_mcknn.py, this is a conservative/stale number; the real '
-             'training state space may be even better separated.)'))
+    print('  ✓  Near-duplicate density is low under the weighted distance.')

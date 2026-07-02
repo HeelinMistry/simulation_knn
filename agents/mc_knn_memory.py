@@ -45,6 +45,39 @@ import numpy as np
 EPS = 1e-8
 
 
+def make_block_weights(block_sizes: list, block_values: list) -> np.ndarray:
+    """
+    Build a length-sum(block_sizes) weight vector by repeating each
+    block_values[i] across block_sizes[i] consecutive dimensions —
+    e.g. for this project's state layout
+    [50 primary 4h dims][72 multi-timeframe context dims][2 portfolio dims]:
+
+        make_block_weights([50, 72, 2], [1.0, 0.5, 2.0])
+
+    produces a 124-length array (note: this project's actual layout has
+    no context block when ENABLE_MULTI_TIMEFRAME=False — pass
+    block_sizes/block_values matching whatever STATE_DIM actually is)
+    weighting primary dims at 1.0x, context dims at 0.5x (down-weighted,
+    since pre_training.py's diagnostic showed raw concatenation diluting
+    nearest-neighbor distance — 0.5x is a starting point, not a derived
+    optimum; re-run pre_training.py's ratio check after changing this),
+    and portfolio dims at 2.0x (boosted, since unrealized PnL/position
+    side are highly decision-relevant but are otherwise just 2 of 122
+    raw dimensions).
+
+    This is intentionally dumb/explicit rather than inferring block
+    boundaries from STATE_DIM math — the caller (main_mcknn.py, which
+    already knows FEATURES/PACES/CONTEXT_PACES) is in the best position
+    to state its own layout unambiguously.
+    """
+    if len(block_sizes) != len(block_values):
+        raise ValueError("block_sizes and block_values must be the same length")
+    return np.concatenate([
+        np.full(size, value, dtype=np.float32)
+        for size, value in zip(block_sizes, block_values)
+    ])
+
+
 class MCKNNMemory:
     """
     Growable bank of (state, action, mc_return, tick, episode_id) rows
@@ -66,6 +99,8 @@ class MCKNNMemory:
         eps_dist: float = 1e-3,
         max_weight_ratio: float = 50.0,
         min_tick_gap: int = 0,
+        block_weights: np.ndarray = None,
+        dim_scale_floor: float = 1e-3,
     ):
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -87,6 +122,55 @@ class MCKNNMemory:
         # ── Temporal-exclusion default (can be overridden per query) ────
         self.min_tick_gap = min_tick_gap
 
+        # ── Weighted (Mahalanobis-style diagonal) distance ───────────────
+        # pre_training.py's diagnostic showed that concatenating raw 4h +
+        # 15m + 1h context into one flat Euclidean distance made the
+        # nearest-neighbor/overall-pairwise distance RATIO worse, not
+        # better (0.18 -> 0.52) — a curse-of-dimensionality symptom: every
+        # one of the 122 raw dimensions gets equal say in distance
+        # regardless of how informative or noisy it actually is, and
+        # equal-weighting 72 context dims against 50 primary dims and a
+        # mere 2 portfolio dims dilutes the signal that actually drives
+        # good decisions (e.g. unrealized PnL is 2/122 of the vector's
+        # influence on which neighbors get picked).
+        #
+        # Fix (two independent multipliers, combined into one per-dim
+        # scale applied before computing distance):
+        #
+        # 1. block_weights — a caller-supplied length-state_dim array
+        #    that weights whole SEMANTIC blocks (e.g. "down-weight the
+        #    72 context dims to 0.5x, leave the 50 primary dims at 1.0x,
+        #    boost the 2 portfolio dims to 2.0x"). MCKNNMemory doesn't
+        #    need to know what a "block" means — the caller (main_mcknn.py,
+        #    which knows STATE_DIM's layout) builds this vector and passes
+        #    it in. Defaults to all-ones (no block weighting) if omitted.
+        #
+        # 2. _dim_scale — per-dimension std, computed from the bank's OWN
+        #    stored states and recomputed after every commit/prune (see
+        #    _recompute_dim_scale() below). This is the actual Mahalanobis
+        #    piece: a dimension with naturally large raw magnitude (say,
+        #    a slow pace's raw indicator value) no longer silently
+        #    dominates distance over a dimension with naturally small
+        #    magnitude (say, a fast context slope) just because of unit
+        #    scale, independent of any block-level weighting choice.
+        #
+        # effective_weight = block_weights / dim_scale, applied
+        # elementwise to (candidate - query) before squaring/summing —
+        # i.e. a diagonal Mahalanobis distance with an extra semantic
+        # weighting layer on top.
+        self.block_weights = (
+            np.ones(state_dim, dtype=np.float32) if block_weights is None
+            else np.asarray(block_weights, dtype=np.float32)
+        )
+        if self.block_weights.shape != (state_dim,):
+            raise ValueError(
+                f"block_weights shape {self.block_weights.shape} doesn't "
+                f"match state_dim={state_dim}"
+            )
+        self.dim_scale_floor = dim_scale_floor
+        self._dim_scale = np.ones(state_dim, dtype=np.float32)
+        self._effective_weight = self.block_weights.copy()
+
         # Pre-allocate growable arrays; track a logical size separately
         # from physical capacity to avoid per-append reallocation.
         self._cap = 4096
@@ -101,6 +185,32 @@ class MCKNNMemory:
         self.n_commits = 0
         self.n_prunes  = 0
         self._next_episode_id = 0
+
+    # ── Weighted distance scale ──────────────────────────────────────────────
+
+    def _recompute_dim_scale(self):
+        """
+        Recompute per-dimension std from the bank's CURRENT contents and
+        refresh the cached effective_weight = block_weights / dim_scale.
+        Called after every commit_episode() and prune() — both are
+        offline, once-per-episode/once-per-prune operations, so the
+        O(N x D) cost of a single np.std() call here is negligible
+        compared to everything else those operations already do.
+
+        dim_scale_floor prevents a near-constant dimension (e.g. the
+        portfolio "position" dim early in training when few trades have
+        opened) from producing a near-zero std and exploding that
+        dimension's effective weight — this would otherwise let a
+        single mostly-flat dimension dominate distance the same way the
+        unweighted version let a coincidentally-large-magnitude
+        dimension dominate it.
+        """
+        if self._size < 2:
+            self._dim_scale = np.ones(self.state_dim, dtype=np.float32)
+        else:
+            std = np.std(self.states[:self._size], axis=0)
+            self._dim_scale = np.maximum(std, self.dim_scale_floor).astype(np.float32)
+        self._effective_weight = (self.block_weights / self._dim_scale).astype(np.float32)
 
     # ── Capacity management ────────────────────────────────────────────────
 
@@ -176,6 +286,11 @@ class MCKNNMemory:
 
         if self._size > self.max_size:
             self.prune(target_size=self.max_size)
+        else:
+            # prune() (when it runs) recomputes the scale itself after
+            # downsampling — only recompute here on the non-pruned path
+            # to avoid doing it twice on the same commit.
+            self._recompute_dim_scale()
 
     # ── Stratified pruning (downsample while keeping signal/noise ratio) ────
 
@@ -219,6 +334,7 @@ class MCKNNMemory:
         self.episode_id[:len(keep_idx)] = self.episode_id[keep_idx]
         self._size = len(keep_idx)
         self.n_prunes += 1
+        self._recompute_dim_scale()
 
     # ── k-NN query ────────────────────────────────────────────────────────
 
@@ -226,10 +342,23 @@ class MCKNNMemory:
               query_tick: int = None, query_episode_id: int = None,
               min_tick_gap: int = None):
         """
-        Find the k nearest neighbors (plain Euclidean, unweighted) to
-        `state`, EXCLUDING any stored row from the same episode whose
-        tick lies within `min_tick_gap` of `query_tick` (temporal
-        exclusion — see module docstring), then return a capped-weight
+        Find the k nearest neighbors to `state` using a WEIGHTED
+        (diagonal Mahalanobis-style) distance — each dimension is
+        scaled by self._effective_weight = block_weights / dim_scale
+        before computing Euclidean distance, so dimensions with
+        naturally larger raw magnitude or a caller-assigned lower
+        block weight (e.g. multi-timeframe context dims, see __init__)
+        no longer silently dominate which neighbors get selected. See
+        __init__ and _recompute_dim_scale() docstrings for the full
+        rationale — this directly targets the curse-of-dimensionality
+        regression pre_training.py's diagnostic exposed when raw
+        concatenation of 4h + 15m + 1h context made the nearest-
+        neighbor/overall-pairwise distance ratio WORSE (0.18 -> 0.52)
+        instead of better.
+
+        Temporal exclusion: EXCLUDES any stored row from the same
+        episode whose tick lies within `min_tick_gap` of `query_tick`
+        (see module docstring), then returns a capped-weight
         majority-vote distribution over actions plus diagnostic info.
 
         Parameters
@@ -289,7 +418,7 @@ class MCKNNMemory:
 
         k_eff = min(k, len(cand_idx_all))
         cand_states = self.states[cand_idx_all]
-        diffs = cand_states - state[None, :]
+        diffs = (cand_states - state[None, :]) * self._effective_weight[None, :]
         dists = np.sqrt(np.sum(diffs * diffs, axis=1))
 
         nn_local = np.argpartition(dists, k_eff - 1)[:k_eff]
@@ -366,6 +495,8 @@ class MCKNNMemory:
             eps_dist=self.eps_dist,
             max_weight_ratio=self.max_weight_ratio,
             min_tick_gap=self.min_tick_gap,
+            block_weights=self.block_weights,
+            dim_scale_floor=self.dim_scale_floor,
             n_commits=self.n_commits,
             n_prunes=self.n_prunes,
             next_episode_id=self._next_episode_id,
@@ -374,8 +505,13 @@ class MCKNNMemory:
     @classmethod
     def load(cls, path: str) -> "MCKNNMemory":
         data = np.load(path, allow_pickle=False)
+        state_dim = int(data["state_dim"])
+        block_weights = (
+            data["block_weights"] if "block_weights" in data
+            else np.ones(state_dim, dtype=np.float32)
+        )
         mem = cls(
-            state_dim=int(data["state_dim"]),
+            state_dim=state_dim,
             action_dim=int(data["action_dim"]),
             k=int(data["k"]),
             max_size=int(data["max_size"]),
@@ -383,6 +519,8 @@ class MCKNNMemory:
             eps_dist=float(data["eps_dist"]) if "eps_dist" in data else 1e-3,
             max_weight_ratio=float(data["max_weight_ratio"]) if "max_weight_ratio" in data else 50.0,
             min_tick_gap=int(data["min_tick_gap"]) if "min_tick_gap" in data else 0,
+            block_weights=block_weights,
+            dim_scale_floor=float(data["dim_scale_floor"]) if "dim_scale_floor" in data else 1e-3,
         )
         n = len(data["states"])
         mem._grow(n)
@@ -405,4 +543,10 @@ class MCKNNMemory:
         mem.n_commits = int(data["n_commits"])
         mem.n_prunes  = int(data["n_prunes"])
         mem._next_episode_id = int(data["next_episode_id"]) if "next_episode_id" in data else 0
+        # Recompute from the loaded states rather than persisting/trusting
+        # a serialized scale — guarantees it always reflects the ACTUAL
+        # data in the bank, including for legacy checkpoints saved before
+        # this revision (which fall back to dim_scale=ones, i.e.
+        # unweighted, until the next commit_episode()/prune() call).
+        mem._recompute_dim_scale()
         return mem

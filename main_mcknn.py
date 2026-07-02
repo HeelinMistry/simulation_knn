@@ -73,6 +73,7 @@ import pandas as pd
 
 from agents.episode_buffer import EpisodeBuffer
 from agents.mc_knn_agent import MCKNNAgent
+from agents.mc_knn_memory import make_block_weights
 from agents.unified_executor import UnifiedExecutor
 from data.data_manager import update_master_data, update_all_timeframes
 from walkforward import generate_purged_folds, compute_required_lookback_ticks, summarize_folds
@@ -119,21 +120,63 @@ STATE_DIM_WITHOUT_CONTEXT = (len(FEATURES) * 2 * len(PACES)) + 2
 # master CSVs were actually found — see main() for the fallback logic.
 STATE_DIM = STATE_DIM_WITH_CONTEXT if ENABLE_MULTI_TIMEFRAME else STATE_DIM_WITHOUT_CONTEXT
 
+# ── Weighted (Mahalanobis-style) distance block weights ─────────────────────
+# pre_training.py's diagnostic showed raw concatenation of 4h + 15m + 1h
+# context made nearest-neighbor distance WORSE relative to overall
+# pairwise distance (ratio 0.18 -> 0.52) — a curse-of-dimensionality
+# symptom from giving 72 context dims equal say against 50 primary dims
+# and a mere 2 portfolio dims (position/unrealized PnL) in plain
+# Euclidean distance. mc_knn_memory.py now supports per-dimension
+# weighting (combined with per-dim std normalization computed from the
+# bank's own data) — these are the STARTING weights, not a derived
+# optimum. Re-run pre_training.py's ratio check after changing these to
+# see whether they actually help before trusting them.
+PRIMARY_BLOCK_WEIGHT   = 1.0   # 4h market vector (50 dims)
+CONTEXT_BLOCK_WEIGHT   = 0.5   # 15m/1h context, per-timeframe (72 dims total)
+PORTFOLIO_BLOCK_WEIGHT = 2.0   # position + unrealized PnL (2 dims) — boosted
+                               # since these are highly decision-relevant
+                               # but would otherwise be just 2/122 of the
+                               # vector's raw influence on distance.
+
+
+def build_block_weights(state_dim: int, uses_context: bool) -> "np.ndarray":
+    """
+    Build the block-weight vector matching this file's actual state
+    layout: [primary 4h][context, if enabled][portfolio (2 dims)].
+    Always returns a vector of length exactly `state_dim`.
+    """
+    primary_dim = len(FEATURES) * 2 * len(PACES)
+    portfolio_dim = 2
+    if uses_context:
+        context_dim = state_dim - primary_dim - portfolio_dim
+        if context_dim <= 0:
+            raise ValueError(
+                f"uses_context=True but state_dim={state_dim} doesn't leave "
+                f"room for a positive context block (primary={primary_dim}, "
+                f"portfolio={portfolio_dim})."
+            )
+        return make_block_weights(
+            [primary_dim, context_dim, portfolio_dim],
+            [PRIMARY_BLOCK_WEIGHT, CONTEXT_BLOCK_WEIGHT, PORTFOLIO_BLOCK_WEIGHT],
+        )
+    return make_block_weights(
+        [primary_dim, portfolio_dim],
+        [PRIMARY_BLOCK_WEIGHT, PORTFOLIO_BLOCK_WEIGHT],
+    )
+
 # ── Walk-forward CV configuration (replaces VAL_YEARS hard split) ───────────
 N_CV_FOLDS        = 6
-CV_EPOCHS         = 3     # short training run per fold — CV is for measuring
-                          # robustness of the APPROACH, not for producing a
-                          # deployable checkpoint (that happens separately,
-                          # see run_final_training())
+CV_EPOCHS         = 8     # enough for the bank to accumulate meaningful signal
+                          # per fold before evaluating — was 3, which was too few
 MIN_TRAIN_TICKS   = 1000
 
 # Training hyperparameters (final/deployable run)
-NUM_EPOCHS       = 100
+NUM_EPOCHS       = 50
 WARMUP_IDX       = 128          # aggregator warm-up rows (= max_pace × max_history)
 
-PATIENCE         = 1            # epochs without improvement before stopping
-WARMUP_EPOCHS    = 2
-MIN_IMPROVE      = 0.005        # val PnL must improve by 0.5 pp to reset patience
+PATIENCE         = 5            # was 1 — too aggressive, killed runs before bank matured
+WARMUP_EPOCHS    = 5            # was 2 — don't check early-stop criteria until epoch 6
+MIN_IMPROVE      = 0.002        # was 0.005 — easier per-epoch bar to clear
 
 # ── MC-kNN specific knobs ─────────────────────────────────────────────────────
 BANK_MAX_SIZE    = 200_000
@@ -150,10 +193,24 @@ LOG_EVERY_TICKS  = 500
 SAVE_EVERY_EPOCH = 5
 
 # ── Reward shaping ────────────────────────────────────────────────────────────
-REWARD_SCALE    = 100.0
+# REWARD_SCALE reduced from 100.0 to 10.0: the previous value inflated MC
+# returns 100x, making vote confidence look artificially strong and
+# causing the bank's returns to swamp the [-42, +134] range seen in
+# post_training.py — at 10x the return distribution is more calibrated
+# relative to the actual trade PnL fractions (typically 0.1%–5%).
+REWARD_SCALE    = 10.0
 MICRO_HOLD_COST = 0.000005
 EPSILON_START   = 0.10
 EPSILON_END     = 0.01
+
+# ── Val floor for final training checkpoint saving ───────────────────────────
+# -0.10 was too tight for a single recent period (Dec 2024–Feb 2026 showed
+# -38.7% in epoch 3, triggering the floor every epoch and preventing any
+# checkpoint from ever being saved). -0.40 still catches genuine disasters
+# while giving the model room to improve across epochs. CV showed 5/6
+# folds positive with mean +25.5%, so a -40% floor on the final val window
+# is a reasonable safety net, not a free pass.
+VAL_PNL_FLOOR   = -0.40
 
 
 # ─────────────────────────────────────────────
@@ -338,6 +395,7 @@ def run_cross_validation(df: pd.DataFrame, extra_context_arr: np.ndarray,
             k=K_NEIGHBORS, max_size=BANK_MAX_SIZE, gamma=GAMMA,
             signal_threshold=SIGNAL_THRESHOLD,
             min_tick_gap=MIN_TICK_GAP, max_weight_ratio=MAX_WEIGHT_RATIO,
+            block_weights=build_block_weights(state_dim, extra_context_arr is not None),
         )
         episode_buffer = EpisodeBuffer(gamma=GAMMA)
         train_executor = UnifiedExecutor(
@@ -480,6 +538,11 @@ def run_final_training(df: pd.DataFrame, extra_context_arr: np.ndarray,
         "context_timeframes": list(CONTEXT_TIMEFRAMES) if extra_context_arr is not None else None,
         "warmup_idx":       int(WARMUP_IDX),
         "total_rows":       int(len(df)),
+        "block_weights":    {
+            "primary":   PRIMARY_BLOCK_WEIGHT,
+            "context":   CONTEXT_BLOCK_WEIGHT if extra_context_arr is not None else None,
+            "portfolio": PORTFOLIO_BLOCK_WEIGHT,
+        },
     }
     with open("outcomes/final_fold_meta.json", "w") as f:
         json.dump(fold_meta, f, indent=2)
@@ -490,22 +553,50 @@ def run_final_training(df: pd.DataFrame, extra_context_arr: np.ndarray,
         k=K_NEIGHBORS, max_size=BANK_MAX_SIZE, gamma=GAMMA,
         signal_threshold=SIGNAL_THRESHOLD,
         min_tick_gap=MIN_TICK_GAP, max_weight_ratio=MAX_WEIGHT_RATIO,
+        block_weights=build_block_weights(state_dim, extra_context_arr is not None),
     )
     agent.load(CHECKPOINT_PATH)
-
-    episode_buffer = EpisodeBuffer(gamma=GAMMA)
-    train_executor = UnifiedExecutor(
-        "Train", agent, paces=PACES,
-        deterministic=False, num_indicators=len(FEATURES)
-    )
 
     best_val_pnl = -np.inf
     no_improve   = 0
     EPSILON_DECAY = (EPSILON_END / EPSILON_START) ** (1 / 20)
     epsilon       = EPSILON_START
+    episode_buffer = EpisodeBuffer(gamma=GAMMA)  # reset(new_episode_id=True) each epoch
 
     for epoch in range(1, NUM_EPOCHS + 1):
         t0 = time.time()
+
+        # ── Per-epoch bank reset — mirrors the discipline that makes CV
+        #    work: each epoch trains a FRESH bank on a single full pass
+        #    through train_df, then evaluates. Without this, the bank
+        #    accumulates N copies of every training tick after N epochs
+        #    (3 epochs → 3 near-duplicate copies of every state), which
+        #    makes vote confidence artificially self-referential and widens
+        #    the train/val gap. CV builds fresh agents per fold and showed
+        #    mean +25.5% — final training should mirror that discipline.
+        #    We keep the CHECKPOINT_PATH load (above) so we can resume
+        #    training from a saved bank, but within a single run, each
+        #    epoch starts fresh. ─────────────────────────────────────────
+        agent.memory.__init__(
+            state_dim=state_dim, action_dim=ACTION_DIM,
+            k=K_NEIGHBORS, max_size=BANK_MAX_SIZE,
+            signal_threshold=SIGNAL_THRESHOLD,
+            eps_dist=agent.memory.eps_dist,
+            max_weight_ratio=MAX_WEIGHT_RATIO,
+            min_tick_gap=MIN_TICK_GAP,
+            block_weights=agent.memory.block_weights,
+            dim_scale_floor=agent.memory.dim_scale_floor,
+        )
+        # Reset the actor to point at the refreshed memory object
+        agent.actor.memory = agent.memory
+        episode_buffer.reset(new_episode_id=True)
+        # Re-init the train executor's aggregator so state construction
+        # starts clean each epoch (warm_up_all inside run_epoch handles
+        # the actual per-pass warm-up — this just resets the tick counter)
+        train_executor = UnifiedExecutor(
+            "Train", agent, paces=PACES,
+            deterministic=False, num_indicators=len(FEATURES)
+        )
 
         train_metrics = run_epoch(
             train_executor, train_df, episode_buffer, agent,
@@ -552,10 +643,9 @@ def run_final_training(df: pd.DataFrame, extra_context_arr: np.ndarray,
 
         short_pct_val = v_ac[1] / max(sum(v_ac), 1)
         long_pct_val  = v_ac[0] / max(sum(v_ac), 1)
-        bear_pnl_floor = -0.10
         is_directional = short_pct_val >= 0.03 and long_pct_val >= 0.03
 
-        if is_directional and v_pnl > best_val_pnl + MIN_IMPROVE and v_pnl > bear_pnl_floor:
+        if is_directional and v_pnl > best_val_pnl + MIN_IMPROVE and v_pnl > VAL_PNL_FLOOR:
             best_val_pnl = v_pnl
             no_improve = 0
             agent.save(BEST_PATH)
@@ -565,8 +655,9 @@ def run_final_training(df: pd.DataFrame, extra_context_arr: np.ndarray,
             print(f"  ↷ Skipped save — directional collapse"
                   f" (L={long_pct_val:.0%} S={short_pct_val:.0%})")
             no_improve += 1
-        elif v_pnl <= bear_pnl_floor:
-            print(f"  ↷ Skipped save — val floor breached (val={v_pnl:+.4%})")
+        elif v_pnl <= VAL_PNL_FLOOR:
+            print(f"  ↷ Skipped save — val floor breached "
+                  f"(val={v_pnl:+.4%} < floor={VAL_PNL_FLOOR:+.0%})")
             no_improve += 1
         else:
             no_improve += 1

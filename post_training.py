@@ -47,6 +47,12 @@ print(f"  max_size          : {mem.max_size:,}")
 print(f"  signal_threshold  : {mem.signal_threshold}")
 print(f"  eps_dist          : {getattr(mem, 'eps_dist', 'n/a (pre-integrity-check checkpoint)')}")
 print(f"  max_weight_ratio  : {getattr(mem, 'max_weight_ratio', 'n/a (pre-integrity-check checkpoint)')}")
+bw = getattr(mem, 'block_weights', None)
+if bw is not None:
+    distinct_weights = sorted(set(np.round(bw, 4).tolist()))
+    print(f"  block_weights     : {'uniform (1.0, no weighting)' if distinct_weights == [1.0] else distinct_weights}")
+else:
+    print(f"  block_weights     : n/a (pre-weighted-distance-fix checkpoint)")
 print(f"  min_tick_gap      : {getattr(mem, 'min_tick_gap', 'n/a (pre-integrity-check checkpoint)')}")
 
 print(f"\n── BANK CONTENTS ────────────────────────────────────────────")
