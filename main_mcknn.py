@@ -166,17 +166,19 @@ def build_block_weights(state_dim: int, uses_context: bool) -> "np.ndarray":
 
 # ── Walk-forward CV configuration (replaces VAL_YEARS hard split) ───────────
 N_CV_FOLDS        = 6
-CV_EPOCHS         = 8     # enough for the bank to accumulate meaningful signal
-                          # per fold before evaluating — was 3, which was too few
+CV_EPOCHS         = 5     # each CV epoch is independent with per-epoch reset
 MIN_TRAIN_TICKS   = 1000
 
 # Training hyperparameters (final/deployable run)
-NUM_EPOCHS       = 50
-WARMUP_IDX       = 128          # aggregator warm-up rows (= max_pace × max_history)
+NUM_EPOCHS       = 50     # more epochs needed — each epoch now commits fewer
+                          # entries (HOLD excluded) so the bank matures more
+                          # slowly; PATIENCE=5 will cut this short if val
+                          # stops improving.
+WARMUP_IDX       = 128    # aggregator warm-up rows
 
-PATIENCE         = 5            # was 1 — too aggressive, killed runs before bank matured
-WARMUP_EPOCHS    = 5            # was 2 — don't check early-stop criteria until epoch 6
-MIN_IMPROVE      = 0.002        # was 0.005 — easier per-epoch bar to clear
+PATIENCE         = 5
+WARMUP_EPOCHS    = 5      # don't trigger early-stop checks until epoch 6
+MIN_IMPROVE      = 0.002
 
 # ── MC-kNN specific knobs ─────────────────────────────────────────────────────
 BANK_MAX_SIZE    = 200_000
@@ -184,8 +186,12 @@ K_NEIGHBORS      = 25
 GAMMA            = 0.97
 SIGNAL_THRESHOLD = 0.0005
 
-# ── Integrity-check fixes (see mc_knn_memory.py docstring) ───────────────────
-MIN_TICK_GAP     = 100
+# ── Integrity-check fixes ─────────────────────────────────────────────────────
+MIN_TICK_GAP     = 50     # reduced from 100 — with HOLD excluded, the bank
+                          # holds only trade transitions (~6-20% of ticks),
+                          # so a gap of 100 would exclude most of the bank
+                          # on any query near a recent trade. 50 ticks (~8
+                          # days at 4h) still prevents same-week self-voting.
 MAX_WEIGHT_RATIO = 50.0
 
 # Logging
@@ -310,11 +316,25 @@ def run_epoch(executor: UnifiedExecutor, df: pd.DataFrame,
         )
 
         if train and prev_action is not None:
-            episode_buffer.add(
-                prev_state, prev_action,
-                prev_reward * REWARD_SCALE,
-                tick=prev_tick,
-            )
+            # ── Only store non-HOLD transitions (action != 3). ───────────────
+            # HOLD is the default when the bank has no confident signal — it
+            # carries no useful indicator-to-action mapping. Storing it means
+            # the bank grows to 94% HOLD states (as observed in diagnostics),
+            # which dominates every kNN vote regardless of the indicator
+            # pattern. Excluding HOLD keeps the bank focused on transitions
+            # where the model actually made a directional or closing decision,
+            # which is the signal that matters for generalisation.
+            # The MC return for surrounding HOLD ticks is still correctly
+            # propagated via the discounted backfill in compute_mc_returns()
+            # — skipping the buffer.add() here doesn't break the return
+            # computation, it just stops the bank from being diluted with
+            # uninformative state-action pairs.
+            if prev_action != 3:  # 3 = HOLD
+                episode_buffer.add(
+                    prev_state, prev_action,
+                    prev_reward * REWARD_SCALE,
+                    tick=prev_tick,
+                )
 
         prev_state  = s_t
         prev_action = action
@@ -398,19 +418,39 @@ def run_cross_validation(df: pd.DataFrame, extra_context_arr: np.ndarray,
             block_weights=build_block_weights(state_dim, extra_context_arr is not None),
         )
         episode_buffer = EpisodeBuffer(gamma=GAMMA)
-        train_executor = UnifiedExecutor(
-            f"CVFold{fold.fold_id}_Train", agent, paces=PACES,
-            deterministic=False, num_indicators=len(FEATURES),
-        )
 
         # NOTE: train_df's rows are NOT contiguous in absolute time once
         # purge/embargo removes a chunk in the middle (everything before
         # purge_start and everything after embargo_end is concatenated
-        # into one frame). We deliberately do NOT need a tick_offset here
-        # — see run_epoch's docstring on why local positional ticks are
-        # sufficient given each fold gets its own episode_id.
+        # into one frame). Local positional ticks (0..n-1) are sufficient
+        # given each fold gets its own episode_id from the per-epoch reset.
         for cv_epoch in range(1, CV_EPOCHS + 1):
             t0 = time.time()
+            # ── Per-epoch bank reset (mirrors run_final_training's discipline).
+            #    Without this, bank grows to CV_EPOCHS × fold_train_rows entries
+            #    — 8 epochs × ~11K rows = ~88K entries with 8 near-duplicate
+            #    copies of the same period. The _dim_scale computed from those
+            #    distorted the weighted distance and caused CV to degrade from
+            #    5/6 positive (CV_EPOCHS=3, no reset) to 2/6 (CV_EPOCHS=8,
+            #    no reset). With per-epoch reset, each fold's evaluation uses a
+            #    fresh single-epoch bank — matching exactly what the final
+            #    training run produces and making CV a valid proxy for it. ──────
+            agent.memory.__init__(
+                state_dim=state_dim, action_dim=ACTION_DIM,
+                k=K_NEIGHBORS, max_size=BANK_MAX_SIZE,
+                signal_threshold=SIGNAL_THRESHOLD,
+                eps_dist=agent.memory.eps_dist,
+                max_weight_ratio=MAX_WEIGHT_RATIO,
+                min_tick_gap=MIN_TICK_GAP,
+                block_weights=agent.memory.block_weights,
+                dim_scale_floor=agent.memory.dim_scale_floor,
+            )
+            agent.actor.memory = agent.memory
+            episode_buffer.reset(new_episode_id=True)
+            train_executor = UnifiedExecutor(
+                f"CVFold{fold.fold_id}_Train", agent, paces=PACES,
+                deterministic=False, num_indicators=len(FEATURES),
+            )
             run_epoch(train_executor, train_df, episode_buffer, agent,
                       train=True, epsilon=EPSILON_START,
                       extra_context_arr=train_ctx)
@@ -559,7 +599,14 @@ def run_final_training(df: pd.DataFrame, extra_context_arr: np.ndarray,
 
     best_val_pnl = -np.inf
     no_improve   = 0
-    EPSILON_DECAY = (EPSILON_END / EPSILON_START) ** (1 / 20)
+    # ── Epsilon schedule: slow decay over NUM_EPOCHS so exploration stays
+    #    meaningful throughout. With per-epoch bank resets, each epoch
+    #    starts from an empty bank — if epsilon drops too quickly, the
+    #    sparse early-epoch bank defaults to HOLD and the model commits
+    #    mostly HOLD states, creating a self-reinforcing loop where every
+    #    query finds HOLD neighbors. Decaying over NUM_EPOCHS (not a fixed
+    #    20) means epsilon reaches EPSILON_END only at the very last epoch.
+    EPSILON_DECAY = (EPSILON_END / EPSILON_START) ** (1.0 / max(NUM_EPOCHS - 1, 1))
     epsilon       = EPSILON_START
     episode_buffer = EpisodeBuffer(gamma=GAMMA)  # reset(new_episode_id=True) each epoch
 
