@@ -170,28 +170,29 @@ CV_EPOCHS         = 5     # each CV epoch is independent with per-epoch reset
 MIN_TRAIN_TICKS   = 1000
 
 # Training hyperparameters (final/deployable run)
-NUM_EPOCHS       = 50     # more epochs needed — each epoch now commits fewer
-                          # entries (HOLD excluded) so the bank matures more
-                          # slowly; PATIENCE=5 will cut this short if val
-                          # stops improving.
+NUM_EPOCHS       = 15     # with accumulation, the bank peaks at ~2-3 epochs
+                          # (~24K entries) and degrades beyond that as training-
+                          # period states dominate val queries. 15 epochs with
+                          # PATIENCE=3 will stop well before the bank bloats.
 WARMUP_IDX       = 128    # aggregator warm-up rows
 
-PATIENCE         = 5
-WARMUP_EPOCHS    = 5      # don't trigger early-stop checks until epoch 6
+PATIENCE         = 3      # tighter — we know the sweet spot is early
+WARMUP_EPOCHS    = 3      # don't check early-stop before epoch 4
 MIN_IMPROVE      = 0.002
 
 # ── MC-kNN specific knobs ─────────────────────────────────────────────────────
-BANK_MAX_SIZE    = 200_000
+BANK_MAX_SIZE    = 25_000  # was 200,000 — the bank peaked at ~24K entries in
+                           # diagnostics (+60.3% val) and deteriorated to
+                           # -55.8% by epoch 7 (bank=83K). Capping at 25K
+                           # triggers stratified pruning to keep the bank in
+                           # the productive range rather than letting it grow
+                           # into a training-period lookup table.
 K_NEIGHBORS      = 25
 GAMMA            = 0.97
 SIGNAL_THRESHOLD = 0.0005
 
 # ── Integrity-check fixes ─────────────────────────────────────────────────────
-MIN_TICK_GAP     = 50     # reduced from 100 — with HOLD excluded, the bank
-                          # holds only trade transitions (~6-20% of ticks),
-                          # so a gap of 100 would exclude most of the bank
-                          # on any query near a recent trade. 50 ticks (~8
-                          # days at 4h) still prevents same-week self-voting.
+MIN_TICK_GAP     = 50
 MAX_WEIGHT_RATIO = 50.0
 
 # Logging
@@ -316,20 +317,26 @@ def run_epoch(executor: UnifiedExecutor, df: pd.DataFrame,
         )
 
         if train and prev_action is not None:
-            # ── Only store non-HOLD transitions (action != 3). ───────────────
-            # HOLD is the default when the bank has no confident signal — it
-            # carries no useful indicator-to-action mapping. Storing it means
-            # the bank grows to 94% HOLD states (as observed in diagnostics),
-            # which dominates every kNN vote regardless of the indicator
-            # pattern. Excluding HOLD keeps the bank focused on transitions
-            # where the model actually made a directional or closing decision,
-            # which is the signal that matters for generalisation.
-            # The MC return for surrounding HOLD ticks is still correctly
-            # propagated via the discounted backfill in compute_mc_returns()
-            # — skipping the buffer.add() here doesn't break the return
-            # computation, it just stops the bank from being diluted with
-            # uninformative state-action pairs.
-            if prev_action != 3:  # 3 = HOLD
+            # ── Exclude FLAT-HOLD only; keep IN-POSITION HOLD. ──────────────
+            # Two types of HOLD:
+            #
+            # 1. FLAT-HOLD (not in a position): "chose not to enter the market"
+            #    → No signal value. Storing these caused 94% HOLD dominance
+            #    (the old problem). Excluded.
+            #
+            # 2. IN-POSITION HOLD (holding an existing trade): "chose to stay
+            #    in this trade given the current indicators"
+            #    → Real signal: the MC return will reflect whether holding paid
+            #    off. Storing these lets the bank learn "when to stay in a
+            #    trade" rather than churning in/out every tick (the new
+            #    problem: 46.5% trade rate with all-HOLD excluded).
+            #
+            # After a HOLD action, current_side cannot have changed (HOLD
+            # never opens or closes a position), so executor.current_side at
+            # tick i+1 correctly reflects the position state when HOLD was
+            # chosen at tick i.
+            flat_hold = (prev_action == 3 and executor.current_side is None)
+            if not flat_hold:
                 episode_buffer.add(
                     prev_state, prev_action,
                     prev_reward * REWARD_SCALE,
@@ -599,47 +606,47 @@ def run_final_training(df: pd.DataFrame, extra_context_arr: np.ndarray,
 
     best_val_pnl = -np.inf
     no_improve   = 0
-    # ── Epsilon schedule: slow decay over NUM_EPOCHS so exploration stays
-    #    meaningful throughout. With per-epoch bank resets, each epoch
-    #    starts from an empty bank — if epsilon drops too quickly, the
-    #    sparse early-epoch bank defaults to HOLD and the model commits
-    #    mostly HOLD states, creating a self-reinforcing loop where every
-    #    query finds HOLD neighbors. Decaying over NUM_EPOCHS (not a fixed
-    #    20) means epsilon reaches EPSILON_END only at the very last epoch.
+    # ── Epsilon schedule: slow decay over NUM_EPOCHS. ───────────────────────
+    # With bank accumulation (no reset), the bank grows each epoch so
+    # training queries become more informative over time. Epsilon should
+    # still stay meaningful throughout so the bank keeps seeing new
+    # exploration rather than repeating the same deterministic path.
     EPSILON_DECAY = (EPSILON_END / EPSILON_START) ** (1.0 / max(NUM_EPOCHS - 1, 1))
     epsilon       = EPSILON_START
-    episode_buffer = EpisodeBuffer(gamma=GAMMA)  # reset(new_episode_id=True) each epoch
+    # ── Single episode_buffer for the entire training run. ──────────────────
+    # NOT reset between epochs — end_episode_and_commit() calls
+    # reset(new_episode_id=False) internally, keeping the same episode_id
+    # across all epochs. This means temporal exclusion (MIN_TICK_GAP) covers
+    # ALL epochs: a training query at tick T will exclude committed rows from
+    # ANY epoch within ±MIN_TICK_GAP of T. This is the correct behaviour —
+    # it prevents any epoch from voting on a near-duplicate of itself from
+    # a prior epoch at the same historical tick.
+    episode_buffer = EpisodeBuffer(gamma=GAMMA)
 
     for epoch in range(1, NUM_EPOCHS + 1):
         t0 = time.time()
 
-        # ── Per-epoch bank reset — mirrors the discipline that makes CV
-        #    work: each epoch trains a FRESH bank on a single full pass
-        #    through train_df, then evaluates. Without this, the bank
-        #    accumulates N copies of every training tick after N epochs
-        #    (3 epochs → 3 near-duplicate copies of every state), which
-        #    makes vote confidence artificially self-referential and widens
-        #    the train/val gap. CV builds fresh agents per fold and showed
-        #    mean +25.5% — final training should mirror that discipline.
-        #    We keep the CHECKPOINT_PATH load (above) so we can resume
-        #    training from a saved bank, but within a single run, each
-        #    epoch starts fresh. ─────────────────────────────────────────
-        agent.memory.__init__(
-            state_dim=state_dim, action_dim=ACTION_DIM,
-            k=K_NEIGHBORS, max_size=BANK_MAX_SIZE,
-            signal_threshold=SIGNAL_THRESHOLD,
-            eps_dist=agent.memory.eps_dist,
-            max_weight_ratio=MAX_WEIGHT_RATIO,
-            min_tick_gap=MIN_TICK_GAP,
-            block_weights=agent.memory.block_weights,
-            dim_scale_floor=agent.memory.dim_scale_floor,
-        )
-        # Reset the actor to point at the refreshed memory object
-        agent.actor.memory = agent.memory
-        episode_buffer.reset(new_episode_id=True)
-        # Re-init the train executor's aggregator so state construction
-        # starts clean each epoch (warm_up_all inside run_epoch handles
-        # the actual per-pass warm-up — this just resets the tick counter)
+        # ── NO per-epoch bank reset (key change from prior revision). ────────
+        # Previously the bank was wiped at the start of each epoch, which
+        # meant bank=0 throughout the ENTIRE training pass — every query
+        # hit the empty-bank cold-start HOLD default, so training actions
+        # were driven purely by epsilon-greedy randomness, not by any learned
+        # signal. Training P/L reflected random exploration quality, not model
+        # quality, and the bank only helped AFTER commit (val evaluation).
+        #
+        # With accumulation:
+        #   epoch 1: bank=0 → epsilon-only → commit ~1K entries
+        #   epoch 2: bank=1K → kNN + epsilon → commit ~1K more
+        #   epoch N: bank=N×1K → increasingly informed queries
+        #
+        # Near-duplicate protection: the stable episode_id means temporal
+        # exclusion covers ALL prior epochs — a query at tick T (±50 ticks)
+        # cannot vote on rows committed at that same tick from any earlier
+        # epoch. This prevents self-referential vote inflation across epochs
+        # without discarding the genuine historical signal those rows carry.
+        #
+        # The bank will approach BANK_MAX_SIZE over many epochs; pruning
+        # (stratified by |return|) keeps it bounded when it gets there.
         train_executor = UnifiedExecutor(
             "Train", agent, paces=PACES,
             deterministic=False, num_indicators=len(FEATURES)
