@@ -54,6 +54,8 @@ if bw is not None:
 else:
     print(f"  block_weights     : n/a (pre-weighted-distance-fix checkpoint)")
 print(f"  min_tick_gap      : {getattr(mem, 'min_tick_gap', 'n/a (pre-integrity-check checkpoint)')}")
+data_sig = getattr(mem, 'data_signature', '') or ''
+print(f"  data_signature    : {data_sig if data_sig else 'n/a (pre-integrity-check checkpoint, or resumed under a mismatched signature and reset — see MCKNNAgent.load())'}")
 
 print(f"\n── BANK CONTENTS ────────────────────────────────────────────")
 print(f"  bank size         : {len(mem):,}")

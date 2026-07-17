@@ -1277,6 +1277,9 @@ def write_summary(ep: dict, agent: MCKNNAgent, pnls):
         distinct_weights = sorted(set(np.round(bw, 4).tolist()))
         lines.append(f"  block_weights: "
                      f"{'uniform (1.0, no weighting)' if distinct_weights == [1.0] else distinct_weights}")
+    data_sig = getattr(mem, 'data_signature', '') or ''
+    lines.append(f"  data_signature: {data_sig if data_sig else 'n/a (legacy checkpoint, or was reset '
+                 'on load due to a signature mismatch — see training console log)'}")
     lines.append("=" * 62)
 
     if n == 0:
@@ -1476,9 +1479,12 @@ def main():
     #    so we use it as the authoritative cross-check below rather than
     #    trusting fold_meta blindly (e.g. if you're diagnosing an older
     #    checkpoint that predates final_fold_meta.json). ─────────────────
+    # max_size=10_000_000 is intentionally oversized so MCKNNAgent.load()'s
+    # new cap-enforcement logic never prunes the bank during evaluation —
+    # diagnostic runs are read-only and must see the full saved bank.
     agent = MCKNNAgent(
         state_dim=expected_state_dim, action_dim=ACTION_DIM,
-        k=K_NEIGHBORS, max_size=200_000, gamma=GAMMA,
+        k=K_NEIGHBORS, max_size=10_000_000, gamma=GAMMA,
     )
     agent.load(args.checkpoint)
     actual_state_dim = agent.memory.state_dim

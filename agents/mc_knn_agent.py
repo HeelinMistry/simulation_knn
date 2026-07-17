@@ -37,11 +37,26 @@ class MCKNNAgent:
         block_weights: np.ndarray = None,
         dim_scale_floor: float = 1e-3,
         device: str = None,   # accepted, unused — keeps call sites unchanged
+        data_signature: str = None,
     ):
         self.state_dim  = state_dim
         self.action_dim = action_dim
         self.gamma      = gamma
-        self.device      = "cpu"   # no GPU work happens here; numpy only
+        self.max_size   = max_size   # stored so load() can enforce the cap
+        self.device     = "cpu"
+
+        # ── Integrity fix: fold/data-layout signature ────────────────────
+        # This is the signature of the CURRENT run's (dataset snapshot,
+        # purge/embargo fold boundaries, state config) — see
+        # main_mcknn.py's compute_data_signature(). Stored here (not just
+        # on self.memory) so load() can compare "what this run expects"
+        # against "what the checkpoint on disk was actually built under"
+        # even after self.memory gets replaced wholesale by
+        # MCKNNMemory.load(). Callers that don't care about resume-safety
+        # (live inference, diagnostics — anything that doesn't keep
+        # training the loaded bank) can simply omit this and no check is
+        # performed, preserving old behaviour.
+        self.data_signature = data_signature
 
         self.memory = MCKNNMemory(
             state_dim=state_dim, action_dim=action_dim,
@@ -49,6 +64,7 @@ class MCKNNAgent:
             eps_dist=eps_dist, max_weight_ratio=max_weight_ratio,
             min_tick_gap=min_tick_gap,
             block_weights=block_weights, dim_scale_floor=dim_scale_floor,
+            data_signature=data_signature,
         )
         self.actor = MCKNNPolicy(self.memory, action_dim=action_dim)
 
@@ -118,7 +134,73 @@ class MCKNNAgent:
         if not os.path.exists(npz_path):
             print(f"[MCKNNAgent] ⚠️  No checkpoint at {npz_path} — starting fresh (empty bank).")
             return
-        self.memory = MCKNNMemory.load(npz_path)
+        loaded_memory = MCKNNMemory.load(npz_path)
+
+        # ── Integrity fix: refuse to resume onto an incompatible bank. ──────
+        # A checkpoint's stored `tick` values are only meaningful relative
+        # to the exact (dataset snapshot, purge/embargo fold boundaries,
+        # state config) it was committed under (see
+        # MCKNNMemory.data_signature docstring). If this run's expected
+        # signature (self.data_signature, set at construction time) is
+        # non-empty and DIFFERS from what's stored on disk, resuming would
+        # silently mix rows whose ticks refer to different historical
+        # slices under the same small integer episode_id space — this is
+        # the confirmed root cause of a previously-reported "best val"
+        # P/L not reproducing under diagnostic_mcknn.py's replay (bank
+        # held episode_ids [42, 53] spanning two incompatible fold
+        # layouts). We reset to a fresh bank rather than trusting stale,
+        # possibly-misaligned data. Legacy checkpoints (no stored
+        # data_signature, i.e. "") and callers that didn't opt into the
+        # check (self.data_signature is None, e.g. live/diagnostic
+        # loading) are unaffected — this only fires when BOTH sides
+        # declare a signature and they disagree.
+        stored_sig = getattr(loaded_memory, "data_signature", "") or ""
+        if self.data_signature and stored_sig and stored_sig != self.data_signature:
+            print(f"[MCKNNAgent] ⛔ REFUSING to resume onto incompatible bank at "
+                  f"{npz_path}:")
+            print(f"             stored data_signature  = {stored_sig}")
+            print(f"             this run's data_signature = {self.data_signature}")
+            print(f"             (dataset snapshot and/or purge/embargo fold "
+                  f"boundaries differ from what produced this checkpoint — "
+                  f"the stored `tick` values are not comparable to this "
+                  f"run's ticks.) Starting from a FRESH empty bank instead "
+                  f"of silently contaminating training with misaligned "
+                  f"history. If you intended to keep training the same "
+                  f"model on the same data, check whether data/raw/ "
+                  f"changed between runs.")
+            self.memory = MCKNNMemory(
+                state_dim=self.state_dim, action_dim=self.action_dim,
+                k=loaded_memory.k, max_size=self.max_size,
+                signal_threshold=loaded_memory.signal_threshold,
+                eps_dist=loaded_memory.eps_dist,
+                max_weight_ratio=loaded_memory.max_weight_ratio,
+                min_tick_gap=loaded_memory.min_tick_gap,
+                block_weights=loaded_memory.block_weights,
+                dim_scale_floor=loaded_memory.dim_scale_floor,
+                data_signature=self.data_signature,
+            )
+            self.actor = MCKNNPolicy(self.memory, action_dim=self.action_dim)
+            self.last_bank_size = 0
+            self.last_n_prunes  = 0
+            return
+
+        self.memory = loaded_memory
+        # ── Enforce the constructor's max_size, not the file's. ─────────────
+        # MCKNNMemory.load() restores max_size from the .npz file (e.g. 200,000
+        # from a prior run). If the caller set a smaller BANK_MAX_SIZE in the
+        # MCKNNAgent constructor (e.g. 25,000), that setting is silently lost
+        # unless we re-apply it here. We always trust the live config over the
+        # checkpoint config for capacity limits, since the whole point of
+        # changing BANK_MAX_SIZE is to take effect on the next run.
+        # Pruning immediately if the loaded bank exceeds the new cap means the
+        # model resumes training with the right bank size rather than carrying
+        # 150K+ stale entries that override the cap for the entire run.
+        if self.memory.max_size != self.max_size:
+            self.memory.max_size = self.max_size
+            if len(self.memory) > self.max_size:
+                print(f"[MCKNNAgent] ↷ Loaded bank ({len(self.memory):,}) exceeds "
+                      f"max_size={self.max_size:,} — pruning to cap.")
+                self.memory.prune(target_size=self.max_size)
         self.actor  = MCKNNPolicy(self.memory, action_dim=self.action_dim)
         self.last_bank_size = len(self.memory)
         self.last_n_prunes  = self.memory.n_prunes

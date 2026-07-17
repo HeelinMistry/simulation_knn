@@ -6,24 +6,58 @@ into actual dates, classifies each gap by likely cause, and reports
 which gaps (if any) fall inside the walk-forward val window — the only
 ones that matter for whether a gap-proximity exclusion mask is needed.
 
+CHANGES IN THIS REVISION — CV FOLD CROSS-REFERENCE
+─────────────────────────────────────────────────────
+main_mcknn.py's walk-forward CV gate (see run_cross_validation()'s
+gate in main()) now records each fold's val_start_date/val_end_date
+and flags a fold whose val P/L breaches VAL_PNL_FLOOR, plus whether
+that breach recurs across consecutive runs at the same/overlapping
+window. That tells you WHICH calendar period is the problem but not
+WHY. This revision adds that missing link: given a fold's date range
+(read automatically from outcomes/walkforward_cv_summary.json, or
+supplied manually via --fold-start/--fold-end), it reports whether
+that window's purge+val+embargo span overlaps a known raw-data gap or
+a KNOWN_EVENTS entry — so a recurring blowup fold can be triaged as
+"real market event the strategy should learn to handle", "data-quality
+artifact near a gap", or "neither, needs direct investigation" without
+eyeballing dates by hand.
+
 Run from project root:
     python check_gaps.py
+    python check_gaps.py --fold-start 2022-05-01 --fold-end 2022-07-15
 
 Output is also written to outcomes/gap_report.txt for reference.
 """
 
 import sys; sys.path.insert(0, '.')
 import os
+import argparse
+import json
 import pandas as pd
 import numpy as np
 
 os.makedirs("outcomes", exist_ok=True)
+
+parser = argparse.ArgumentParser(description="Gap + CV-fold-window diagnostic")
+parser.add_argument("--fold-start", default=None,
+                    help="Manually check a specific window instead of/in "
+                         "addition to auto-detecting from "
+                         "outcomes/walkforward_cv_summary.json, e.g. "
+                         "2022-05-01")
+parser.add_argument("--fold-end", default=None,
+                    help="End date for --fold-start (required if "
+                         "--fold-start is given), e.g. 2022-07-15")
+args = parser.parse_args()
 
 # ── Config — must match data_manager.py and main_mcknn.py ────────────────────
 HOUR_PATH  = "data/processed/XRPUSDT_1h_master_processed.csv"
 PRIMARY_PATH = "data/processed/XRPUSDT_4h_master_processed.csv"
 CANDLE_H   = 1      # 1h master
 LOOKBACK_TICKS_4H = 720   # walkforward.compute_required_lookback_ticks() default
+# Keep in sync with main_mcknn.py's VAL_PNL_FLOOR — this is the same
+# threshold the training gate uses to flag a CV fold as a "blowup".
+VAL_PNL_FLOOR = -0.40
+CV_SUMMARY_PATH = "outcomes/walkforward_cv_summary.json"
 
 # Known Binance / market events for date-matching context
 KNOWN_EVENTS = [
@@ -77,6 +111,207 @@ def val_window_from_meta() -> tuple:
         return None, None
 
 
+def load_cv_fold_windows() -> list:
+    """
+    Read outcomes/walkforward_cv_summary.json (written by
+    main_mcknn.py's run_cross_validation()) and return a list of
+    {fold_id, val_pnl, purge_start, val_start, val_end, embargo_end}
+    dicts with real Timestamps, expanding each fold's val window by
+    lookback_ticks (in PRIMARY/4h ticks, converted to hours) to get its
+    full purge+val+embargo span — the same span walkforward.py excludes
+    from train for that fold, and therefore the right span to check for
+    gap/event overlap (a gap just outside the val window itself can
+    still contaminate it via the purge buffer's rolling-window lookback).
+
+    Returns [] if the summary file is missing, or if it predates the
+    val_start_date/val_end_date fields (older runs — re-run CV to
+    populate them).
+    """
+    if not os.path.exists(CV_SUMMARY_PATH):
+        return []
+    with open(CV_SUMMARY_PATH) as f:
+        summary = json.load(f)
+    lookback_ticks = summary.get("lookback_ticks", LOOKBACK_TICKS_4H)
+    lookback_td = pd.Timedelta(hours=4 * lookback_ticks)   # primary tick = 4h
+
+    windows = []
+    for r in summary.get("fold_results", []):
+        if "val_start_date" not in r or "val_end_date" not in r:
+            continue   # pre-date-capture run — nothing to cross-reference
+        val_start = pd.to_datetime(r["val_start_date"])
+        val_end   = pd.to_datetime(r["val_end_date"])
+        windows.append({
+            "fold_id":     r["fold_id"],
+            "val_pnl":     r["val_pnl"],
+            "purge_start": val_start - lookback_td,
+            "val_start":   val_start,
+            "val_end":     val_end,
+            "embargo_end": val_end + lookback_td,
+        })
+    return windows
+
+
+def overlapping_known_events(start: pd.Timestamp, end: pd.Timestamp) -> list:
+    """Return KNOWN_EVENTS entries whose [start,end] month-range overlaps
+    the given date span."""
+    hits = []
+    for (ev_start, ev_end, label) in KNOWN_EVENTS:
+        ev_start_ts = pd.Timestamp(ev_start + "-01")
+        ev_end_ts   = pd.Timestamp(ev_end + "-28") + pd.Timedelta(days=4)  # end of month, roughly
+        if ev_start_ts <= end and start <= ev_end_ts:
+            hits.append((ev_start, ev_end, label))
+    return hits
+
+
+def overlapping_gaps(start: pd.Timestamp, end: pd.Timestamp,
+                     gap_ts: pd.Series, gap_rows_list: list) -> list:
+    """Return (row, gap_end_date, gap_size) tuples for gaps whose closing
+    date falls inside [start, end]."""
+    hits = []
+    for row in gap_rows_list:
+        gap_end = gap_ts.iloc[row]
+        if start <= gap_end <= end:
+            hits.append((row, gap_end, gaps.iloc[row]))
+    return hits
+
+
+def contamination_fraction(val_start: pd.Timestamp, val_end: pd.Timestamp,
+                           gap_ts: pd.Series, gap_rows_list: list) -> float:
+    """
+    Fraction of the VAL window itself (not the padded purge+embargo
+    span) whose 1h candles fall within INDICATOR_LOOKBACK_1H hours of a
+    gap's close — i.e. how much of what actually got SCORED sits inside
+    a rolling-window contamination zone, as opposed to merely "some
+    known event happened somewhere in this multi-month window" (a much
+    weaker claim once windows span a year or more — see
+    report_cv_fold_windows()'s docstring on why event-overlap alone is
+    weak evidence for coarse folds).
+
+    This is a genuine signal, not a coincidence check: OBV/ATR's
+    rolling(200) windows compute real but distorted values for ~200
+    hours after any gap (the window straddles missing data), so a high
+    contamination fraction is a concrete, mechanistic reason a fold
+    could underperform — independent of whether the underlying market
+    regime was also difficult.
+
+    Caveat: computed on the 1h series (this script's only loaded raw
+    table). The PRIMARY state is built from 4h data with its own,
+    separately-gapped rolling(200) 4h window (~33 days) — a low 1h
+    contamination fraction does NOT rule out 4h-level contamination.
+    Treat this as one data point, not the full picture.
+    """
+    val_mask = (gap_ts >= val_start) & (gap_ts <= val_end)
+    total = int(val_mask.sum())
+    if total == 0:
+        return 0.0
+    contaminated = pd.Series(False, index=gap_ts.index)
+    for row in gap_rows_list:
+        gap_end = gap_ts.iloc[row]
+        contam_end = gap_end + pd.Timedelta(hours=INDICATOR_LOOKBACK_1H)
+        contaminated |= (gap_ts >= gap_end) & (gap_ts <= contam_end)
+    return float((contaminated & val_mask).sum()) / total
+
+
+def report_cv_fold_windows(gap_ts: pd.Series, gap_rows_list: list) -> list:
+    """
+    Cross-reference every CV fold's purge+val+embargo window against
+    gaps and KNOWN_EVENTS, flagging any fold whose val P/L breached
+    VAL_PNL_FLOOR. Also checks a manually-supplied --fold-start/--fold-end
+    window if provided, independent of whether a CV summary exists.
+    Returns the report lines (also printed/appended to the saved report).
+    """
+    out = []
+    out.append("=" * 74)
+    out.append("  CV FOLD WINDOW CROSS-REFERENCE")
+    out.append("=" * 74)
+
+    windows = load_cv_fold_windows()
+    if not windows and not args.fold_start:
+        out.append(f"\n  ℹ  No {CV_SUMMARY_PATH} with date-tagged folds found, and no "
+                    f"--fold-start/--fold-end given. Run the updated main_mcknn.py "
+                    f"(records val_start_date/val_end_date per fold) or pass "
+                    f"--fold-start/--fold-end manually to use this section.")
+        return out
+
+    flagged = [w for w in windows if w["val_pnl"] < VAL_PNL_FLOOR]
+    if windows:
+        worst = min(windows, key=lambda w: w["val_pnl"])
+        out.append(f"\n  {len(windows)} fold(s) loaded from {CV_SUMMARY_PATH}.")
+        out.append(f"  {len(flagged)} fold(s) breached VAL_PNL_FLOOR={VAL_PNL_FLOOR:+.0%}.")
+        out.append(f"  Worst fold: #{worst['fold_id']}  {worst['val_pnl']:+.4%}  "
+                    f"({worst['val_start'].date()} → {worst['val_end'].date()})")
+        # Always report at least the worst fold, plus anything else flagged.
+        to_check = {w["fold_id"]: w for w in ([worst] + flagged)}.values()
+    else:
+        to_check = []
+
+    manual_windows = []
+    if args.fold_start:
+        if not args.fold_end:
+            out.append(f"\n  ⚠  --fold-start given without --fold-end — ignoring "
+                        f"manual window.")
+        else:
+            manual_windows.append({
+                "fold_id": "manual",
+                "val_pnl": None,
+                "purge_start": pd.to_datetime(args.fold_start),
+                "val_start":   pd.to_datetime(args.fold_start),
+                "val_end":     pd.to_datetime(args.fold_end),
+                "embargo_end": pd.to_datetime(args.fold_end),
+            })
+
+    for w in list(to_check) + manual_windows:
+        label = f"Fold #{w['fold_id']}" if w["fold_id"] != "manual" else "Manual window"
+        pnl_str = f"  val P/L={w['val_pnl']:+.4%}" if w["val_pnl"] is not None else ""
+        out.append(f"\n  ── {label}{pnl_str} "
+                    f"({w['val_start'].date()} → {w['val_end'].date()}) "
+                    f"── purge+embargo span: "
+                    f"{w['purge_start'].date()} → {w['embargo_end'].date()}")
+
+        ev_hits = overlapping_known_events(w["purge_start"], w["embargo_end"])
+        if ev_hits:
+            for (es, ee, label_ev) in ev_hits:
+                out.append(f"       ⚡ KNOWN EVENT overlap: {es}→{ee}  {label_ev}")
+            if len(ev_hits) > 1:
+                span_months = (w["embargo_end"] - w["purge_start"]).days / 30
+                out.append(f"       ℹ  {len(ev_hits)} events overlap a "
+                            f"{span_months:.0f}-month span — with a window this "
+                            f"wide, multiple hits are somewhat expected and "
+                            f"don't by themselves pin the blame on any one "
+                            f"event. See contamination fraction below for a "
+                            f"more direct signal.")
+        else:
+            out.append(f"       (no KNOWN_EVENTS entry overlaps this span)")
+
+        gap_hits = overlapping_gaps(w["purge_start"], w["embargo_end"], gap_ts, gap_rows_list)
+        if gap_hits:
+            for (row, gap_end, gap_size) in gap_hits:
+                out.append(f"       ⚠  RAW DATA GAP overlap: row {row}  "
+                            f"closes {gap_end}  size={gap_size}")
+        else:
+            out.append(f"       (no raw-data gap falls inside this span)")
+
+        # ── Contamination fraction — the more direct, window-size-independent
+        # signal: how much of the SCORED val window (not the padded span)
+        # actually sits inside a gap's rolling-window contamination zone.
+        if w["fold_id"] != "manual":
+            frac = contamination_fraction(w["val_start"], w["val_end"], gap_ts, gap_rows_list)
+            out.append(f"       1h-gap contamination fraction of val window: "
+                        f"{frac:.1%}  (fraction of val ticks within "
+                        f"{INDICATOR_LOOKBACK_1H}h of a raw-data gap — "
+                        f"a direct, window-size-independent data-quality "
+                        f"signal; NOTE: 1h-only, doesn't cover 4h-level gaps)")
+
+        if not ev_hits and not gap_hits:
+            out.append(f"       → Neither explains this window. If val_pnl breached "
+                        f"the floor here, this looks like a genuine strategy "
+                        f"weakness in this regime, not a data artifact — worth "
+                        f"direct investigation (e.g. plot price/volatility over "
+                        f"this span) rather than a data-pipeline fix.")
+
+    return out
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Load 1h master and compute gap table
 # ─────────────────────────────────────────────────────────────────────────────
@@ -91,9 +326,13 @@ threshold = pd.Timedelta(hours=CANDLE_H * 2)
 gap_mask = gaps > threshold
 gap_rows = gap_mask[gap_mask].index.tolist()
 
-if not gap_rows:
+have_gaps = bool(gap_rows)
+if not have_gaps:
     print("✓  No gaps found — data coverage is clean.\n")
-    sys.exit(0)
+    # NOTE: previously this exited immediately. It no longer does — the
+    # CV fold window cross-reference below is still useful even with a
+    # clean raw-data gap table, since it also checks KNOWN_EVENTS
+    # overlap, which is independent of whether any candles are missing.
 
 # ── Val window from training metadata (if available) ─────────────────────────
 val_start, val_end = val_window_from_meta()
@@ -111,10 +350,13 @@ else:
     lines.append("  Val window: not yet available (run main_mcknn.py first)")
 lines.append("")
 
-header = (f"{'Row':>7}  {'Gap closes at':20}  {'Size':12}  "
-          f"{'Missing':>7}  {'In val?':>8}  Likely cause")
-lines.append(header)
-lines.append("-" * 110)
+if have_gaps:
+    header = (f"{'Row':>7}  {'Gap closes at':20}  {'Size':12}  "
+              f"{'Missing':>7}  {'In val?':>8}  Likely cause")
+    lines.append(header)
+    lines.append("-" * 110)
+else:
+    lines.append("  (no raw-data gaps to list)")
 
 total_missing = 0
 val_gap_rows  = []
@@ -172,6 +414,11 @@ else:
         lines.append("     across 2018-2026 — very likely normal exchange maintenance.")
         lines.append("     Proceed with training; re-run this check afterwards to")
         lines.append("     confirm no gaps landed in the final val window.")
+
+lines.append("")
+
+# ── CV fold window cross-reference (new) ───────────────────────────────────────
+lines.extend(report_cv_fold_windows(ts, gap_rows))
 
 lines.append("")
 lines.append("=" * 74)

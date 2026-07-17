@@ -139,6 +139,55 @@ PORTFOLIO_BLOCK_WEIGHT = 2.0   # position + unrealized PnL (2 dims) — boosted
                                # vector's raw influence on distance.
 
 
+def compute_data_signature(df: pd.DataFrame, state_dim: int, fold, lookback_ticks: int,
+                           uses_context: bool) -> str:
+    """
+    Fingerprint the (dataset snapshot, purge/embargo fold boundaries,
+    state config) combination that a training run's bank is about to be
+    built/resumed against.
+
+    Why this exists
+    ──────────────────
+    EpisodeBuffer.add()'s `tick` values (threaded through to
+    MCKNNMemory.commit_episode()) are LOCAL POSITIONAL indices into
+    THIS run's train_df — which is a purge/embargo-filtered slice of
+    `df` whose boundaries come from generate_purged_folds(). If a later
+    run resumes from a checkpoint (agent.load()) after `df` has grown
+    (new candles fetched) or the fold layout otherwise shifted, the OLD
+    bank's ticks refer to a different historical slice than the NEW
+    run's ticks would, even though nothing in the old bank's episode_id
+    numbering flags this. Two runs' data silently gets mixed under an
+    incompatible tick coordinate system — this was the confirmed
+    mechanism behind a checkpoint's saved "best val" P/L not
+    reproducing under diagnostic_mcknn.py's replay.
+
+    This signature is deliberately coarse-but-sufficient rather than a
+    full content hash (hashing 17K+ rows every run would be wasteful):
+    it captures exactly the things that change the MEANING of a stored
+    tick — row count, calendar span, fold boundaries, and state layout
+    — not things that don't (e.g. re-running indicator math that
+    produces bit-identical values).
+    """
+    import hashlib
+    parts = [
+        str(len(df)),
+        str(df["Open_time"].iloc[0]),
+        str(df["Open_time"].iloc[-1]),
+        str(state_dim),
+        str(uses_context),
+        ",".join(FEATURES),
+        ",".join(str(p) for p in PACES),
+        ",".join(str(p) for p in CONTEXT_PACES) if uses_context else "",
+        ",".join(CONTEXT_TIMEFRAMES) if uses_context else "",
+        str(WARMUP_IDX),
+        str(lookback_ticks),
+        str(fold.val_start), str(fold.val_end),
+        str(fold.purge_start), str(fold.embargo_end),
+    ]
+    raw = "|".join(parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
 def build_block_weights(state_dim: int, uses_context: bool) -> "np.ndarray":
     """
     Build the block-weight vector matching this file's actual state
@@ -475,11 +524,21 @@ def run_cross_validation(df: pd.DataFrame, extra_context_arr: np.ndarray,
 
         print(f"  Fold {fold.fold_id} val P/L: {val_metrics['realised_pnl']:+.4%}  "
               f"trades={val_metrics['n_trades']}")
+        # ── Capture the val window's calendar dates (not just tick indices)
+        # so a recurring worst-fold can be traced back to a specific
+        # historical period across separate CV runs — tick indices alone
+        # aren't comparable once the underlying dataset grows between
+        # runs, but dates are. See main()'s gate for how this is surfaced.
+        val_ts = pd.to_datetime(df["Open_time"], errors="coerce")
+        val_start_date = str(val_ts.iloc[fold.val_start])
+        val_end_date   = str(val_ts.iloc[min(fold.val_end - 1, len(val_ts) - 1)])
         fold_results.append({
             "fold_id": fold.fold_id,
             "val_pnl": val_metrics["realised_pnl"],
             "n_trades": val_metrics["n_trades"],
             "action_counts": val_metrics["action_counts"],
+            "val_start_date": val_start_date,
+            "val_end_date": val_end_date,
         })
 
     if fold_results:
@@ -504,6 +563,9 @@ def run_cross_validation(df: pd.DataFrame, extra_context_arr: np.ndarray,
         print(f"  Min  val P/L : {summary['min_val_pnl']:+.4%}")
         print(f"  Max  val P/L : {summary['max_val_pnl']:+.4%}")
         print(f"  Folds positive: {summary['n_folds_positive']}/{summary['n_folds']}")
+        worst = min(fold_results, key=lambda r: r["val_pnl"])
+        print(f"  Worst fold   : #{worst['fold_id']}  {worst['val_pnl']:+.4%}  "
+              f"({worst['val_start_date'][:10]} → {worst['val_end_date'][:10]})")
         if summary["n_folds"] > 1 and summary["std_val_pnl"] > abs(summary["mean_val_pnl"]):
             summary["std_exceeds_mean_warning"] = True
             print("  ⚠ Std exceeds |mean| — performance is NOT consistent "
@@ -554,6 +616,16 @@ def run_final_training(df: pd.DataFrame, extra_context_arr: np.ndarray,
           f"[{final_fold.val_start}:{final_fold.val_end}) "
           f"(purged region [{final_fold.purge_start}:{final_fold.embargo_end}))")
 
+    data_signature = compute_data_signature(
+        df, state_dim, final_fold, lookback_ticks,
+        uses_context=(extra_context_arr is not None),
+    )
+    print(f"  data_signature: {data_signature}  "
+          f"(fingerprints this exact dataset snapshot + fold boundaries + "
+          f"state layout — resuming CHECKPOINT_PATH under a DIFFERENT "
+          f"signature will start a fresh bank instead of silently mixing "
+          f"incompatible tick coordinates; see MCKNNAgent.load())")
+
     train_df = df[final_fold.train_mask].reset_index(drop=True)
     val_df   = df[final_fold.val_mask].reset_index(drop=True)
     train_ctx = _slice_context(extra_context_arr, final_fold.train_mask)
@@ -585,6 +657,7 @@ def run_final_training(df: pd.DataFrame, extra_context_arr: np.ndarray,
         "context_timeframes": list(CONTEXT_TIMEFRAMES) if extra_context_arr is not None else None,
         "warmup_idx":       int(WARMUP_IDX),
         "total_rows":       int(len(df)),
+        "data_signature":   data_signature,
         "block_weights":    {
             "primary":   PRIMARY_BLOCK_WEIGHT,
             "context":   CONTEXT_BLOCK_WEIGHT if extra_context_arr is not None else None,
@@ -601,8 +674,12 @@ def run_final_training(df: pd.DataFrame, extra_context_arr: np.ndarray,
         signal_threshold=SIGNAL_THRESHOLD,
         min_tick_gap=MIN_TICK_GAP, max_weight_ratio=MAX_WEIGHT_RATIO,
         block_weights=build_block_weights(state_dim, extra_context_arr is not None),
+        data_signature=data_signature,
     )
     agent.load(CHECKPOINT_PATH)
+    # max_size is now enforced inside MCKNNAgent.load() — no manual override needed.
+    # data_signature compatibility (fresh bank on mismatch) is now enforced
+    # inside MCKNNAgent.load() too — see its docstring/comments.
 
     best_val_pnl = -np.inf
     no_improve   = 0
@@ -732,6 +809,20 @@ def run_final_training(df: pd.DataFrame, extra_context_arr: np.ndarray,
 # ─────────────────────────────────────────────
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="MC-kNN training pipeline")
+    parser.add_argument(
+        "--force-final-training", action="store_true",
+        help="Proceed to Step 2 (final deployable training) even if the "
+             "walk-forward CV in Step 1 shows the strategy is not robust "
+             "(std of fold val P/L exceeds |mean|, or fewer than half the "
+             "folds are profitable). Without this flag, an unstable CV "
+             "result aborts before Step 2 — CV already told you a single "
+             "checkpoint's 'best val' number wouldn't generalize; training "
+             "one anyway just produces a number CV pre-flagged as untrustworthy."
+    )
+    args = parser.parse_args()
+
     # ── Primary (4h, decision-timeframe) master data ─────────────────────────
     df = update_master_data(PRIMARY_TIMEFRAME)
     df = df[["Open_time", "Close"] + FEATURES].dropna().reset_index(drop=True)
@@ -782,8 +873,148 @@ def main():
 
     # ── Step 1: walk-forward CV — measure robustness across many
     #    independent historical periods before trusting any one number ──
+    # Stash the PREVIOUS run's summary before run_cross_validation()
+    # overwrites outcomes/walkforward_cv_summary.json, so the gate below
+    # can tell whether today's worst fold is a NEW failure or the SAME
+    # historical window blowing up again across independent runs — the
+    # latter is a strategy blind spot, not sampling noise, and the two
+    # should not be treated with equal concern.
+    import json as _json
+    prev_cv_summary = None
+    if os.path.exists("outcomes/walkforward_cv_summary.json"):
+        try:
+            with open("outcomes/walkforward_cv_summary.json") as f:
+                prev_cv_summary = _json.load(f)
+        except Exception:
+            prev_cv_summary = None
+
     print(f"\n{'#'*62}\n  STEP 1 — PURGED + EMBARGOED WALK-FORWARD CROSS-VALIDATION\n{'#'*62}")
-    run_cross_validation(df, extra_context_arr, state_dim, n_folds=N_CV_FOLDS)
+    fold_results = run_cross_validation(df, extra_context_arr, state_dim, n_folds=N_CV_FOLDS)
+
+    # ── Stability gate — integrity fix ─────────────────────────────────────
+    # Previously Step 2 always ran regardless of what Step 1 found, even
+    # when CV's own summary printed "std exceeds |mean| — treat with real
+    # skepticism". That warning was informational only; nothing stopped a
+    # checkpoint from being trained and saved as BEST_PATH off the back of
+    # a strategy CV had just shown was statistically indistinguishable
+    # from noise (or worse) across historical periods. Now that result
+    # actually gates whether Step 2 runs at all, unless the caller
+    # explicitly opts in via --force-final-training.
+    if not fold_results:
+        print(f"\n{'!'*62}")
+        print("  ⛔ ABORTING before Step 2 — walk-forward CV produced no "
+              "usable folds (see warnings above). Nothing to gate on, so "
+              "training a 'deployable' checkpoint would be flying blind.")
+        print(f"  Re-run with --force-final-training to override.")
+        print(f"{'!'*62}\n")
+        if not args.force_final_training:
+            return
+    else:
+        pnls = np.array([r["val_pnl"] for r in fold_results])
+        mean_pnl, std_pnl = float(pnls.mean()), float(pnls.std())
+        min_pnl = float(pnls.min())
+        n_pos, n_folds = int((pnls > 0).sum()), len(fold_results)
+        # ── Gate criteria (revised) ─────────────────────────────────────
+        # Originally this checked `std_pnl > abs(mean_pnl)`, but that's a
+        # scale-sensitive statistic: a strategy that is directionally
+        # consistent (most folds positive) but has widely varying WIN
+        # magnitudes trips it just as readily as one that's genuinely
+        # incoherent (folds flip sign unpredictably) — those are very
+        # different failure modes and shouldn't share one threshold.
+        # Revised to check the two things that actually matter:
+        #   1. Directional consistency — is a MAJORITY of folds positive?
+        #      (unlike std/mean, this doesn't care how big the wins/
+        #      losses are, only how often the strategy is on the right
+        #      side of zero across independent historical periods.)
+        #   2. Downside floor — did any single fold blow through the SAME
+        #      VAL_PNL_FLOOR already trusted to gate final-checkpoint
+        #      saving? If a historical period can produce a result your
+        #      own save-gate would reject, CV has already told you that
+        #      outcome is reachable from this data/strategy combination —
+        #      training the deployable run anyway just risks landing on
+        #      it without the CV context to explain it.
+        # std/mean is still computed and printed for visibility, but no
+        # longer blocks on its own.
+        directionally_consistent = n_pos >= (n_folds / 2)
+        downside_breach = min_pnl < VAL_PNL_FLOOR
+        unstable = (not directionally_consistent) or downside_breach
+
+        worst = min(fold_results, key=lambda r: r["val_pnl"])
+        worst_window = (worst.get("val_start_date", "")[:10],
+                        worst.get("val_end_date", "")[:10])
+
+        # ── Recurring-blowup check ────────────────────────────────────────
+        # Two consecutive CV runs both showing ~5/6 positive with one fold
+        # blowing well past VAL_PNL_FLOOR is a DIFFERENT situation than a
+        # single run doing that once: if it's the same calendar window
+        # both times, that's a repeatable regime the strategy can't
+        # handle (worth investigating directly — e.g. against
+        # check_gaps.py's known-event list, or a genuine data-quality
+        # issue near that window), not run-to-run sampling variance from
+        # epsilon-greedy exploration. Dates (not fold_id/tick) are the
+        # right comparison key since fold boundaries can shift slightly
+        # between runs as the underlying dataset grows.
+        recurring = False
+        if downside_breach and prev_cv_summary and prev_cv_summary.get("fold_results"):
+            prev_worst = min(prev_cv_summary["fold_results"],
+                             key=lambda r: r["val_pnl"])
+            prev_window = (prev_worst.get("val_start_date", "")[:10],
+                          prev_worst.get("val_end_date", "")[:10])
+            # Overlapping (not necessarily identical) windows count as
+            # "the same period" since fold boundaries can drift by a few
+            # ticks between runs without the underlying event moving.
+            if prev_window[0] and worst_window[0] and (
+                prev_window == worst_window or
+                (prev_window[0] <= worst_window[1] and worst_window[0] <= prev_window[1])
+            ):
+                recurring = True
+
+        if unstable:
+            print(f"\n{'!'*62}")
+            print("  ⛔ CV RESULT IS UNSTABLE — refusing to auto-proceed to "
+                  "Step 2.")
+            print(f"     mean val P/L={mean_pnl:+.4%}  std={std_pnl:.4%}  "
+                  f"folds positive={n_pos}/{n_folds}")
+            if not directionally_consistent:
+                print(f"     ✗ Directional consistency failed: only "
+                      f"{n_pos}/{n_folds} folds positive (< majority).")
+            if downside_breach:
+                print(f"     ✗ Downside floor breached: worst fold "
+                      f"{min_pnl:+.4%} < VAL_PNL_FLOOR={VAL_PNL_FLOOR:+.0%}  "
+                      f"({worst_window[0]} → {worst_window[1]}) "
+                      f"— a historical period exists where this strategy "
+                      f"produces a result your own save-gate would reject.")
+            if recurring:
+                print(f"     ⚠⚠ RECURRING: the previous CV run's worst fold "
+                      f"covered the SAME (or overlapping) window "
+                      f"({prev_window[0]} → {prev_window[1]}). This isn't "
+                      f"run-to-run noise — this specific historical period "
+                      f"is a repeatable blind spot for this strategy. Worth "
+                      f"investigating directly (check_gaps.py's known-event "
+                      f"table, or the raw data around that window) before "
+                      f"spending more runs hoping a different epsilon-greedy "
+                      f"draw papers over it.")
+            print("     A single 'best val' checkpoint trained from here "
+                  "would be one draw from a distribution CV just showed "
+                  "is not reliably positive — its headline number should "
+                  "not be trusted as a generalization claim.")
+            if args.force_final_training:
+                print("     --force-final-training set — proceeding anyway. "
+                      "Treat the resulting checkpoint's val P/L as "
+                      "ANECDOTAL, not validated.")
+            else:
+                print("     Re-run with --force-final-training to proceed "
+                      "anyway.")
+            print(f"{'!'*62}\n")
+            if not args.force_final_training:
+                return
+        elif std_pnl > abs(mean_pnl):
+            print(f"\n  ⚠ Note: std ({std_pnl:.4%}) exceeds |mean| "
+                  f"({abs(mean_pnl):.4%}) across folds, but {n_pos}/{n_folds} "
+                  f"are positive and no fold breached VAL_PNL_FLOOR — "
+                  f"proceeding, but fold magnitudes vary widely, so treat "
+                  f"the final checkpoint's exact val P/L number as noisy "
+                  f"even though the direction looks consistent.\n")
 
     # ── Step 2: train the deployable checkpoint ───────────────────────────
     print(f"\n{'#'*62}\n  STEP 2 — FINAL DEPLOYABLE TRAINING RUN\n{'#'*62}")

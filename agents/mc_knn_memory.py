@@ -101,12 +101,30 @@ class MCKNNMemory:
         min_tick_gap: int = 0,
         block_weights: np.ndarray = None,
         dim_scale_floor: float = 1e-3,
+        data_signature: str = None,
     ):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.k = k
         self.max_size = max_size
         self.signal_threshold = signal_threshold
+
+        # ── Data/fold-layout signature (integrity fix) ───────────────────
+        # Tags this bank with a fingerprint of the dataset + purge/embargo
+        # fold boundaries + state layout it was built under (see
+        # main_mcknn.py's compute_data_signature()). EpisodeBuffer's
+        # `tick` values are LOCAL POSITIONAL indices into whatever
+        # train_df a given run constructed — they are only meaningful
+        # relative to that exact (dataset snapshot, fold boundaries,
+        # state config) combination. If a checkpoint is resumed
+        # (agent.load()) under a DIFFERENT combination (e.g. the master
+        # CSV grew, or fold boundaries shifted), old rows' ticks silently
+        # refer to a different slice of history than new rows' ticks,
+        # even though they share the small integer episode_id space —
+        # this was the root cause of a checkpoint's saved "best val" P/L
+        # not reproducing under diagnostic_mcknn.py's replay. See
+        # MCKNNAgent.load() for where this signature is enforced.
+        self.data_signature = data_signature or ""
 
         # ── Kernel-weight cap config ────────────────────────────────────
         # EPS_DIST is still a floor (anti-div-by-zero), but the dominant
@@ -500,6 +518,7 @@ class MCKNNMemory:
             n_commits=self.n_commits,
             n_prunes=self.n_prunes,
             next_episode_id=self._next_episode_id,
+            data_signature=self.data_signature,
         )
 
     @classmethod
@@ -521,6 +540,7 @@ class MCKNNMemory:
             min_tick_gap=int(data["min_tick_gap"]) if "min_tick_gap" in data else 0,
             block_weights=block_weights,
             dim_scale_floor=float(data["dim_scale_floor"]) if "dim_scale_floor" in data else 1e-3,
+            data_signature=(str(data["data_signature"]) if "data_signature" in data else ""),
         )
         n = len(data["states"])
         mem._grow(n)
