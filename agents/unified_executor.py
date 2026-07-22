@@ -179,10 +179,32 @@ class UnifiedExecutor:
         self.tick = tick
         state = self.get_state(indicators, price, extra_context=extra_context)
 
+        # ATR_Scaled is a rolling z-score that preprocessing.py clips to
+        # [-3, 3] and then DIVIDES BY 3 (same convention as MACD_Scaled/
+        # OBV_Scaled/MeanDev_Scaled), so its stored range is strictly
+        # [-1, 1]. The old threshold of 2.0 was written against the
+        # pre-division z-score and could never be exceeded post-rescale,
+        # making this panic-exit permanently unreachable. ATR_THRESHOLD
+        # is expressed in the SAME post-rescale units the indicators
+        # array actually carries: 0.67 ≈ a z-score of 2.0 pre-division
+        # (2.0 / 3), preserving the original "~2 std devs of ATR" intent.
         ATR_IDX = 4  # ATR_Scaled in the indicators array
-        if self.current_side is None and abs(indicators[ATR_IDX]) > 2.0:
+        ATR_THRESHOLD = 0.67
+        if self.current_side is None and abs(indicators[ATR_IDX]) > ATR_THRESHOLD:
             self.last_probs = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-            return 3, self.last_probs, 0.0, self.get_state(indicators, price, extra_context=extra_context)
+            # Reuse the state already computed above instead of calling
+            # get_state() a second time. get_state() is NOT a pure read —
+            # it drives self.aggregator.update(indicators), which
+            # increments aggregator.tick and appends this tick's
+            # indicators into each due pace's history. Calling it twice
+            # per panic-exit tick was double-advancing aggregator.tick
+            # (permanently phase-shifting which real ticks land on each
+            # pace's `tick % pace == 0` sampling boundary for the rest of
+            # the episode) and inserting a duplicate row into the
+            # rolling window MultiPaceAgent.get_state() uses for its
+            # mean/std/slope computation — silently biasing those
+            # features for up to `max_history` ticks afterward.
+            return 3, self.last_probs, 0.0, state
 
         if self.current_side is not None:
             u_pnl = self.portfolio_info(price)["unrealized_pnl"]
