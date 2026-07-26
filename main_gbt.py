@@ -65,6 +65,25 @@ N_TEST_GROUPS   = 2
 MAX_PATHS       = 28
 MIN_TRAIN_TICKS = 2000
 
+# Base-model regularization (overfitting fix). Prior defaults (depth=6,
+# l2=1.0, no leaf/feature cap, random calibration split) produced CPCV
+# train P/L in the thousands of percent against a negative median test
+# P/L — see GBTPolicy.fit()'s docstring for the full rationale. Exposed
+# here (rather than left as GBTPolicy.fit()'s internal defaults) so it's
+# visible and tunable in one place, and so run_cpcv()/run_final_training()
+# always fit with the SAME config main_gbt.py reports on.
+GBT_HYPERPARAMS = dict(
+    max_iter=150,
+    learning_rate=0.04,
+    max_depth=4,
+    max_leaf_nodes=15,
+    min_samples_leaf=200,
+    l2_regularization=5.0,
+    validation_fraction=0.15,
+    n_iter_no_change=15,
+    max_features=0.7,   # per-split feature subsampling; sklearn>=1.2
+)
+
 # Stability gate (mirrors main_mcknn.py's philosophy — directional
 # consistency + downside floor — plus a PBO check CPCV newly enables)
 VAL_PNL_FLOOR = -0.40
@@ -228,7 +247,14 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame) -> list
             continue
 
         agent = GBTAgent(state_dim=states.shape[1], action_dim=ACTION_DIM)
-        agent.fit(states[train_mask], y[train_mask])
+        # purge_ticks: the calibration split GBTPolicy.fit() carves out
+        # of THIS fold's train rows is chronological (last 20% by
+        # default) — pass the same lookback_ticks used for the outer
+        # CPCV purge/embargo so that internal fit/calibration split gets
+        # an equivalent purge buffer instead of a raw random split that
+        # could leak across overlapping rolling-window lookback.
+        agent.fit(states[train_mask], y[train_mask],
+                  purge_ticks=lookback_ticks, **GBT_HYPERPARAMS)
 
         train_pnl, n_train_trades = simulate_pnl(states, labels, train_mask, agent)
         test_pnl,  n_test_trades  = simulate_pnl(states, labels, test_mask, agent)
@@ -324,7 +350,8 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
           f"embargo: {holdout_start - embargo_start} rows")
 
     agent = GBTAgent(state_dim=states.shape[1], action_dim=ACTION_DIM)
-    agent.fit(states[train_mask], labels["best_action"][train_mask])
+    agent.fit(states[train_mask], labels["best_action"][train_mask],
+              purge_ticks=lookback_ticks, **GBT_HYPERPARAMS)
     agent.save(os.path.join(OUT_DIR, "gbt_agent_best.joblib"))
 
     # ── Calibration report on the genuinely held-out block ──────────

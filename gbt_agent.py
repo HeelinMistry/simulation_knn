@@ -52,7 +52,6 @@ import numpy as np
 
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.model_selection import train_test_split
 from sklearn.isotonic import IsotonicRegression
 import joblib
 
@@ -125,44 +124,102 @@ class GBTPolicy:
     def fit(self, X: np.ndarray, y: np.ndarray,
             calibration_frac: float = 0.2,
             random_state: int = 0,
+            purge_ticks: int = 0,
+            min_fit_rows: int = 200,
             **hgb_kwargs):
         """
-        Fit the base classifier on a (1 - calibration_frac) split, then
-        calibrate on the held-out calibration_frac split via isotonic
-        regression. The split is done manually (rather than via
-        CalibratedClassifierCV's built-in cv folds) so the calibration
-        data is VISIBLY separate from the fitting data, and so this
-        works identically across sklearn versions where cv='prefit'
-        was removed (see _supports_prefit()).
+        Fit the base classifier on a chronological "fit" prefix, then
+        calibrate on a chronological "calibration" suffix via isotonic
+        regression, with an optional purge gap removed from between them.
+
+        CHANGE (overfitting fix): the fit/calibration split used to be a
+        RANDOM train_test_split (optionally stratified). X/y arrive here
+        in original tick order — train_mask/np.flatnonzero indexing in
+        main_gbt.py's run_cpcv()/run_final_training() never reorders rows
+        — so a random split let calibration rows land tick-adjacent to
+        fit rows. Because several features here have rolling lookbacks up
+        to 200 ticks (see preprocessing.py) and the state can include
+        15m/1h context (multi_timeframe_state.py), tick-adjacent rows
+        share substantial overlapping information: the "held-out"
+        calibration split wasn't actually held out. This is precisely the
+        leak walkforward.py's purge/embargo logic exists to prevent
+        everywhere else in this codebase, so the fit/calibration split
+        now follows the same discipline: calibration is the LAST
+        `calibration_frac` of rows (chronologically), and a `purge_ticks`
+        buffer (pass walkforward.compute_required_lookback_ticks(), sized
+        to whatever CPCV/walk-forward fold this X/y came from) is dropped
+        from the fit set immediately before it.
+
+        Also tightened base-model regularization (max_depth, max_leaf_nodes,
+        min_samples_leaf, l2_regularization, max_features where supported)
+        — the prior defaults (depth=6, l2=1.0, no leaf/feature cap) were
+        producing >1000% train P/L against negative median test P/L in
+        CPCV (see main_gbt.py's gate output), a classic small-n/high-dim
+        (state_dim up to 122) overfitting signature for tree ensembles.
 
         IMPORTANT: X/y here should already be the TRAIN-fold data from
         an outer CPCV/walk-forward split (see main_gbt.py) — this
-        train/calibration split is a further internal split of that,
+        fit/calibration split is a further internal split of that,
         purely for calibration, not a substitute for proper purged
         out-of-sample evaluation.
         """
-        strat = y if len(np.unique(y)) > 1 else None
-        X_fit, X_cal, y_fit, y_cal = train_test_split(
-            X, y, test_size=calibration_frac, random_state=random_state,
-            stratify=strat,
-        )
+        n = len(X)
+        cal_size = max(1, int(n * calibration_frac))
+        cal_start = n - cal_size
+        fit_end = max(0, cal_start - purge_ticks)
+        if fit_end < min_fit_rows:
+            # purge_ticks would eat too much of a short fold — fall back
+            # to an unpurged (but still chronological, non-random) split
+            # rather than starving the fit set.
+            fit_end = cal_start
 
-        base = HistGradientBoostingClassifier(
-            max_iter=hgb_kwargs.pop("max_iter", 300),
-            learning_rate=hgb_kwargs.pop("learning_rate", 0.05),
-            max_depth=hgb_kwargs.pop("max_depth", 6),
-            l2_regularization=hgb_kwargs.pop("l2_regularization", 1.0),
-            early_stopping=True,
-            random_state=random_state,
-            **hgb_kwargs,
-        )
-        base.fit(X_fit, y_fit)
+        X_fit, y_fit = X[:fit_end], y[:fit_end]
+        X_cal, y_cal = X[cal_start:], y[cal_start:]
+
+        if len(np.unique(y_fit)) < 2:
+            raise ValueError(
+                f"Fit split (rows 0:{fit_end}) contains only "
+                f"{len(np.unique(y_fit))} class(es) — cannot train a "
+                f"classifier. Check class balance / fold size."
+            )
+
+        hgb_kwargs.setdefault("max_iter", 150)
+        hgb_kwargs.setdefault("learning_rate", 0.04)
+        hgb_kwargs.setdefault("max_depth", 4)
+        hgb_kwargs.setdefault("max_leaf_nodes", 15)
+        hgb_kwargs.setdefault("min_samples_leaf", 200)
+        hgb_kwargs.setdefault("l2_regularization", 5.0)
+        hgb_kwargs.setdefault("validation_fraction", 0.15)
+        hgb_kwargs.setdefault("n_iter_no_change", 15)
+        # max_features (per-split feature subsampling) needs sklearn>=1.2;
+        # degrade gracefully on older installs rather than hard-failing.
+        hgb_kwargs.setdefault("max_features", 0.7)
+
+        try:
+            base = HistGradientBoostingClassifier(
+                early_stopping=True, random_state=random_state, **hgb_kwargs,
+            )
+            base.fit(X_fit, y_fit)
+        except TypeError:
+            hgb_kwargs.pop("max_features", None)
+            base = HistGradientBoostingClassifier(
+                early_stopping=True, random_state=random_state, **hgb_kwargs,
+            )
+            base.fit(X_fit, y_fit)
 
         if _supports_prefit():
             self.model = CalibratedClassifierCV(base, method="isotonic", cv="prefit")
         else:
             self.model = _ManualIsotoneCalibrator(base)
-        self.model.fit(X_cal, y_cal)
+
+        if len(np.unique(y_cal)) < 2:
+            # Calibration split is degenerate (e.g. very short fold) —
+            # fall back to calibrating on the fit split rather than
+            # crashing; isotonic regression still runs, just without a
+            # genuinely held-out calibration slice for this fold.
+            self.model.fit(X_fit, y_fit)
+        else:
+            self.model.fit(X_cal, y_cal)
 
         self.classes_ = np.array(sorted(np.unique(y)))
         return self
@@ -286,10 +343,10 @@ class GBTAgent:
             return action, probs
         return self.actor.act(state, deterministic=deterministic, action_mask=action_mask)
 
-    def fit(self, X: np.ndarray, y: np.ndarray, **kwargs):
-        self.actor.fit(X, y, **kwargs)
+    def fit(self, X: np.ndarray, y: np.ndarray, purge_ticks: int = 0, **kwargs):
+        self.actor.fit(X, y, purge_ticks=purge_ticks, **kwargs)
         print(f"[GBTAgent] ✅ Fit complete on {len(X):,} rows  "
-              f"(classes={self.actor.classes_.tolist()})")
+              f"(classes={self.actor.classes_.tolist()}, purge_ticks={purge_ticks})")
 
     def update(self, episode_buffer=None):
         # No-op — kept for interface parity with MCKNNAgent.update(),
