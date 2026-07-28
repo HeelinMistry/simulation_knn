@@ -112,12 +112,30 @@ class GBTPolicy:
     _in_position_probs() instead of the flat-position 4-class mapping
     below — see that method's docstring for why this needs the
     currently-open side, which the policy itself doesn't track.
+
+    ENTRY-CONVICTION THRESHOLD (entry_threshold)
+    ─────────────────────────────────────────────
+    Previously get_action() always took argmax(LONG, SHORT, HOLD) —
+    meaning a directional class could be selected with as little as
+    ~34% probability if it merely edged out the other two. CPCV showed
+    this produced hundreds of low-conviction trades per fold with
+    near-zero aggregate edge (mean test avg/trade ≈ +0.01%, std 70x the
+    mean). entry_threshold requires a directional class's OWN
+    probability to exceed this bar before it's eligible to be chosen;
+    otherwise that mass is folded into HOLD (see get_action()) so the
+    policy stays flat instead of taking a low-conviction bet. Defaults
+    to 0.5 (weakly stricter than pure argmax, since a directional class
+    must clear 50% on its own now rather than just outscore HOLD/the
+    other side). The deployed value is chosen empirically by
+    main_gbt.py's CPCV threshold sweep, never hand-picked or fit on the
+    holdout — see sweep_entry_thresholds() there.
     """
 
-    def __init__(self, model=None, action_dim: int = 4):
+    def __init__(self, model=None, action_dim: int = 4, entry_threshold: float = 0.5):
         self.model = model
         self.action_dim = action_dim
         self.classes_ = None  # set on fit(); subset of {0,1,3}
+        self.entry_threshold = entry_threshold
 
     # ── Training ──────────────────────────────────────────────────────────
 
@@ -278,7 +296,17 @@ class GBTPolicy:
         """
         lsh = self._raw_probs(state)  # [LONG, SHORT, HOLD]
         probs4 = np.zeros(4, dtype=np.float32)
-        probs4[0], probs4[1], probs4[3] = lsh[0], lsh[1], lsh[2]
+        # Entry-conviction gate: a directional class only stays "live"
+        # if its OWN calibrated probability clears entry_threshold.
+        # Suppressed mass folds into HOLD (rather than vanishing) so
+        # probs4 remains a valid distribution and argmax naturally
+        # resolves to HOLD instead of a weak directional plurality —
+        # see class docstring.
+        long_ok  = lsh[0] > self.entry_threshold
+        short_ok = lsh[1] > self.entry_threshold
+        probs4[0] = lsh[0] if long_ok else 0.0
+        probs4[1] = lsh[1] if short_ok else 0.0
+        probs4[3] = lsh[2] + (0.0 if long_ok else lsh[0]) + (0.0 if short_ok else lsh[1])
 
         if action_mask is not None:
             invalid = ~np.asarray(action_mask, dtype=bool)
@@ -318,10 +346,10 @@ class GBTAgent:
     through explicitly if you extend UnifiedExecutor for this agent.
     """
 
-    def __init__(self, state_dim: int = 122, action_dim: int = 4):
+    def __init__(self, state_dim: int = 122, action_dim: int = 4, entry_threshold: float = 0.5):
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.actor = GBTPolicy(action_dim=action_dim)
+        self.actor = GBTPolicy(action_dim=action_dim, entry_threshold=entry_threshold)
         self.device = "cpu"
 
     # Deliberately NOT declaring query_tick/query_episode_id — see
@@ -359,8 +387,9 @@ class GBTAgent:
         joblib.dump({
             "model": self.actor.model, "classes_": self.actor.classes_,
             "state_dim": self.state_dim, "action_dim": self.action_dim,
+            "entry_threshold": self.actor.entry_threshold,
         }, path)
-        print(f"[GBTAgent] ✅ Saved → {path}")
+        print(f"[GBTAgent] ✅ Saved → {path}  (entry_threshold={self.actor.entry_threshold:.2f})")
 
     def load(self, path: str = "outcomes/gbt_agent.joblib"):
         if not os.path.exists(path):
@@ -371,4 +400,8 @@ class GBTAgent:
         self.actor.classes_ = data["classes_"]
         self.state_dim = data["state_dim"]
         self.action_dim = data["action_dim"]
-        print(f"[GBTAgent] ✅ Loaded ← {path}")
+        # Backward-compat: checkpoints saved before this revision won't
+        # have entry_threshold — fall back to the old implicit behaviour
+        # (0.5, i.e. plain argmax-eligible) rather than erroring.
+        self.actor.entry_threshold = data.get("entry_threshold", 0.5)
+        print(f"[GBTAgent] ✅ Loaded ← {path}  (entry_threshold={self.actor.entry_threshold:.2f})")

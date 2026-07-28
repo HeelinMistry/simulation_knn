@@ -700,6 +700,7 @@ def write_summary(ep: dict, agent: GBTAgent, pnls, calib_report: dict = None):
     lines = ["=" * 62, f"  GBT DIAGNOSTIC SUMMARY — {label.upper()}",
              f"  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
              f"  state_dim (trained): {agent.state_dim}",
+             f"  entry_threshold: {getattr(agent.actor, 'entry_threshold', 0.5):.2f}",
              f"  classes_: {agent.actor.classes_.tolist() if agent.actor.classes_ is not None else 'n/a'}",
              "=" * 62]
 
@@ -883,5 +884,5 @@ if __name__ == "__main__":
     main()
 
 # python diagnostic_gbt.py - -split val
-# python diagnostic_gbt.py --split both --checkpoint
+# python diagnostic_gbt.py - -split both - -checkpoint
 # outcomes / gbt / gbt_agent_best.joblib

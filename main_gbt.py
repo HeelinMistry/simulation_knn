@@ -59,6 +59,36 @@ gap itself, and the gap is still large enough to warrant additional
 regularization on top of the previous tightening pass (see
 gbt_agent.py's GBTPolicy.fit() docstring for that history).
 
+CHANGES IN THIS REVISION — ENTRY-CONVICTION THRESHOLD + HOLDOUT GATE
+───────────────────────────────────────────────────────────────────────
+A live run of the previous revision passed the CPCV gate (PBO=35.7%,
+directionally consistent) and then LOST money on the genuinely held-out
+block (-0.33%/trade, -8.64% total over 26 trades). Two gaps caused
+this:
+
+1. The policy always traded argmax(LONG, SHORT, HOLD), so a directional
+   class could be selected on as little as ~34% probability if it
+   merely edged out the other two options — CPCV's near-zero mean
+   edge (+0.01%/trade, std 70x the mean) is largely low-conviction
+   noise trades. Fix: GBTPolicy now has an entry_threshold (see
+   gbt_agent.py) — a directional class must clear this probability on
+   its own to be tradeable. sweep_entry_thresholds() below chooses the
+   deployed value from CPCV TEST folds only (never the holdout), by
+   scoring mean/std of test_avg_pnl across paths (a Sharpe-like ranking
+   across independent CPCV paths) subject to a minimum aggregate trade
+   count — this is the same "hyperparameter must be chosen out-of-
+   sample" discipline the rest of this codebase already applies to
+   purge/embargo sizing.
+
+2. gate_and_summarize() only ever checked CPCV; nothing gated the
+   FINAL model's performance on its own holdout block before
+   overwriting gbt_agent_best.joblib. run_final_training() now computes
+   holdout avg_pnl at the swept entry_threshold and refuses to deploy
+   (i.e. won't touch gbt_agent_best.joblib) if it doesn't clear
+   HOLDOUT_AVG_TRADE_FLOOR with at least HOLDOUT_MIN_TRADES — instead
+   saving under a clearly-marked "_FAILED_HOLDOUT" filename so nothing
+   is silently lost, but nothing bad gets silently deployed either.
+
 Run
 ────
     python main_gbt.py                        # gated pipeline
@@ -115,13 +145,27 @@ GBT_HYPERPARAMS = dict(
     max_iter=150,
     learning_rate=0.04,
     max_depth=3,               # was 4
-    max_leaf_nodes=10,         # was 15
-    min_samples_leaf=300,      # was 200
-    l2_regularization=8.0,     # was 5.0
+    max_leaf_nodes=8,          # was 10 -> 15
+    min_samples_leaf=400,      # was 300 -> 200
+    l2_regularization=10.0,    # was 8.0 -> 5.0
     validation_fraction=0.15,
     n_iter_no_change=15,
-    max_features=0.5,          # was 0.7; sklearn>=1.2
+    max_features=0.45,         # was 0.5 -> 0.7; sklearn>=1.2
 )
+
+# ── Entry-conviction threshold sweep (CPCV-only — see module docstring) ─────
+ENTRY_THRESHOLD_CANDIDATES = (0.50, 0.55, 0.60, 0.65, 0.70)
+# A threshold whose aggregate CPCV test trade count falls below this is
+# disqualified regardless of how good its per-trade stats look — a few
+# great-looking trades on a tiny sample isn't trustworthy.
+MIN_SWEEP_TRADES = 150
+
+# ── Final holdout deployment gate (this revision — see module docstring) ────
+# Distinct from VAL_AVG_TRADE_FLOOR (a CPCV-path floor): this gates the
+# actual deployable model's performance on ITS OWN held-out block, at
+# the entry_threshold that will actually be used live.
+HOLDOUT_AVG_TRADE_FLOOR = 0.0    # require a non-negative mean holdout trade
+HOLDOUT_MIN_TRADES      = 10     # fewer trades than this -> gate can't be trusted either way
 
 # Stability gate (mirrors main_mcknn.py's philosophy — directional
 # consistency + downside floor — plus a PBO check CPCV newly enables).
@@ -219,7 +263,7 @@ def build_states_and_labels():
 # ─────────────────────────────────────────────
 
 def simulate_pnl(states: np.ndarray, labels: dict, mask: np.ndarray,
-                  agent: GBTAgent) -> tuple:
+                  agent: GBTAgent, prob_threshold: float = 0.5) -> tuple:
     """
     Score the CLASSIFIER's entry decisions against the triple-barrier
     label's own ground-truth realised return, enforcing ONE OPEN
@@ -227,9 +271,17 @@ def simulate_pnl(states: np.ndarray, labels: dict, mask: np.ndarray,
     `inventory` deque) — at each tick in `mask` that isn't still
     "inside" a previously opened trade's holding window, take the
     higher-probability directional class if its calibrated probability
-    exceeds 0.5, credit that tick's own long_return/short_return, and
-    then skip every tick up to and including that trade's touch tick
-    before considering another entry.
+    exceeds `prob_threshold`, credit that tick's own long_return/
+    short_return, and then skip every tick up to and including that
+    trade's touch tick before considering another entry.
+
+    prob_threshold (this revision): previously hardcoded to 0.5. Now a
+    parameter so sweep_entry_thresholds() can re-score the SAME fitted
+    agent's predictions at multiple candidate thresholds without
+    refitting — this is intentionally independent of
+    agent.actor.entry_threshold (which governs live inference via
+    get_action()); callers pass the threshold they want evaluated
+    explicitly.
 
     NORMALIZATION FIX (this revision): total_pnl (a raw sum of
     per-trade returns) is trade-count-dependent — a fold with 600
@@ -264,13 +316,13 @@ def simulate_pnl(states: np.ndarray, labels: dict, mask: np.ndarray,
             continue   # a previously opened trade is still "in the market"
         lsh = agent.actor._raw_probs(states[row])
         best = int(np.argmax(lsh))
-        if best == 0 and lsh[0] > 0.5:
+        if best == 0 and lsh[0] > prob_threshold:
             r = float(labels["long_return"][row])
             total_pnl += r
             trade_returns.append(r)
             next_free_tick = int(labels["long_touch"][row]) + 1
             n_trades += 1
-        elif best == 1 and lsh[1] > 0.5:
+        elif best == 1 and lsh[1] > prob_threshold:
             r = float(labels["short_return"][row])
             total_pnl += r
             trade_returns.append(r)
@@ -299,7 +351,17 @@ def _sharpe_like(trade_returns: list) -> float:
     return float(arr.mean() / std * np.sqrt(len(arr)))
 
 
-def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame) -> list:
+def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame) -> tuple:
+    """
+    Returns (path_results, fitted_paths, valid).
+
+    fitted_paths: list of (CPCVPath, GBTAgent) for every path that was
+    actually fit — kept so sweep_entry_thresholds()/
+    evaluate_paths_at_threshold() can re-score the SAME fitted models
+    at different entry-probability thresholds without the cost (and
+    the subtle risk of a different random_state/early-stopping path)
+    of refitting per threshold.
+    """
     lookback_ticks = compute_required_lookback_ticks()
     paths = generate_cpcv_paths(
         aligned_df, n_groups=N_GROUPS, n_test_groups=N_TEST_GROUPS,
@@ -314,6 +376,7 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame) -> list
     valid = labels["valid_mask"]
 
     path_results = []
+    fitted_paths = []
     for path in paths:
         train_mask = path.train_mask & valid
         test_mask  = path.test_mask & valid
@@ -329,7 +392,12 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame) -> list
         # could leak across overlapping rolling-window lookback.
         agent.fit(states[train_mask], y[train_mask],
                   purge_ticks=lookback_ticks, **GBT_HYPERPARAMS)
+        fitted_paths.append((path, agent))
 
+        # Baseline (threshold=0.5) results — used for human-readable
+        # per-path logging here only. The actual gating decision in
+        # main() uses evaluate_paths_at_threshold() at the SWEPT
+        # threshold, computed after this loop returns.
         train_pnl, n_train_trades, train_avg_pnl, train_returns = simulate_pnl(
             states, labels, train_mask, agent)
         test_pnl, n_test_trades, test_avg_pnl, test_returns = simulate_pnl(
@@ -340,7 +408,7 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame) -> list
             "path_id": path.path_id, "test_groups": list(path.test_groups),
             # Raw sums — logging/context only, NOT trade-count-normalized.
             "train_pnl": train_pnl, "test_pnl": test_pnl,
-            # Normalized — these drive gate_and_summarize()'s decision.
+            # Normalized — baseline @ threshold=0.5, context only now.
             "train_avg_pnl": train_avg_pnl, "test_avg_pnl": test_avg_pnl,
             "test_sharpe": test_sharpe,
             "n_train": int(train_mask.sum()), "n_test": int(test_mask.sum()),
@@ -351,17 +419,110 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame) -> list
               f"train_avg={train_avg_pnl:+.3%} ({n_train_trades} trades)  "
               f"test_avg={test_avg_pnl:+.3%} ({n_test_trades} trades)  "
               f"test_sharpe={sharpe_str}  "
-              f"[raw: train={train_pnl:+.2%} test={test_pnl:+.2%}]")
+              f"[raw: train={train_pnl:+.2%} test={test_pnl:+.2%}]  "
+              f"[@0.50 baseline]")
 
-    return path_results
+    return path_results, fitted_paths, valid
 
 
-def gate_and_summarize(path_results: list) -> bool:
+def sweep_entry_thresholds(states: np.ndarray, labels: dict, fitted_paths: list,
+                           valid: np.ndarray) -> dict:
+    """
+    Re-score every already-fitted CPCV (path, agent) at each candidate
+    entry-probability threshold — cheap, no refitting — and pick the
+    threshold that scores best OUT OF SAMPLE across CPCV test folds
+    only. The holdout block is never touched here, so the chosen
+    threshold can't leak holdout information the way hand-tuning it
+    against the final backtest would.
+
+    Score = mean(test_avg_pnl across paths) / (std(test_avg_pnl across
+    paths) + eps) — a Sharpe-like ranking across INDEPENDENT CPCV
+    paths, so a threshold with a good mean but wildly inconsistent
+    per-path results scores worse than one that's modest but reliable.
+    Thresholds whose aggregate test trade count falls below
+    MIN_SWEEP_TRADES are disqualified (score = -inf) regardless of how
+    good their stats look — too few trades to trust.
+    """
+    print(f"\n  Sweeping entry_threshold over {ENTRY_THRESHOLD_CANDIDATES} "
+          f"across {len(fitted_paths)} fitted CPCV paths (test folds only)...")
+    candidates = {}
+    for t in ENTRY_THRESHOLD_CANDIDATES:
+        avg_pnls = []
+        trade_counts = []
+        for path, agent in fitted_paths:
+            test_mask = path.test_mask & valid
+            _, n_test_trades, test_avg_pnl, _ = simulate_pnl(
+                states, labels, test_mask, agent, prob_threshold=t)
+            avg_pnls.append(test_avg_pnl)
+            trade_counts.append(n_test_trades)
+
+        avg_pnls = np.array(avg_pnls, dtype=np.float64)
+        total_trades = int(sum(trade_counts))
+        mean_avg = float(avg_pnls.mean()) if len(avg_pnls) else float("nan")
+        std_avg  = float(avg_pnls.std()) if len(avg_pnls) else float("nan")
+        eligible = total_trades >= MIN_SWEEP_TRADES
+        score = (mean_avg / (std_avg + 1e-6)) if eligible else float("-inf")
+
+        candidates[t] = {
+            "mean_test_avg_pnl": mean_avg, "std_test_avg_pnl": std_avg,
+            "total_test_trades": total_trades, "eligible": eligible,
+            "score": score,
+        }
+        elig_str = "" if eligible else "  [DISQUALIFIED: too few trades]"
+        print(f"    threshold={t:.2f}  mean_test_avg={mean_avg:+.4%}  "
+              f"std={std_avg:.4%}  total_test_trades={total_trades}  "
+              f"score={score:+.3f}{elig_str}")
+
+    best_t = max(candidates, key=lambda k: candidates[k]["score"])
+    if candidates[best_t]["score"] == float("-inf"):
+        print(f"  ⚠ No threshold cleared MIN_SWEEP_TRADES={MIN_SWEEP_TRADES} — "
+              f"falling back to threshold=0.50.")
+        best_t = 0.50
+    print(f"  ✓ Selected entry_threshold={best_t:.2f}  "
+          f"(score={candidates[best_t]['score']:+.3f}, "
+          f"total_test_trades={candidates[best_t]['total_test_trades']})")
+
+    return {"chosen_threshold": best_t, "candidates": candidates}
+
+
+def evaluate_paths_at_threshold(states: np.ndarray, labels: dict, fitted_paths: list,
+                                valid: np.ndarray, threshold: float) -> list:
+    """Re-score every fitted CPCV path at `threshold` (no refitting),
+    producing the same path_results shape run_cpcv() does — this is
+    what actually gets gated/logged/saved to cpcv_summary.json, so the
+    reported CPCV numbers match the threshold that will be deployed."""
+    results = []
+    for path, agent in fitted_paths:
+        train_mask = path.train_mask & valid
+        test_mask  = path.test_mask & valid
+        train_pnl, n_train_trades, train_avg_pnl, train_returns = simulate_pnl(
+            states, labels, train_mask, agent, prob_threshold=threshold)
+        test_pnl, n_test_trades, test_avg_pnl, test_returns = simulate_pnl(
+            states, labels, test_mask, agent, prob_threshold=threshold)
+        test_sharpe = _sharpe_like(test_returns)
+        results.append({
+            "path_id": path.path_id, "test_groups": list(path.test_groups),
+            "train_pnl": train_pnl, "test_pnl": test_pnl,
+            "train_avg_pnl": train_avg_pnl, "test_avg_pnl": test_avg_pnl,
+            "test_sharpe": test_sharpe,
+            "n_train": int(train_mask.sum()), "n_test": int(test_mask.sum()),
+            "n_train_trades": n_train_trades, "n_test_trades": n_test_trades,
+        })
+    return results
+
+
+def gate_and_summarize(path_results: list, entry_threshold: float = 0.5,
+                       threshold_sweep: dict = None) -> bool:
     """
     NORMALIZED gate (this revision): decisions are based on
     test_avg_pnl (mean per-trade test return) and test_sharpe, not the
     raw trade-count-scaled test_pnl sum — see module docstring for why.
     Raw sums are still reported for context.
+
+    path_results here is expected to already be evaluated AT
+    entry_threshold (see evaluate_paths_at_threshold()), so the gate's
+    accept/reject decision reflects the exact operating point that will
+    be deployed, not the 0.5 baseline.
     """
     if not path_results:
         print("  ⛔ No usable CPCV paths — aborting.")
@@ -381,7 +542,7 @@ def gate_and_summarize(path_results: list) -> bool:
                  for r in path_results]
     pbo_info = compute_pbo(pbo_input)
 
-    print(f"\n{'='*62}\n  CPCV SUMMARY ({n_total} paths)\n{'='*62}")
+    print(f"\n{'='*62}\n  CPCV SUMMARY ({n_total} paths)  @ entry_threshold={entry_threshold:.2f}\n{'='*62}")
     print(f"  Mean test avg/trade : {test_avg_pnls.mean():+.4%}")
     print(f"  Std  test avg/trade : {test_avg_pnls.std():.4%}")
     print(f"  Min  test avg/trade : {test_avg_pnls.min():+.4%}")
@@ -402,6 +563,8 @@ def gate_and_summarize(path_results: list) -> bool:
     with open(os.path.join(OUT_DIR, "cpcv_summary.json"), "w") as f:
         json.dump({
             "n_paths": n_total,
+            "entry_threshold": entry_threshold,
+            "threshold_sweep": threshold_sweep,
             "mean_test_avg_pnl": float(test_avg_pnls.mean()),
             "std_test_avg_pnl": float(test_avg_pnls.std()),
             "min_test_avg_pnl": float(test_avg_pnls.min()),
@@ -438,9 +601,27 @@ def gate_and_summarize(path_results: list) -> bool:
 # Final deployable training
 # ─────────────────────────────────────────────
 
-def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame):
+def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
+                       entry_threshold: float = 0.5):
     """Train the deployable model on all rows except the most recent
-    embargo-safe holdout block, then report calibration on that holdout."""
+    embargo-safe holdout block, then report calibration on that holdout.
+
+    entry_threshold: the value chosen by main()'s CPCV-only sweep
+    (sweep_entry_thresholds()) — baked into the saved GBTAgent so live
+    inference (get_action()) uses the same operating point this
+    function evaluates on the holdout, and used here to score the
+    holdout P/L that DEPLOYMENT GATING (below) decides on.
+
+    DEPLOYMENT GATE (this revision): CPCV passing is necessary but, as
+    a live run demonstrated, not sufficient — a CPCV-gated model still
+    lost money on its own holdout (-0.33%/trade). This function now
+    additionally requires the trained model's HOLDOUT avg/trade to
+    clear HOLDOUT_AVG_TRADE_FLOOR with at least HOLDOUT_MIN_TRADES
+    before it's allowed to overwrite gbt_agent_best.joblib. If it
+    doesn't clear the bar, the model is still saved (nothing is lost)
+    but under a "_FAILED_HOLDOUT" filename, and any previously deployed
+    gbt_agent_best.joblib is left untouched.
+    """
     n = len(states)
     lookback_ticks = compute_required_lookback_ticks()
     holdout_frac = 0.15
@@ -457,12 +638,13 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
 
     print(f"\n  Final train: {train_mask.sum():,} rows  |  "
           f"Holdout: {holdout_mask.sum():,} rows  |  "
-          f"embargo: {holdout_start - embargo_start} rows")
+          f"embargo: {holdout_start - embargo_start} rows  |  "
+          f"entry_threshold: {entry_threshold:.2f}")
 
-    agent = GBTAgent(state_dim=states.shape[1], action_dim=ACTION_DIM)
+    agent = GBTAgent(state_dim=states.shape[1], action_dim=ACTION_DIM,
+                     entry_threshold=entry_threshold)
     agent.fit(states[train_mask], labels["best_action"][train_mask],
               purge_ticks=lookback_ticks, **GBT_HYPERPARAMS)
-    agent.save(os.path.join(OUT_DIR, "gbt_agent_best.joblib"))
 
     # ── Calibration report on the genuinely held-out block ──────────
     probs = agent.actor.model.predict_proba(states[holdout_mask])
@@ -491,10 +673,47 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
         json.dump(report, f, indent=2)
     print(f"  ✓  Calibration report saved → {OUT_DIR}/calibration_report.json")
 
-    test_pnl, n_trades, avg_pnl, _returns = simulate_pnl(states, labels, holdout_mask, agent)
+    test_pnl, n_trades, avg_pnl, _returns = simulate_pnl(
+        states, labels, holdout_mask, agent, prob_threshold=entry_threshold)
     print(f"\n  Held-out simulated P/L (non-overlapping single-position, "
           f"see simulate_pnl docstring): {test_pnl:+.4%} raw sum  "
-          f"({n_trades} trades, avg/trade={avg_pnl:+.4%})")
+          f"({n_trades} trades, avg/trade={avg_pnl:+.4%})  "
+          f"@ entry_threshold={entry_threshold:.2f}")
+
+    # ── DEPLOYMENT GATE ──────────────────────────────────────────────
+    # See function docstring / module docstring. This is the check that
+    # was missing when a CPCV-gated model still lost money live.
+    deploy_ok = (n_trades >= HOLDOUT_MIN_TRADES) and (avg_pnl > HOLDOUT_AVG_TRADE_FLOOR)
+
+    gate_status = {
+        "entry_threshold": entry_threshold,
+        "holdout_avg_pnl": avg_pnl, "holdout_total_pnl_raw": test_pnl,
+        "holdout_n_trades": n_trades,
+        "holdout_avg_trade_floor": HOLDOUT_AVG_TRADE_FLOOR,
+        "holdout_min_trades": HOLDOUT_MIN_TRADES,
+        "deploy_gate_passed": bool(deploy_ok),
+    }
+    with open(os.path.join(OUT_DIR, "deployment_gate.json"), "w") as f:
+        json.dump(gate_status, f, indent=2)
+
+    if deploy_ok:
+        save_path = os.path.join(OUT_DIR, "gbt_agent_best.joblib")
+        agent.save(save_path)
+        print(f"\n  ✓ HOLDOUT GATE PASSED (avg/trade={avg_pnl:+.4%} > "
+              f"floor={HOLDOUT_AVG_TRADE_FLOOR:+.2%}, n_trades={n_trades}) "
+              f"— deployed → {save_path}")
+    else:
+        save_path = os.path.join(OUT_DIR, "gbt_agent_candidate_FAILED_HOLDOUT.joblib")
+        agent.save(save_path)
+        print(f"\n  ⛔ HOLDOUT GATE FAILED — avg/trade={avg_pnl:+.4%} "
+              f"(floor={HOLDOUT_AVG_TRADE_FLOOR:+.2%}, n_trades={n_trades} "
+              f"vs min={HOLDOUT_MIN_TRADES}).")
+        print(f"     Saved as CANDIDATE ONLY → {save_path}. Any existing "
+              f"gbt_agent_best.joblib was left untouched — the pipeline will "
+              f"not silently deploy a model that lost money on its own holdout.")
+        print(f"     Consider: raising entry_threshold candidates, revisiting "
+              f"TP_MULT/SL_MULT/MAX_HOLDING label sizing, reducing state_dim "
+              f"(CONTEXT_PACES/ENABLE_MULTI_TIMEFRAME), or gathering more data.")
 
 
 # ─────────────────────────────────────────────
@@ -518,15 +737,26 @@ def main():
     print(f"  Label balance — LONG:{n_long:,}  SHORT:{n_short:,}  HOLD:{n_hold:,}")
 
     print(f"\n{'#'*62}\n  STEP 1 — COMBINATORIAL PURGED CROSS-VALIDATION\n{'#'*62}")
-    path_results = run_cpcv(states, labels, aligned_df)
-    ok = gate_and_summarize(path_results)
+    _baseline_path_results, fitted_paths, valid = run_cpcv(states, labels, aligned_df)
+
+    print(f"\n{'#'*62}\n  STEP 1b — ENTRY-CONVICTION THRESHOLD SWEEP "
+          f"(CPCV test folds only — no holdout leakage)\n{'#'*62}")
+    sweep = sweep_entry_thresholds(states, labels, fitted_paths, valid)
+    entry_threshold = sweep["chosen_threshold"]
+
+    # Re-evaluate every CPCV path at the chosen threshold so the gate
+    # decision reflects the exact operating point that will be deployed.
+    path_results = evaluate_paths_at_threshold(states, labels, fitted_paths,
+                                               valid, entry_threshold)
+    ok = gate_and_summarize(path_results, entry_threshold=entry_threshold,
+                            threshold_sweep=sweep)
 
     if not ok and not args.force_final_training:
         print("\n  Re-run with --force-final-training to override.")
         return
 
     print(f"\n{'#'*62}\n  STEP 2 — FINAL DEPLOYABLE TRAINING + CALIBRATION\n{'#'*62}")
-    run_final_training(states, labels, aligned_df)
+    run_final_training(states, labels, aligned_df, entry_threshold=entry_threshold)
 
 
 if __name__ == "__main__":
