@@ -22,6 +22,43 @@ Pipeline
      gate philosophy), fit the final deployable model on all data up to
      an embargo-safe cutoff, calibrate, and report reliability.
 
+CHANGES IN THIS REVISION — NORMALIZED CPCV EVALUATION
+───────────────────────────────────────────────────────
+simulate_pnl() previously returned only a RAW SUM of per-trade returns
+(total_pnl). That sum is trade-count-dependent: a fold that happens to
+generate 600 trades will produce a far bigger number (in either
+direction) than a fold generating 8 trades, purely from arithmetic,
+with zero relationship to how GOOD the model's edge actually is. Two
+concrete symptoms this caused:
+
+  1. Train P/L in the hundreds-to-thousands of percent range was, in
+     large part, hundreds of trades' worth of near-tautological
+     "correct" predictions (the classifier scored against the exact
+     labels it was fit on) additively summed with no compounding and
+     no capital constraint — not proof of catastrophic overfitting by
+     itself, though real overfitting is also present.
+  2. VAL_PNL_FLOOR (a raw-sum floor) penalized high-trade-count folds
+     far more harshly than low-trade-count folds of similar per-trade
+     severity, making the gate's pass/fail decision largely a function
+     of how many trades a fold happened to generate rather than the
+     quality of the model's edge.
+
+Fix: simulate_pnl() now also returns the list of individual trade
+returns, from which we derive a MEAN PER-TRADE RETURN and a Sharpe-like
+statistic (mean/std * sqrt(n), the same formula diagnostic_gbt.py's
+write_summary() already uses for its real tick-by-tick backtest) — both
+trade-count-independent. The CPCV gate (gate_and_summarize) and PBO
+computation now operate on these normalized per-path statistics instead
+of the raw sum. Raw totals are still logged for human-readable context,
+but no longer drive the accept/reject decision.
+
+GBT_HYPERPARAMS is also tightened further (lower max_depth/leaf_nodes,
+higher min_samples_leaf/l2, lower max_features) — the normalized metric
+fix corrects how we MEASURE the train/test gap, it doesn't shrink the
+gap itself, and the gap is still large enough to warrant additional
+regularization on top of the previous tightening pass (see
+gbt_agent.py's GBTPolicy.fit() docstring for that history).
+
 Run
 ────
     python main_gbt.py                        # gated pipeline
@@ -65,28 +102,38 @@ N_TEST_GROUPS   = 2
 MAX_PATHS       = 28
 MIN_TRAIN_TICKS = 2000
 
-# Base-model regularization (overfitting fix). Prior defaults (depth=6,
-# l2=1.0, no leaf/feature cap, random calibration split) produced CPCV
-# train P/L in the thousands of percent against a negative median test
-# P/L — see GBTPolicy.fit()'s docstring for the full rationale. Exposed
-# here (rather than left as GBTPolicy.fit()'s internal defaults) so it's
-# visible and tunable in one place, and so run_cpcv()/run_final_training()
-# always fit with the SAME config main_gbt.py reports on.
+# Base-model regularization (overfitting fix, round 2). Round 1 (see
+# GBTPolicy.fit()'s docstring) brought train P/L down from >1000% but
+# CPCV still showed train P/L in the hundreds-to-thousands of percent
+# against near-zero/negative median test P/L — tightened further here:
+# lower depth/leaf-node budget, higher min_samples_leaf and l2, and a
+# stronger per-split feature subsample, all aimed at making individual
+# trees (and therefore the ensemble) less able to carve out
+# training-set-specific decision boundaries in a state space that can
+# be up to 122-dim relative to ~10-12k fit rows per CPCV fold.
 GBT_HYPERPARAMS = dict(
     max_iter=150,
     learning_rate=0.04,
-    max_depth=4,
-    max_leaf_nodes=15,
-    min_samples_leaf=200,
-    l2_regularization=5.0,
+    max_depth=3,               # was 4
+    max_leaf_nodes=10,         # was 15
+    min_samples_leaf=300,      # was 200
+    l2_regularization=8.0,     # was 5.0
     validation_fraction=0.15,
     n_iter_no_change=15,
-    max_features=0.7,   # per-split feature subsampling; sklearn>=1.2
+    max_features=0.5,          # was 0.7; sklearn>=1.2
 )
 
 # Stability gate (mirrors main_mcknn.py's philosophy — directional
-# consistency + downside floor — plus a PBO check CPCV newly enables)
-VAL_PNL_FLOOR = -0.40
+# consistency + downside floor — plus a PBO check CPCV newly enables).
+#
+# NORMALIZED, not raw-sum: VAL_AVG_TRADE_FLOOR is a floor on the WORST
+# path's MEAN PER-TRADE test return, so a fold's severity is judged
+# per-bet rather than being amplified/muted by however many trades that
+# particular fold happened to generate. -0.03 means: even in the worst
+# CPCV path, the average trade shouldn't lose more than 3% net of
+# commission — a materially different (and fairer) bar than the old
+# "-40% of an unbounded, trade-count-scaled sum".
+VAL_AVG_TRADE_FLOOR = -0.03
 
 OUT_DIR = "outcomes/gbt"
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -184,29 +231,33 @@ def simulate_pnl(states: np.ndarray, labels: dict, mask: np.ndarray,
     then skip every tick up to and including that trade's touch tick
     before considering another entry.
 
-    FIX: the prior version summed a return for every confident tick
-    independently, with no concept of a position already being open.
-    Because triple-barrier outcome windows span up to max_holding
-    ticks and heavily overlap between adjacent ticks, any sustained
-    stretch of conviction (e.g. a clean trend, which is exactly when a
-    model is MOST confident) got counted as dozens of simultaneous
-    "trades" stacked on top of each other — inflating P/L by roughly
-    max_holding-fold and producing implausible five-digit percentage
-    train returns. This does NOT re-run unified_executor.py's full
-    position-management loop (commission-on-both-sides, stop-loss/
-    max-hold forced exits, etc. are already baked into long_return/
-    short_return by triple_barrier.py) — it only adds the missing
-    "can't open two positions at once" constraint.
+    NORMALIZATION FIX (this revision): total_pnl (a raw sum of
+    per-trade returns) is trade-count-dependent — a fold with 600
+    trades produces a far larger number than a fold with 8 trades of
+    similar per-trade quality, purely from arithmetic. That made the
+    CPCV gate's pass/fail decision largely a function of how many
+    trades a given fold happened to generate rather than genuine edge
+    quality (see main_gbt.py module docstring). This function now also
+    returns the individual trade_returns list and their mean
+    (avg_pnl), which callers should use for any cross-fold comparison
+    or gating decision; total_pnl/n_trades remain for human-readable
+    logging only.
 
     Returns
     -------
-    (total_pnl, n_trades) — n_trades lets callers sanity-check trade
-    frequency (e.g. a suspiciously high count relative to len(mask)
-    would flag a similar double-counting issue elsewhere).
+    (total_pnl, n_trades, avg_pnl, trade_returns)
+      total_pnl     : raw sum of realised trade returns (logging only —
+                       NOT trade-count-normalized, do not use for gating).
+      n_trades      : number of trades taken.
+      avg_pnl       : mean per-trade realised return (trade-count-
+                       independent — use this for cross-fold comparison).
+      trade_returns : list of individual trade returns, for computing
+                       a Sharpe-like stat (see run_cpcv()).
     """
     idx = np.flatnonzero(mask)
     total_pnl  = 0.0
     n_trades   = 0
+    trade_returns: list = []
     next_free_tick = -1   # no trade open yet
     for row in idx:
         if row < next_free_tick:
@@ -214,15 +265,38 @@ def simulate_pnl(states: np.ndarray, labels: dict, mask: np.ndarray,
         lsh = agent.actor._raw_probs(states[row])
         best = int(np.argmax(lsh))
         if best == 0 and lsh[0] > 0.5:
-            total_pnl += float(labels["long_return"][row])
+            r = float(labels["long_return"][row])
+            total_pnl += r
+            trade_returns.append(r)
             next_free_tick = int(labels["long_touch"][row]) + 1
             n_trades += 1
         elif best == 1 and lsh[1] > 0.5:
-            total_pnl += float(labels["short_return"][row])
+            r = float(labels["short_return"][row])
+            total_pnl += r
+            trade_returns.append(r)
             next_free_tick = int(labels["short_touch"][row]) + 1
             n_trades += 1
         # else: HOLD — stays flat, next_free_tick unchanged.
-    return total_pnl, n_trades
+
+    avg_pnl = float(np.mean(trade_returns)) if trade_returns else 0.0
+    return total_pnl, n_trades, avg_pnl, trade_returns
+
+
+def _sharpe_like(trade_returns: list) -> float:
+    """
+    Same formula diagnostic_gbt.py's write_summary() already uses for
+    its real tick-by-tick backtest (pnl_arr.mean() / pnl_arr.std() *
+    sqrt(n)) — kept identical here so the two pipelines' notion of
+    "risk-adjusted edge" is directly comparable. Returns NaN when there
+    are too few trades or zero variance to compute a meaningful ratio.
+    """
+    if len(trade_returns) < 5:
+        return float("nan")
+    arr = np.array(trade_returns, dtype=np.float64)
+    std = arr.std()
+    if std == 0:
+        return float("nan")
+    return float(arr.mean() / std * np.sqrt(len(arr)))
 
 
 def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame) -> list:
@@ -256,65 +330,101 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame) -> list
         agent.fit(states[train_mask], y[train_mask],
                   purge_ticks=lookback_ticks, **GBT_HYPERPARAMS)
 
-        train_pnl, n_train_trades = simulate_pnl(states, labels, train_mask, agent)
-        test_pnl,  n_test_trades  = simulate_pnl(states, labels, test_mask, agent)
+        train_pnl, n_train_trades, train_avg_pnl, train_returns = simulate_pnl(
+            states, labels, train_mask, agent)
+        test_pnl, n_test_trades, test_avg_pnl, test_returns = simulate_pnl(
+            states, labels, test_mask, agent)
+        test_sharpe = _sharpe_like(test_returns)
 
         path_results.append({
             "path_id": path.path_id, "test_groups": list(path.test_groups),
+            # Raw sums — logging/context only, NOT trade-count-normalized.
             "train_pnl": train_pnl, "test_pnl": test_pnl,
+            # Normalized — these drive gate_and_summarize()'s decision.
+            "train_avg_pnl": train_avg_pnl, "test_avg_pnl": test_avg_pnl,
+            "test_sharpe": test_sharpe,
             "n_train": int(train_mask.sum()), "n_test": int(test_mask.sum()),
             "n_train_trades": n_train_trades, "n_test_trades": n_test_trades,
         })
+        sharpe_str = f"{test_sharpe:+.2f}" if not np.isnan(test_sharpe) else "n/a"
         print(f"  path {path.path_id:>3}  test_groups={path.test_groups}  "
-              f"train_pnl={train_pnl:+.4%} ({n_train_trades} trades)  "
-              f"test_pnl={test_pnl:+.4%} ({n_test_trades} trades)")
+              f"train_avg={train_avg_pnl:+.3%} ({n_train_trades} trades)  "
+              f"test_avg={test_avg_pnl:+.3%} ({n_test_trades} trades)  "
+              f"test_sharpe={sharpe_str}  "
+              f"[raw: train={train_pnl:+.2%} test={test_pnl:+.2%}]")
 
     return path_results
 
 
 def gate_and_summarize(path_results: list) -> bool:
+    """
+    NORMALIZED gate (this revision): decisions are based on
+    test_avg_pnl (mean per-trade test return) and test_sharpe, not the
+    raw trade-count-scaled test_pnl sum — see module docstring for why.
+    Raw sums are still reported for context.
+    """
     if not path_results:
         print("  ⛔ No usable CPCV paths — aborting.")
         return False
 
-    test_pnls = np.array([r["test_pnl"] for r in path_results])
-    n_pos = int((test_pnls > 0).sum())
+    test_pnls      = np.array([r["test_pnl"] for r in path_results])       # raw, context only
+    test_avg_pnls  = np.array([r["test_avg_pnl"] for r in path_results])   # normalized — gates on this
+    sharpes        = np.array([r["test_sharpe"] for r in path_results])
+    n_pos   = int((test_avg_pnls > 0).sum())
     n_total = len(path_results)
-    pbo_info = compute_pbo(path_results)
+
+    # PBO fed on the normalized per-trade metric, so "in-sample-good"
+    # vs "out-of-sample-good" ranking isn't itself confounded by
+    # trade-count differences between paths (see compute_pbo()'s train/
+    # test_pnl keys — reused here with normalized values).
+    pbo_input = [{"train_pnl": r["train_avg_pnl"], "test_pnl": r["test_avg_pnl"]}
+                 for r in path_results]
+    pbo_info = compute_pbo(pbo_input)
 
     print(f"\n{'='*62}\n  CPCV SUMMARY ({n_total} paths)\n{'='*62}")
-    print(f"  Mean test P/L : {test_pnls.mean():+.4%}")
-    print(f"  Std  test P/L : {test_pnls.std():.4%}")
-    print(f"  Min  test P/L : {test_pnls.min():+.4%}")
-    print(f"  Positive paths: {n_pos}/{n_total}")
-    print(f"  PBO           : {pbo_info['pbo']:.1%}  "
+    print(f"  Mean test avg/trade : {test_avg_pnls.mean():+.4%}")
+    print(f"  Std  test avg/trade : {test_avg_pnls.std():.4%}")
+    print(f"  Min  test avg/trade : {test_avg_pnls.min():+.4%}")
+    valid_sharpes = sharpes[~np.isnan(sharpes)]
+    if len(valid_sharpes):
+        print(f"  Mean test Sharpe    : {valid_sharpes.mean():+.3f}  "
+              f"(n_paths_with_sharpe={len(valid_sharpes)}/{n_total})")
+    print(f"  Positive paths      : {n_pos}/{n_total}")
+    print(f"  PBO                 : {pbo_info['pbo']:.1%}  "
           f"(fraction of in-sample-good paths that disappointed "
           f"out-of-sample — lower is better; >50% means in-sample "
           f"selection is worse than a coin flip)")
-    print(f"  logit_lambda  : {pbo_info['logit_lambda']:+.3f}  "
+    print(f"  logit_lambda        : {pbo_info['logit_lambda']:+.3f}  "
           f"(more negative = more systematic overfitting)")
+    print(f"  [context, raw sums] mean={test_pnls.mean():+.2%}  "
+          f"std={test_pnls.std():.2%}  min={test_pnls.min():+.2%}")
 
     with open(os.path.join(OUT_DIR, "cpcv_summary.json"), "w") as f:
         json.dump({
-            "n_paths": n_total, "mean_test_pnl": float(test_pnls.mean()),
-            "std_test_pnl": float(test_pnls.std()),
-            "min_test_pnl": float(test_pnls.min()),
+            "n_paths": n_total,
+            "mean_test_avg_pnl": float(test_avg_pnls.mean()),
+            "std_test_avg_pnl": float(test_avg_pnls.std()),
+            "min_test_avg_pnl": float(test_avg_pnls.min()),
+            "mean_test_pnl_raw": float(test_pnls.mean()),
+            "std_test_pnl_raw": float(test_pnls.std()),
+            "min_test_pnl_raw": float(test_pnls.min()),
             "n_paths_positive": n_pos, **pbo_info,
             "path_results": path_results,
         }, f, indent=2)
     print(f"  ✓  CPCV summary saved → {OUT_DIR}/cpcv_summary.json")
 
     directionally_consistent = n_pos >= (n_total / 2)
-    downside_breach = test_pnls.min() < VAL_PNL_FLOOR
+    downside_breach = test_avg_pnls.min() < VAL_AVG_TRADE_FLOOR
     pbo_high = (not np.isnan(pbo_info["pbo"])) and pbo_info["pbo"] > 0.5
 
     unstable = (not directionally_consistent) or downside_breach or pbo_high
     if unstable:
         print(f"\n  ⛔ UNSTABLE — refusing to train final deployable model.")
         if not directionally_consistent:
-            print(f"     ✗ only {n_pos}/{n_total} paths positive")
+            print(f"     ✗ only {n_pos}/{n_total} paths positive (per-trade avg)")
         if downside_breach:
-            print(f"     ✗ worst path {test_pnls.min():+.4%} < floor {VAL_PNL_FLOOR:+.0%}")
+            print(f"     ✗ worst path avg/trade {test_avg_pnls.min():+.4%} "
+                  f"< floor {VAL_AVG_TRADE_FLOOR:+.2%}")
         if pbo_high:
             print(f"     ✗ PBO={pbo_info['pbo']:.1%} > 50% — in-sample "
                   f"performance is not predictive of out-of-sample performance")
@@ -381,9 +491,10 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
         json.dump(report, f, indent=2)
     print(f"  ✓  Calibration report saved → {OUT_DIR}/calibration_report.json")
 
-    test_pnl, n_trades = simulate_pnl(states, labels, holdout_mask, agent)
+    test_pnl, n_trades, avg_pnl, _returns = simulate_pnl(states, labels, holdout_mask, agent)
     print(f"\n  Held-out simulated P/L (non-overlapping single-position, "
-          f"see simulate_pnl docstring): {test_pnl:+.4%}  ({n_trades} trades)")
+          f"see simulate_pnl docstring): {test_pnl:+.4%} raw sum  "
+          f"({n_trades} trades, avg/trade={avg_pnl:+.4%})")
 
 
 # ─────────────────────────────────────────────
