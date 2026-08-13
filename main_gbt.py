@@ -97,13 +97,55 @@ identical CPCV/stability machinery — useful for checking whether the
 15m/1h context is actually earning its keep versus just adding
 dimensions relative to the ~10-12k fit rows per CPCV fold.
 
+CHANGES IN THIS REVISION — NESTED THRESHOLD SELECTION / GATE CONFIRMATION
+───────────────────────────────────────────────────────────────────────────
+The previous revision's run_stability_check() picked entry_threshold via
+sweep_entry_thresholds() on a seed's own CPCV test folds, then scored
+that SAME seed's gate at the chosen threshold — circular: the gate was
+confirming a threshold selected to fit the data being used to judge it.
+Symptomatically, the sweep's "winning" threshold (0.60) had the fewest
+total test trades (522) and a std_test_avg_pnl more than 3x its mean —
+the noisiest candidate of the five, selected anyway because "best
+mean/std" over a shrinking sample is exactly what multiple-comparison
+selection inflates.
+
+Fixed by splitting seeds into two DISJOINT pools:
+  - select_threshold_nested() fits CPCV on --selection-seeds only, pools
+    every fitted path across those seeds, and sweeps entry_threshold
+    ONCE on the pooled set.
+  - confirm_gate_nested() then evaluates that fixed, already-chosen
+    threshold against CPCV paths from --confirmation-seeds — seeds the
+    threshold has never seen in any form — both per-seed (multi-seed
+    stability, same idea as the old run_stability_check) and pooled
+    across all confirmation seeds (the number reported as "the" CPCV
+    summary). The deployed model's random_state is picked as the
+    median-performing CONFIRMATION seed only.
+run_stability_check()/--seeds are kept for backward compatibility but
+are no longer called by main() — see select_threshold_nested()/
+confirm_gate_nested() below.
+
+CHANGES IN THIS REVISION — BOOTSTRAP CI ON THE HOLDOUT RESULT
+───────────────────────────────────────────────────────────────
+run_final_training()'s holdout avg/trade point estimate (e.g.
+"-1.13% over 10 trades") was being read as a clean pass/fail fact, but
+at n=10 the standard error is comparable in magnitude to the estimate
+itself — CPCV path-level test_avg_pnl at similar sample sizes swings
+from -0.81% to +1.13%. bootstrap_ci() now resamples the holdout's own
+trade_returns to report a 90% CI alongside the point estimate, and both
+the PASS and FAIL branches print a note when that interval straddles
+(or on the FAIL side, still partly overlaps) zero, so a gate verdict on
+a small holdout isn't mistaken for a statistically confirmed result.
+The pass/fail RULE itself is unchanged (point estimate vs floor) — the
+CI is reported for interpretation, not substituted into the gate logic.
+
 Run
 ────
-    python main_gbt.py                                   # gated pipeline, live data
-    python main_gbt.py --frozen-data                      # reproducible comparisons
-    python main_gbt.py --frozen-data --seeds 0 1 2 3 4    # more thorough stability check
-    python main_gbt.py --frozen-data --no-multi-timeframe # 4h-only baseline
-    python main_gbt.py --force-final-training              # override an unstable gate
+    python main_gbt.py                                              # gated pipeline, live data
+    python main_gbt.py --frozen-data                                 # reproducible comparisons
+    python main_gbt.py --frozen-data --selection-seeds 0 1 \\
+                        --confirmation-seeds 2 3 4                   # explicit nested seed pools
+    python main_gbt.py --frozen-data --no-multi-timeframe            # 4h-only baseline
+    python main_gbt.py --force-final-training                        # override an unstable gate
 """
 
 import os
@@ -183,6 +225,34 @@ MIN_PATH_TEST_TRADES = 15
 DEFAULT_STABILITY_SEEDS = (0, 1, 2)
 DEFAULT_MIN_PASS_FRAC   = 0.6   # >= 60% of seeds must independently pass
 
+# ── Nested threshold selection / gate confirmation (this revision) ──────────
+# PROBLEM THIS FIXES: the previous flow picked entry_threshold by sweeping
+# over CPCV test-fold performance (sweep_entry_thresholds), then evaluated
+# the CPCV "gate" on those SAME test folds at the chosen threshold. That's
+# circular — the gate was confirming a threshold that was chosen to look
+# good on exactly the data being used to judge it. Concretely, the
+# threshold=0.60 candidate in the observed run had total_test_trades=522
+# (smallest of the 5 candidates) and std_test_avg_pnl (2.09%) more than 3x
+# its mean (0.60%) — it was the noisiest candidate, and the sweep picked it
+# anyway because "best mean/std" on a shrinking, noisy sample is exactly
+# the kind of statistic multiple-comparison selection inflates.
+#
+# FIX: split seeds into two DISJOINT pools.
+#   - SELECTION_SEEDS build CPCV paths used ONLY to choose entry_threshold
+#     (sweep_entry_thresholds, pooled across all selection seeds' paths).
+#   - CONFIRMATION_SEEDS build a completely separate set of CPCV paths,
+#     never used for threshold selection, and the gate (directional
+#     consistency + downside floor + PBO) is evaluated ONLY on those, AT
+#     the already-chosen threshold (no further tuning). This makes the
+#     gate a genuine out-of-sample check on the threshold decision itself,
+#     not just on that threshold's fit to a given path's train/test split.
+# The final deployed model's random_state is picked as the median-by-
+# performance CONFIRMATION seed (never a selection seed), so the reported
+# CPCV numbers, the gate verdict, and the deployed model are all drawn
+# from the confirmation pool alone.
+DEFAULT_SELECTION_SEEDS    = (0, 1)
+DEFAULT_CONFIRMATION_SEEDS = (2, 3, 4)
+
 # ── Final holdout deployment gate ────────────────────────────────────────────
 # Distinct from VAL_AVG_TRADE_FLOOR (a CPCV-path floor): this gates the
 # actual deployable model's performance on ITS OWN held-out block, at
@@ -201,6 +271,26 @@ VAL_AVG_TRADE_FLOOR = -0.03
 
 OUT_DIR = "outcomes/gbt"
 os.makedirs(OUT_DIR, exist_ok=True)
+
+
+def _json_default(obj):
+    """
+    Fallback encoder for json.dump(default=_json_default) calls in this
+    module. numpy scalar types (np.bool_, np.int64, np.float32/64, ...)
+    are not JSON-serializable even though some print/repr as if they
+    were native Python types (np.bool_'s class name is literally "bool",
+    which is what made the earlier TypeError's message read
+    "Object of type bool is not JSON serializable" and look confusing).
+    Converting the ROOT CAUSE (evaluate_gate()'s numpy comparisons) to
+    native bool/float at the source is the real fix; this is a defense-
+    in-depth net so any other numpy scalar that slips into a dict here
+    doesn't crash the run instead of just writing a slightly-off value.
+    """
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
 # ─────────────────────────────────────────────
@@ -370,6 +460,53 @@ def _sharpe_like(trade_returns: list) -> float:
     if std == 0:
         return float("nan")
     return float(arr.mean() / std * np.sqrt(len(arr)))
+
+
+def bootstrap_ci(trade_returns: list, n_boot: int = 10_000, ci: float = 0.90,
+                 random_state: int = 0) -> dict:
+    """
+    Percentile bootstrap CI on the mean per-trade return.
+
+    WHY THIS EXISTS: a point estimate like "avg/trade=-1.13% (n=10)" reads
+    as a definitive result but isn't one — with few trades and typical
+    per-trade volatility in this pipeline (CPCV path-level test_avg_pnl
+    swings from -0.81% to +1.13% at similar sample sizes), the standard
+    error can be comparable to or larger than the point estimate itself.
+    Resampling trade_returns with replacement and taking the mean each
+    time gives an empirical distribution of "what avg/trade would plausibly
+    look like from this same underlying process", so the gate's pass/fail
+    decision can be read alongside how much that decision could have swung
+    on a slightly different sample.
+
+    Returns
+    -------
+    dict with:
+      mean       : point estimate (mean of trade_returns, matches simulate_pnl's avg_pnl)
+      ci_lo/ci_hi: (1-ci)/2 and 1-(1-ci)/2 percentiles of the bootstrap
+                   distribution of the mean (e.g. ci=0.90 -> 5th/95th pct)
+      ci_level   : the requested CI level (for display)
+      n_trades   : sample size actually used
+      note       : set when n_trades is too small for a meaningful interval
+    """
+    n = len(trade_returns)
+    if n < 2:
+        return {"mean": float(np.mean(trade_returns)) if n else float("nan"),
+                "ci_lo": float("nan"), "ci_hi": float("nan"), "ci_level": ci,
+                "n_trades": n, "note": "too few trades for a bootstrap interval"}
+
+    arr = np.asarray(trade_returns, dtype=np.float64)
+    rng = np.random.default_rng(random_state)
+    boot_means = rng.choice(arr, size=(n_boot, n), replace=True).mean(axis=1)
+    lo_pct = (1 - ci) / 2 * 100
+    hi_pct = (1 - (1 - ci) / 2) * 100
+    ci_lo, ci_hi = np.percentile(boot_means, [lo_pct, hi_pct])
+
+    result = {"mean": float(arr.mean()), "ci_lo": float(ci_lo), "ci_hi": float(ci_hi),
+              "ci_level": ci, "n_trades": n}
+    if n < 30:
+        result["note"] = (f"n_trades={n} is small — bootstrap CI is itself "
+                          f"unstable; treat as directional, not precise")
+    return result
 
 
 def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
@@ -582,9 +719,9 @@ def evaluate_gate(path_results: list) -> tuple:
                  for r in reliable]
     pbo_info = compute_pbo(pbo_input)
 
-    directionally_consistent = n_pos >= (n_total / 2)
-    downside_breach = test_avg_pnls.min() < VAL_AVG_TRADE_FLOOR
-    pbo_high = (not np.isnan(pbo_info["pbo"])) and pbo_info["pbo"] > 0.5
+    directionally_consistent = bool(n_pos >= (n_total / 2))
+    downside_breach = bool(test_avg_pnls.min() < VAL_AVG_TRADE_FLOOR)
+    pbo_high = bool((not np.isnan(pbo_info["pbo"])) and pbo_info["pbo"] > 0.5)
     passed = directionally_consistent and (not downside_breach) and (not pbo_high)
 
     stats = {
@@ -678,7 +815,7 @@ def gate_and_summarize(path_results: list, entry_threshold: float = 0.5,
                 "n_paths_positive": n_pos,
                 "pbo": stats["pbo"], "logit_lambda": stats["logit_lambda"],
                 "path_results": reliable,
-            }, f, indent=2)
+            }, f, indent=2, default=_json_default)
         print(f"  ✓  CPCV summary saved → {OUT_DIR}/cpcv_summary.json")
 
     if not passed:
@@ -698,13 +835,24 @@ def gate_and_summarize(path_results: list, entry_threshold: float = 0.5,
 
 
 # ─────────────────────────────────────────────
-# Multi-seed stability check (this revision)
+# Multi-seed stability check (LEGACY — superseded by the nested
+# selection/confirmation split below; kept only for backward
+# compatibility with anything that still imports it directly)
 # ─────────────────────────────────────────────
 
 def run_stability_check(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
                         seeds: tuple = DEFAULT_STABILITY_SEEDS,
                         min_pass_frac: float = DEFAULT_MIN_PASS_FRAC) -> tuple:
     """
+    DEPRECATED as of the nested-selection revision — main() no longer
+    calls this. It picks entry_threshold via sweep_entry_thresholds()
+    on the SAME CPCV paths that evaluate_gate() then scores per seed,
+    so a seed's "pass" partly reflects that its own threshold was
+    chosen to fit its own test folds — see select_threshold_nested() /
+    confirm_gate_nested() below for the fix (disjoint seed pools for
+    threshold selection vs. gate confirmation). Left in place only for
+    backward compatibility with any external caller.
+
     Run the full CPCV -> threshold-sweep -> gate pipeline once per seed
     in `seeds`, entirely independently, and require that at least
     `min_pass_frac` of them pass the CPCV gate before the overall
@@ -773,7 +921,7 @@ def run_stability_check(states: np.ndarray, labels: dict, aligned_df: pd.DataFra
             "seeds": list(seeds), "min_pass_frac": min_pass_frac,
             "n_pass": n_pass, "frac_pass": frac_pass, "stable": stable,
             "results": seed_results,
-        }, f, indent=2)
+        }, f, indent=2, default=_json_default)
     print(f"  ✓  Stability check saved → {OUT_DIR}/stability_check.json")
 
     return stable, seed_results
@@ -789,6 +937,174 @@ def _pick_representative_seed(seed_results: list) -> int:
     """
     passed = [r for r in seed_results if r["passed"]]
     pool = passed if passed else seed_results
+    pool_sorted = sorted(pool, key=lambda r: r["mean_test_avg_pnl"])
+    median = pool_sorted[len(pool_sorted) // 2]
+    return median["seed"]
+
+
+# ─────────────────────────────────────────────
+# Nested threshold selection + gate confirmation (this revision)
+# ─────────────────────────────────────────────
+#
+# See DEFAULT_SELECTION_SEEDS / DEFAULT_CONFIRMATION_SEEDS docstring
+# above for the full rationale. In one line: threshold selection and
+# gate confirmation must draw on disjoint data, or the gate is just
+# confirming a threshold that was chosen to fit it.
+
+def select_threshold_nested(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
+                            selection_seeds: tuple = DEFAULT_SELECTION_SEEDS) -> dict:
+    """
+    Fit CPCV paths for every seed in `selection_seeds`, POOL all of
+    their fitted (path, agent) pairs together, and run
+    sweep_entry_thresholds() ONCE on the pooled set.
+
+    Pooling (rather than sweeping per-seed and averaging the chosen
+    thresholds) means the sweep's own eligibility filter
+    (MIN_SWEEP_TRADES) and mean/std statistics are computed over the
+    combined trade count across all selection seeds — a threshold that
+    only looks good in one seed's idiosyncratic path split gets diluted
+    by the others, rather than each seed independently overweighting
+    whatever the noisiest-but-highest-scoring candidate happened to be
+    for it.
+
+    Returns
+    -------
+    dict: {"chosen_threshold", "candidates", "selection_seeds",
+           "n_selection_paths"} — everything needed to log/save the
+    selection step separately from the confirmation step below.
+    """
+    print(f"\n{'#'*62}\n  THRESHOLD SELECTION  (selection_seeds={list(selection_seeds)})"
+          f"\n{'#'*62}")
+    pooled_fitted_paths = []
+    pooled_valid = None
+    for seed in selection_seeds:
+        print(f"\n{'-'*62}\n  [selection] seed {seed}\n{'-'*62}")
+        _, fitted_paths, valid = run_cpcv(states, labels, aligned_df, random_state=seed)
+        pooled_fitted_paths.extend(fitted_paths)
+        pooled_valid = valid   # valid_mask is seed-independent (comes from labels)
+
+    print(f"\n  Pooled {len(pooled_fitted_paths)} fitted CPCV paths across "
+          f"{len(selection_seeds)} selection seed(s) for threshold sweep.")
+    sweep = sweep_entry_thresholds(states, labels, pooled_fitted_paths, pooled_valid)
+
+    return {
+        "chosen_threshold": sweep["chosen_threshold"],
+        "candidates": sweep["candidates"],
+        "selection_seeds": list(selection_seeds),
+        "n_selection_paths": len(pooled_fitted_paths),
+    }
+
+
+def confirm_gate_nested(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
+                        entry_threshold: float,
+                        confirmation_seeds: tuple = DEFAULT_CONFIRMATION_SEEDS,
+                        min_pass_frac: float = DEFAULT_MIN_PASS_FRAC) -> dict:
+    """
+    Evaluate the ALREADY-CHOSEN `entry_threshold` (no further tuning)
+    against CPCV paths built from `confirmation_seeds` — seeds that
+    were never used in select_threshold_nested(). This is the genuine
+    out-of-sample check on the threshold decision: every one of these
+    paths' test folds is data the threshold has not seen in any form.
+
+    Runs the gate (directional consistency + downside floor + PBO)
+    independently per confirmation seed AND on the pooled confirmation
+    set, and requires >= min_pass_frac of the per-seed gates to pass —
+    same multi-seed stability logic as the old run_stability_check(),
+    just applied after threshold selection instead of interleaved
+    with it.
+
+    Returns
+    -------
+    dict with:
+      passed             : bool, overall confirmation verdict
+      frac_pass          : fraction of confirmation seeds that passed individually
+      per_seed           : list of per-seed {seed, passed, stats}
+      pooled_stats        : evaluate_gate() stats on ALL confirmation
+                             paths pooled together (the number reported
+                             as "the" CPCV summary for this threshold)
+      pooled_path_results : the pooled, threshold-evaluated path_results
+                             (for gate_and_summarize()/json export)
+    """
+    print(f"\n{'#'*62}\n  GATE CONFIRMATION  (confirmation_seeds={list(confirmation_seeds)}, "
+          f"entry_threshold={entry_threshold:.2f})\n{'#'*62}")
+
+    per_seed = []
+    pooled_path_results = []
+    for seed in confirmation_seeds:
+        print(f"\n{'-'*62}\n  [confirmation] seed {seed}\n{'-'*62}")
+        _, fitted_paths, valid = run_cpcv(states, labels, aligned_df, random_state=seed)
+        evaluated = evaluate_paths_at_threshold(states, labels, fitted_paths,
+                                                valid, entry_threshold)
+        passed, stats = evaluate_gate(evaluated)
+        pooled_path_results.extend(evaluated)
+
+        per_seed.append({
+            "seed": seed, "passed": bool(passed),
+            "n_total": stats["n_total"], "n_pos": stats.get("n_pos", 0),
+            "mean_test_avg_pnl": stats["mean_test_avg_pnl"],
+            "min_test_avg_pnl": stats["min_test_avg_pnl"],
+            "pbo": stats["pbo"],
+        })
+        status = "PASS" if passed else "FAIL"
+        pbo_str = f"{stats['pbo']:.1%}" if not np.isnan(stats["pbo"]) else "n/a"
+        print(f"  [confirmation] seed {seed}: {status}  "
+              f"mean_test_avg={stats['mean_test_avg_pnl']:+.4%}  "
+              f"positive={stats.get('n_pos', 0)}/{stats['n_total']}  PBO={pbo_str}")
+
+    n_pass = sum(r["passed"] for r in per_seed)
+    frac_pass = n_pass / len(confirmation_seeds)
+    per_seed_stable = frac_pass >= min_pass_frac
+
+    # Pooled verdict: the same threshold's paths across ALL confirmation
+    # seeds, evaluated together — this is the number that gets reported
+    # as "the" CPCV summary (more paths -> more stable statistics than
+    # any single confirmation seed alone).
+    pooled_passed, pooled_stats = evaluate_gate(pooled_path_results)
+
+    overall_passed = per_seed_stable and pooled_passed
+
+    print(f"\n{'='*62}\n  GATE CONFIRMATION VERDICT\n{'='*62}")
+    print(f"  Per-seed: {n_pass}/{len(confirmation_seeds)} confirmation seeds passed "
+          f"({frac_pass:.0%}, required >= {min_pass_frac:.0%})")
+    print(f"  Pooled ({pooled_stats['n_total']} reliable paths across all confirmation "
+          f"seeds): {'PASS' if pooled_passed else 'FAIL'}  "
+          f"mean_test_avg={pooled_stats['mean_test_avg_pnl']:+.4%}  "
+          f"positive={pooled_stats.get('n_pos', 0)}/{pooled_stats['n_total']}  "
+          f"PBO={pooled_stats['pbo']:.1%}" if not np.isnan(pooled_stats['pbo'])
+          else f"  Pooled: {'PASS' if pooled_passed else 'FAIL'}  PBO=n/a")
+    print(f"  → {'CONFIRMED' if overall_passed else 'NOT CONFIRMED'} "
+          f"(requires both per-seed stability AND a passing pooled gate)")
+
+    with open(os.path.join(OUT_DIR, "nested_gate_confirmation.json"), "w") as f:
+        json.dump({
+            "entry_threshold": entry_threshold,
+            "confirmation_seeds": list(confirmation_seeds),
+            "min_pass_frac": min_pass_frac,
+            "n_pass": n_pass, "frac_pass": frac_pass,
+            "per_seed_stable": per_seed_stable,
+            "pooled_passed": bool(pooled_passed),
+            "overall_passed": bool(overall_passed),
+            "per_seed": per_seed,
+            "pooled_stats": {k: v for k, v in pooled_stats.items()
+                             if k not in ("reliable_paths", "excluded_paths")},
+        }, f, indent=2, default=_json_default)
+    print(f"  ✓  Gate confirmation saved → {OUT_DIR}/nested_gate_confirmation.json")
+
+    return {
+        "passed": overall_passed, "frac_pass": frac_pass,
+        "per_seed": per_seed, "pooled_stats": pooled_stats,
+        "pooled_path_results": pooled_path_results,
+    }
+
+
+def _pick_representative_confirmation_seed(per_seed: list) -> int:
+    """
+    Same MEDIAN-by-performance logic as _pick_representative_seed(),
+    restricted to confirmation seeds only, so the deployed model's
+    random_state is never a seed that was used for threshold selection.
+    """
+    passed = [r for r in per_seed if r["passed"]]
+    pool = passed if passed else per_seed
     pool_sorted = sorted(pool, key=lambda r: r["mean_test_avg_pnl"])
     median = pool_sorted[len(pool_sorted) // 2]
     return median["seed"]
@@ -872,17 +1188,40 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
                              os.path.join(OUT_DIR, "reliability_diagram.png"))
 
     with open(os.path.join(OUT_DIR, "calibration_report.json"), "w") as f:
-        json.dump(report, f, indent=2)
+        json.dump(report, f, indent=2, default=_json_default)
     print(f"  ✓  Calibration report saved → {OUT_DIR}/calibration_report.json")
 
-    test_pnl, n_trades, avg_pnl, _returns = simulate_pnl(
+    test_pnl, n_trades, avg_pnl, trade_returns = simulate_pnl(
         states, labels, holdout_mask, agent, prob_threshold=entry_threshold)
     print(f"\n  Held-out simulated P/L (non-overlapping single-position, "
           f"see simulate_pnl docstring): {test_pnl:+.4%} raw sum  "
           f"({n_trades} trades, avg/trade={avg_pnl:+.4%})  "
           f"@ entry_threshold={entry_threshold:.2f}")
 
+    # ── BOOTSTRAP CI on avg/trade ─────────────────────────────────────
+    # A point estimate on n_trades this small can't be trusted at face
+    # value — see bootstrap_ci()'s docstring. This resamples the SAME
+    # trade_returns to show how much the point estimate could plausibly
+    # swing, so a gate verdict can be read alongside its own uncertainty
+    # rather than as a clean binary fact.
+    ci = bootstrap_ci(trade_returns, ci=0.90, random_state=random_state)
+    if not np.isnan(ci["ci_lo"]):
+        straddles_zero = ci["ci_lo"] < 0 < ci["ci_hi"]
+        print(f"  Bootstrap 90% CI on avg/trade: [{ci['ci_lo']:+.4%}, {ci['ci_hi']:+.4%}]"
+              + ("  (interval straddles zero — cannot statistically "
+                 "distinguish this result from no edge)" if straddles_zero else ""))
+        if ci.get("note"):
+            print(f"    ⚠ {ci['note']}")
+    else:
+        print(f"  Bootstrap CI unavailable — {ci.get('note', 'insufficient trades')}")
+
     # ── DEPLOYMENT GATE ──────────────────────────────────────────────
+    # Gate decision itself is unchanged (point estimate vs floor,
+    # n_trades vs min) — the CI is reported for interpretability, not
+    # substituted into the pass/fail rule, so behaviour for existing
+    # callers/checkpoints doesn't silently change. Read the CI alongside
+    # the verdict below rather than treating the verdict as dispositive
+    # when the interval straddles zero.
     deploy_ok = (n_trades >= HOLDOUT_MIN_TRADES) and (avg_pnl > HOLDOUT_AVG_TRADE_FLOOR)
 
     gate_status = {
@@ -891,10 +1230,11 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
         "holdout_n_trades": n_trades,
         "holdout_avg_trade_floor": HOLDOUT_AVG_TRADE_FLOOR,
         "holdout_min_trades": HOLDOUT_MIN_TRADES,
+        "holdout_avg_pnl_bootstrap_ci": ci,
         "deploy_gate_passed": bool(deploy_ok),
     }
     with open(os.path.join(OUT_DIR, "deployment_gate.json"), "w") as f:
-        json.dump(gate_status, f, indent=2)
+        json.dump(gate_status, f, indent=2, default=_json_default)
 
     if deploy_ok:
         save_path = os.path.join(OUT_DIR, "gbt_agent_best.joblib")
@@ -902,12 +1242,23 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
         print(f"\n  ✓ HOLDOUT GATE PASSED (avg/trade={avg_pnl:+.4%} > "
               f"floor={HOLDOUT_AVG_TRADE_FLOOR:+.2%}, n_trades={n_trades}) "
               f"— deployed → {save_path}")
+        if not np.isnan(ci["ci_lo"]) and ci["ci_lo"] < 0:
+            print(f"     ⚠ Note: the 90% CI lower bound ({ci['ci_lo']:+.4%}) is "
+                  f"still negative — this pass is on the point estimate only; "
+                  f"treat as a provisional deploy, not a confirmed edge, until "
+                  f"more holdout trades accumulate.")
     else:
         save_path = os.path.join(OUT_DIR, "gbt_agent_candidate_FAILED_HOLDOUT.joblib")
         agent.save(save_path)
         print(f"\n  ⛔ HOLDOUT GATE FAILED — avg/trade={avg_pnl:+.4%} "
               f"(floor={HOLDOUT_AVG_TRADE_FLOOR:+.2%}, n_trades={n_trades} "
               f"vs min={HOLDOUT_MIN_TRADES}).")
+        if not np.isnan(ci["ci_lo"]) and ci["ci_hi"] > 0:
+            print(f"     Note: the 90% CI [{ci['ci_lo']:+.4%}, {ci['ci_hi']:+.4%}] "
+                  f"still includes positive values — this failure may reflect "
+                  f"an unlucky small sample rather than a confirmed negative "
+                  f"edge. More holdout trades (wider window / faster-resolving "
+                  f"barriers) would narrow this before concluding either way.")
         print(f"     Saved as CANDIDATE ONLY → {save_path}. Any existing "
               f"gbt_agent_best.joblib was left untouched — the pipeline will "
               f"not silently deploy a model that lost money on its own holdout.")
@@ -934,16 +1285,24 @@ def main():
                              "recommended whenever comparing two runs (e.g. "
                              "hyperparameter changes, the stability check's own "
                              "seeds) so the dataset itself isn't also changing.")
-    parser.add_argument("--seeds", type=int, nargs="+",
-                        default=list(DEFAULT_STABILITY_SEEDS),
-                        help="Random seeds for the multi-seed CPCV stability "
-                             "check (default: %(default)s). More seeds = more "
-                             "confidence but proportionally more compute (each "
-                             "seed refits every CPCV path).")
+    parser.add_argument("--selection-seeds", type=int, nargs="+",
+                        default=list(DEFAULT_SELECTION_SEEDS),
+                        help="Seeds used ONLY to choose entry_threshold "
+                             "(default: %(default)s). Must be disjoint from "
+                             "--confirmation-seeds or the gate stops being a "
+                             "genuine out-of-sample check — see module "
+                             "docstring on nested selection/confirmation.")
+    parser.add_argument("--confirmation-seeds", type=int, nargs="+",
+                        default=list(DEFAULT_CONFIRMATION_SEEDS),
+                        help="Seeds used ONLY to confirm the gate at the "
+                             "already-chosen entry_threshold, and to pick the "
+                             "final deployed model's random_state (default: "
+                             "%(default)s). Never used for threshold selection.")
     parser.add_argument("--min-pass-frac", type=float, default=DEFAULT_MIN_PASS_FRAC,
-                        help="Fraction of seeds that must independently pass the "
-                             "CPCV gate for the pipeline to proceed to final "
-                             "training (default: %(default)s).")
+                        help="Fraction of confirmation seeds that must "
+                             "independently pass the CPCV gate for the "
+                             "pipeline to proceed to final training "
+                             "(default: %(default)s).")
     parser.add_argument("--no-multi-timeframe", action="store_true",
                         help="Disable 15m/1h context (state_dim ~50 instead of "
                              "~122) for this run, to compare against the full "
@@ -962,37 +1321,45 @@ def main():
     n_hold  = int((labels["best_action"] == 3).sum())
     print(f"  Label balance — LONG:{n_long:,}  SHORT:{n_short:,}  HOLD:{n_hold:,}")
 
-    stable, seed_results = run_stability_check(
-        states, labels, aligned_df,
-        seeds=tuple(args.seeds), min_pass_frac=args.min_pass_frac,
+    selection_seeds = tuple(args.selection_seeds)
+    confirmation_seeds = tuple(args.confirmation_seeds)
+    overlap = set(selection_seeds) & set(confirmation_seeds)
+    if overlap:
+        raise ValueError(
+            f"--selection-seeds and --confirmation-seeds share seed(s) "
+            f"{sorted(overlap)} — they must be disjoint, otherwise the gate "
+            f"is partly confirming a threshold against data it was chosen "
+            f"on. Pick non-overlapping seed lists."
+        )
+
+    # ── STEP 0 — nested threshold selection (selection seeds only) ────────
+    selection = select_threshold_nested(states, labels, aligned_df,
+                                        selection_seeds=selection_seeds)
+    entry_threshold = selection["chosen_threshold"]
+
+    # ── STEP 1 — gate confirmation (confirmation seeds only, disjoint
+    #    from selection; threshold is fixed here, not re-tuned) ───────────
+    confirmation = confirm_gate_nested(
+        states, labels, aligned_df, entry_threshold=entry_threshold,
+        confirmation_seeds=confirmation_seeds, min_pass_frac=args.min_pass_frac,
     )
 
-    if not stable and not args.force_final_training:
+    # Save the pooled confirmation result in the same shape/location
+    # gate_and_summarize() used to (cpcv_summary.json), so downstream
+    # tooling (diagnostic_gbt.py etc.) that reads that file keeps working.
+    gate_and_summarize(
+        confirmation["pooled_path_results"], entry_threshold=entry_threshold,
+        threshold_sweep=selection, seed=None, write=True,
+    )
+
+    if not confirmation["passed"] and not args.force_final_training:
         print("\n  Re-run with --force-final-training to override the "
-              "multi-seed stability check.")
+              "nested selection/confirmation gate.")
         return
 
-    chosen_seed = _pick_representative_seed(seed_results)
-    print(f"\n{'#'*62}\n  DEPLOYED CPCV SUMMARY — representative seed={chosen_seed}"
-          f"\n{'#'*62}")
-
-    path_results, fitted_paths, valid = run_cpcv(states, labels, aligned_df,
-                                                  random_state=chosen_seed)
-    sweep = sweep_entry_thresholds(states, labels, fitted_paths, valid)
-    entry_threshold = sweep["chosen_threshold"]
-
-    # Re-evaluate every CPCV path at the chosen threshold so the gate
-    # decision reflects the exact operating point that will be deployed.
-    path_results = evaluate_paths_at_threshold(states, labels, fitted_paths,
-                                               valid, entry_threshold)
-    ok = gate_and_summarize(path_results, entry_threshold=entry_threshold,
-                            threshold_sweep=sweep, seed=chosen_seed)
-
-    if not ok and not args.force_final_training:
-        print("\n  Re-run with --force-final-training to override.")
-        return
-
-    print(f"\n{'#'*62}\n  STEP 2 — FINAL DEPLOYABLE TRAINING + CALIBRATION\n{'#'*62}")
+    chosen_seed = _pick_representative_confirmation_seed(confirmation["per_seed"])
+    print(f"\n{'#'*62}\n  STEP 2 — FINAL DEPLOYABLE TRAINING + CALIBRATION  "
+          f"(representative confirmation seed={chosen_seed})\n{'#'*62}")
     run_final_training(states, labels, aligned_df, entry_threshold=entry_threshold,
                        random_state=chosen_seed)
 
@@ -1001,4 +1368,6 @@ if __name__ == "__main__":
     main()
 
 # python main_gbt.py --min-path-test-trades 15
-# python main_gbt.py --disable-multi-timeframe   # comparison baseline
+# python main_gbt.py --disable-multi-timeframe
+# python main_gbt.py --frozen-data --force-final-training
+# python main_gbt.py --frozen-dat
