@@ -138,6 +138,30 @@ a small holdout isn't mistaken for a statistically confirmed result.
 The pass/fail RULE itself is unchanged (point estimate vs floor) — the
 CI is reported for interpretation, not substituted into the gate logic.
 
+CHANGES IN THIS REVISION — CAPACITY ROUND 4 + LOGISTIC BASELINE (A/B-DRIVEN)
+───────────────────────────────────────────────────────────────────────────
+A --no-multi-timeframe A/B run (state_dim ~122 -> ~50) was used to test
+whether feature dimensionality was the dominant driver of the
+train/test gap and PBO>50% instability seen in prior runs. It wasn't:
+train_avg_pnl stayed essentially the same magnitude in the ~50-dim run
+as the ~122-dim run, while out-of-sample performance got WORSE (mean
+test avg/trade +0.196% -> +0.046%, positive paths 31/54 -> 26/54,
+0/3 confirmation seeds passing vs 1/3 before). Two conclusions follow:
+  1. ENABLE_MULTI_TIMEFRAME stays True — the 15m/1h context is
+     contributing real signal, not just extra noise dimensions.
+  2. GBT_HYPERPARAMS is tightened again (round 4), this time targeting
+     tree capacity/iteration count DIRECTLY (shallower trees, larger
+     min_samples_leaf, fewer/smaller boosting steps, higher L2) rather
+     than via feature count, since dimensionality is now ruled out as
+     the dominant lever.
+Additionally, run_logistic_baseline() (new) fits a near-minimal-capacity
+logistic regression through the exact same CPCV paths/purge/embargo/
+labels as a floor check: if even a linear model can't clear PBO<=50%
+on this state/label setup, that's evidence the instability is a label/
+regime problem rather than something further GBT tuning can fix. Runs
+automatically before threshold selection unless --skip-baseline is
+passed; is purely informational and does not gate the pipeline.
+
 Run
 ────
     python main_gbt.py                                              # gated pipeline, live data
@@ -169,6 +193,13 @@ PACES      = (1, 6, 42, 90)
 WARMUP_IDX = 128
 ACTION_DIM = 4
 
+# Kept True (default) deliberately: a --no-multi-timeframe A/B run
+# showed dropping context makes out-of-sample results WORSE (mean
+# test avg/trade +0.196% -> +0.046%, positive paths 31/54 -> 26/54)
+# while barely moving train avg/trade at all — see GBT_HYPERPARAMS'
+# round-4 comment above. The context is contributing real signal;
+# --no-multi-timeframe remains available as a CLI override for further
+# A/B comparisons, but it is no longer the recommended default.
 ENABLE_MULTI_TIMEFRAME = True
 CONTEXT_TIMEFRAMES = ("15m", "1h")
 CONTEXT_PACES = (1, 4, 16)
@@ -190,24 +221,38 @@ N_TEST_GROUPS   = 2
 MAX_PATHS       = 28
 MIN_TRAIN_TICKS = 2000
 
-# Base-model regularization (overfitting fix, round 3 — see module
-# docstring). Rounds 1-2 brought train P/L down from >1000% and then
-# from the hundreds-of-percent range, but train avg/trade was still
-# running ~2-5x test avg/trade even after round 2. Tightened further:
-# higher min_samples_leaf/l2, lower max_features, aimed at making
-# individual trees (and therefore the ensemble) less able to carve out
-# training-set-specific decision boundaries in a state space that can
-# be up to 122-dim relative to ~10-12k fit rows per CPCV fold.
+# Base-model regularization (overfitting fix, round 4 — see module
+# docstring). Rounds 1-3 progressively tightened min_samples_leaf/l2/
+# max_features, aimed at reducing the state space's effective capacity
+# relative to ~10-12k fit rows per CPCV fold. A --no-multi-timeframe
+# A/B run (state_dim ~122 -> ~50) directly tested whether that
+# dimensionality was the dominant driver: it wasn't. train_avg_pnl
+# stayed at essentially the SAME magnitude (~1.7-3.5% per trade) in the
+# ~50-dim run as in the ~122-dim run, while test performance actually
+# got WORSE (mean_test_avg +0.196% -> +0.046%, positive paths 31/54 ->
+# 26/54) — i.e. the 15m/1h context was contributing real signal, and
+# cutting feature count did nothing to shrink the train/test gap that
+# was supposedly caused by dimensionality. That falsifies "too many
+# features" as the dominant cause.
+#
+# Round 4 therefore attacks CAPACITY/ITERATIONS DIRECTLY instead of via
+# dimensionality: much shallower trees (depth 3->2, leaf nodes 8->4),
+# a much larger min_samples_leaf (650->1000), fewer/smaller boosting
+# steps (max_iter 150->80, learning_rate 0.04->0.02), and higher L2
+# (14->20) — while KEEPING the full multi-timeframe state (see
+# ENABLE_MULTI_TIMEFRAME below), since removing it measurably hurt
+# out-of-sample performance in the A/B test above.
 GBT_HYPERPARAMS = dict(
-    max_iter=150,
-    learning_rate=0.04,
-    max_depth=3,
-    max_leaf_nodes=8,
-    min_samples_leaf=650,      # was 400 -> 650
-    l2_regularization=14.0,    # was 10.0 -> 14.0
+    max_iter=80,               # was 150 -> 80
+    learning_rate=0.02,        # was 0.04 -> 0.02
+    max_depth=2,                # was 3 -> 2
+    max_leaf_nodes=4,           # was 8 -> 4
+    min_samples_leaf=1000,      # was 650 -> 1000
+    l2_regularization=20.0,     # was 14.0 -> 20.0
     validation_fraction=0.15,
     n_iter_no_change=15,
-    max_features=0.35,         # was 0.45 -> 0.35; sklearn>=1.2
+    max_features=0.35,          # unchanged — dimensionality already
+                                 # ruled out as the dominant lever above
 )
 
 # ── Entry-conviction threshold sweep (CPCV-only — see module docstring) ─────
@@ -510,7 +555,8 @@ def bootstrap_ci(trade_returns: list, n_boot: int = 10_000, ci: float = 0.90,
 
 
 def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
-             random_state: int = 0) -> tuple:
+             random_state: int = 0, model_type: str = "hgb",
+             hyperparams: dict = None) -> tuple:
     """
     Returns (path_results, fitted_paths, valid).
 
@@ -520,6 +566,13 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
         can re-run the entire CPCV pass under several independent seeds
         without touching anything else — see module docstring.
 
+    model_type, hyperparams : forwarded to GBTAgent/GBTPolicy — lets a
+        caller swap the base classifier (e.g. model_type="logistic" for
+        run_logistic_baseline()'s capacity-floor check) without
+        duplicating any of the CPCV path-generation/purge/simulate_pnl
+        machinery below. Defaults ("hgb", None -> GBT_HYPERPARAMS)
+        reproduce the exact prior behaviour.
+
     fitted_paths: list of (CPCVPath, GBTAgent) for every path that was
     actually fit — kept so sweep_entry_thresholds()/
     evaluate_paths_at_threshold() can re-score the SAME fitted models
@@ -527,6 +580,8 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
     the subtle risk of a different random_state/early-stopping path)
     of refitting per threshold.
     """
+    hp = GBT_HYPERPARAMS if hyperparams is None else hyperparams
+
     lookback_ticks = compute_required_lookback_ticks()
     paths = generate_cpcv_paths(
         aligned_df, n_groups=N_GROUPS, n_test_groups=N_TEST_GROUPS,
@@ -535,7 +590,8 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
     )
     print(f"  Generated {len(paths)} CPCV paths "
           f"(groups={N_GROUPS}, test_groups={N_TEST_GROUPS}, "
-          f"lookback_ticks={lookback_ticks}, random_state={random_state})")
+          f"lookback_ticks={lookback_ticks}, random_state={random_state}, "
+          f"model_type={model_type})")
 
     y = labels["best_action"]
     valid = labels["valid_mask"]
@@ -548,7 +604,8 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
         if train_mask.sum() < MIN_TRAIN_TICKS or test_mask.sum() < 100:
             continue
 
-        agent = GBTAgent(state_dim=states.shape[1], action_dim=ACTION_DIM)
+        agent = GBTAgent(state_dim=states.shape[1], action_dim=ACTION_DIM,
+                         model_type=model_type)
         # purge_ticks: the calibration split GBTPolicy.fit() carves out
         # of THIS fold's train rows is chronological (last 20% by
         # default) — pass the same lookback_ticks used for the outer
@@ -557,7 +614,7 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
         # could leak across overlapping rolling-window lookback.
         agent.fit(states[train_mask], y[train_mask],
                   purge_ticks=lookback_ticks, random_state=random_state,
-                  **GBT_HYPERPARAMS)
+                  **hp)
         fitted_paths.append((path, agent))
 
         # Baseline (threshold=0.5) results — used for human-readable
@@ -586,7 +643,7 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
               f"test_avg={test_avg_pnl:+.3%} ({n_test_trades} trades)  "
               f"test_sharpe={sharpe_str}  "
               f"[raw: train={train_pnl:+.2%} test={test_pnl:+.2%}]  "
-              f"[@0.50 baseline, seed={random_state}]")
+              f"[@0.50 baseline, seed={random_state}, model={model_type}]")
 
     return path_results, fitted_paths, valid
 
@@ -832,6 +889,103 @@ def gate_and_summarize(path_results: list, entry_threshold: float = 0.5,
 
     print(f"\n  ✓ CPCV gate passed.")
     return True
+
+
+# ─────────────────────────────────────────────
+# Logistic regression baseline (capacity floor check)
+# ─────────────────────────────────────────────
+#
+# WHY THIS EXISTS: the --no-multi-timeframe A/B run ruled out feature
+# dimensionality as the dominant driver of GBT instability — cutting
+# state_dim from ~122 to ~50 didn't shrink train_avg_pnl at all, it
+# just made test performance worse. That leaves two live hypotheses
+# for the remaining PBO>50% instability:
+#   (a) the GBT still has more capacity than this label/feature
+#       relationship can support, even independent of dimension count
+#       (addressed by GBT_HYPERPARAMS' round-4 tightening above), or
+#   (b) the instability is inherent to the label/regime relationship
+#       itself (crypto's non-stationarity across regimes), in which
+#       case NO classifier — however regularized — will show PBO<=50%
+#       on this exact CPCV split, and the fix has to be structural
+#       (regime-conditional models, shorter re-fit windows, a smaller/
+#       more selective trading footprint) rather than more tuning.
+#
+# A near-linear model (logistic regression, effectively minimal
+# capacity) run through the EXACT SAME CPCV paths/purge/embargo/labels
+# is a cheap way to tell these apart. If logistic ALSO fails PBO<=50%,
+# that's evidence for (b) — the floor itself is broken, not the GBT's
+# capacity. If logistic passes while the GBT still fails, that's
+# evidence for (a) — the GBT genuinely has room to give back capacity.
+
+def run_logistic_baseline(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
+                          seeds: tuple = None) -> dict:
+    """
+    Fit a plain logistic regression (via GBTAgent(model_type="logistic"))
+    through the same CPCV path generation / purge-embargo / triple-
+    barrier labels as the GBT pipeline, at the default entry_threshold
+    (0.5 — no threshold sweep here; this is a floor check, not a
+    deployment candidate). Pools results across `seeds` (defaults to
+    DEFAULT_CONFIRMATION_SEEDS, so it's directly comparable to the
+    GBT's confirmation-pool numbers) and reports the same PBO / mean
+    test avg/trade / positive-path-fraction stats the GBT gate uses.
+
+    Returns the pooled evaluate_gate() stats dict and also writes them
+    to outcomes/gbt/logistic_baseline.json.
+    """
+    seeds = DEFAULT_CONFIRMATION_SEEDS if seeds is None else seeds
+    print(f"\n{'#'*62}\n  LOGISTIC REGRESSION BASELINE (capacity floor check)  "
+          f"seeds={list(seeds)}\n{'#'*62}")
+
+    pooled_results = []
+    for seed in seeds:
+        print(f"\n{'-'*62}\n  [baseline] seed {seed}\n{'-'*62}")
+        path_results, _, _ = run_cpcv(
+            states, labels, aligned_df, random_state=seed,
+            model_type="logistic", hyperparams={},
+        )
+        pooled_results.extend(path_results)
+
+    passed, stats = evaluate_gate(pooled_results)
+
+    print(f"\n{'='*62}\n  LOGISTIC BASELINE VERDICT  ({stats['n_total']} reliable paths)"
+          f"\n{'='*62}")
+    print(f"  Mean test avg/trade : {stats['mean_test_avg_pnl']:+.4%}")
+    print(f"  Std  test avg/trade : {stats['std_test_avg_pnl']:.4%}")
+    print(f"  Min  test avg/trade : {stats['min_test_avg_pnl']:+.4%}")
+    print(f"  Positive paths      : {stats.get('n_pos', 0)}/{stats['n_total']}")
+    pbo_str = f"{stats['pbo']:.1%}" if not np.isnan(stats["pbo"]) else "n/a"
+    print(f"  PBO                 : {pbo_str}")
+
+    if not np.isnan(stats["pbo"]) and stats["pbo"] > 0.5:
+        print(f"\n  → Baseline ALSO fails PBO<=50% at near-minimal model "
+              f"capacity. This supports a label/regime explanation for the "
+              f"GBT's instability over a pure capacity/overfitting "
+              f"explanation — further GBT regularization is unlikely to be "
+              f"the fix by itself; consider regime-conditional models, "
+              f"shorter re-fit windows, or a smaller/more selective "
+              f"trading footprint.")
+    elif np.isnan(stats["pbo"]):
+        print(f"\n  → Not enough reliable logistic paths to compute a PBO "
+              f"verdict — treat as inconclusive, not a pass.")
+    else:
+        print(f"\n  → Baseline PASSES PBO<=50% at near-minimal capacity. "
+              f"This supports treating the GBT's instability as an "
+              f"addressable capacity/tuning problem rather than a broken "
+              f"label/regime floor — the round-4 GBT_HYPERPARAMS tightening "
+              f"above is a reasonable next step to actually close that gap.")
+
+    with open(os.path.join(OUT_DIR, "logistic_baseline.json"), "w") as f:
+        json.dump({
+            "seeds": list(seeds),
+            "mean_test_avg_pnl": stats["mean_test_avg_pnl"],
+            "std_test_avg_pnl": stats["std_test_avg_pnl"],
+            "min_test_avg_pnl": stats["min_test_avg_pnl"],
+            "n_total": stats["n_total"], "n_pos": stats.get("n_pos", 0),
+            "pbo": stats["pbo"], "logit_lambda": stats["logit_lambda"],
+        }, f, indent=2, default=_json_default)
+    print(f"\n  ✓  Logistic baseline saved → {OUT_DIR}/logistic_baseline.json")
+
+    return stats
 
 
 # ─────────────────────────────────────────────
@@ -1307,7 +1461,18 @@ def main():
                         help="Disable 15m/1h context (state_dim ~50 instead of "
                              "~122) for this run, to compare against the full "
                              "multi-timeframe state using identical CPCV/"
-                             "stability machinery.")
+                             "stability machinery. NOTE: a prior A/B run showed "
+                             "this makes out-of-sample results worse, not "
+                             "better — kept only for further comparison, not "
+                             "recommended as the default.")
+    parser.add_argument("--skip-baseline", action="store_true",
+                        help="Skip the logistic-regression capacity-floor "
+                             "check (run_logistic_baseline) that otherwise "
+                             "runs automatically before threshold selection. "
+                             "Skipping saves ~1 CPCV pass per confirmation "
+                             "seed but loses the capacity-vs-label/regime "
+                             "diagnostic signal — see run_logistic_baseline()'s "
+                             "docstring.")
     args = parser.parse_args()
 
     print("Building states + triple-barrier labels...")
@@ -1331,6 +1496,18 @@ def main():
             f"is partly confirming a threshold against data it was chosen "
             f"on. Pick non-overlapping seed lists."
         )
+
+    # ── STEP -1 — logistic regression capacity-floor check (informational
+    #    only; does not gate the pipeline) — see run_logistic_baseline()'s
+    #    docstring for why this was added after the --no-multi-timeframe
+    #    A/B run ruled out dimensionality as the dominant overfitting
+    #    cause. Runs on the confirmation seeds so its PBO/mean-avg numbers
+    #    are directly comparable to the GBT's own confirmation-pool
+    #    numbers reported later in this run. ─────────────────────────────
+    if not args.skip_baseline:
+        run_logistic_baseline(states, labels, aligned_df, seeds=confirmation_seeds)
+    else:
+        print("\n  ⏭  Skipping logistic-regression baseline (--skip-baseline).")
 
     # ── STEP 0 — nested threshold selection (selection seeds only) ────────
     selection = select_threshold_nested(states, labels, aligned_df,

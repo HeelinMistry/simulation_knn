@@ -45,17 +45,40 @@ ONCE on a full (state, best_action) dataset built upstream (see
 main_gbt.py) — there is no per-episode incremental update. update()
 is kept as a no-op for interface parity with call sites that might
 still invoke it out of habit.
+
+model_type — pluggable base classifier (this revision)
+────────────────────────────────────────────────────────
+GBTPolicy/GBTAgent now accept a `model_type` ("hgb", the default, or
+"logistic") that swaps ONLY the base estimator construction in
+GBTPolicy.fit() — the chronological fit/calibration split, purge_ticks
+handling, isotonic calibration wrapper, and every downstream inference
+method (_raw_probs, _in_position_probs, get_action, act,
+GBTAgent.select_action) are shared verbatim between both model types.
+
+This exists for main_gbt.py's run_logistic_baseline(): after a
+--no-multi-timeframe A/B run ruled out feature dimensionality as the
+dominant driver of the GBT's CPCV instability, the next question is
+whether the instability is a GBT-capacity problem (fixable by more
+regularization) or a label/regime problem (not fixable by swapping
+classifiers at all). Running a near-minimal-capacity logistic
+regression through the IDENTICAL CPCV paths/purge/embargo/labels the
+GBT uses gives a cheap floor check for that question — see
+main_gbt.py's run_logistic_baseline() docstring for the full
+reasoning. "logistic" is not intended as a deployment candidate, only
+a diagnostic.
 """
 
 import os
 import numpy as np
 
 from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.isotonic import IsotonicRegression
 import joblib
 
 ACTION_NAMES = {0: "LONG", 1: "SHORT", 2: "CLOSE", 3: "HOLD"}
+VALID_MODEL_TYPES = ("hgb", "logistic")
 
 
 def _supports_prefit() -> bool:
@@ -131,11 +154,17 @@ class GBTPolicy:
     holdout — see sweep_entry_thresholds() there.
     """
 
-    def __init__(self, model=None, action_dim: int = 4, entry_threshold: float = 0.5):
+    def __init__(self, model=None, action_dim: int = 4, entry_threshold: float = 0.5,
+                model_type: str = "hgb"):
+        if model_type not in VALID_MODEL_TYPES:
+            raise ValueError(f"model_type={model_type!r} not in {VALID_MODEL_TYPES}")
         self.model = model
         self.action_dim = action_dim
         self.classes_ = None  # set on fit(); subset of {0,1,3}
         self.entry_threshold = entry_threshold
+        self.model_type = model_type  # "hgb" (default, deployable) or
+                                       # "logistic" (capacity-floor
+                                       # diagnostic — see module docstring)
 
     # ── Training ──────────────────────────────────────────────────────────
 
@@ -174,6 +203,8 @@ class GBTPolicy:
         producing >1000% train P/L against negative median test P/L in
         CPCV (see main_gbt.py's gate output), a classic small-n/high-dim
         (state_dim up to 122) overfitting signature for tree ensembles.
+        (`hgb_kwargs` is ignored entirely when self.model_type=="logistic"
+        — see the model_type branch below and the module docstring.)
 
         IMPORTANT: X/y here should already be the TRAIN-fold data from
         an outer CPCV/walk-forward split (see main_gbt.py) — this
@@ -201,29 +232,45 @@ class GBTPolicy:
                 f"classifier. Check class balance / fold size."
             )
 
-        hgb_kwargs.setdefault("max_iter", 150)
-        hgb_kwargs.setdefault("learning_rate", 0.04)
-        hgb_kwargs.setdefault("max_depth", 4)
-        hgb_kwargs.setdefault("max_leaf_nodes", 15)
-        hgb_kwargs.setdefault("min_samples_leaf", 200)
-        hgb_kwargs.setdefault("l2_regularization", 5.0)
-        hgb_kwargs.setdefault("validation_fraction", 0.15)
-        hgb_kwargs.setdefault("n_iter_no_change", 15)
-        # max_features (per-split feature subsampling) needs sklearn>=1.2;
-        # degrade gracefully on older installs rather than hard-failing.
-        hgb_kwargs.setdefault("max_features", 0.7)
+        if self.model_type == "logistic":
+            # Near-minimal-capacity baseline — see module docstring on
+            # why this exists (capacity-vs-label/regime floor check).
+            # class_weight="balanced" compensates for HOLD dominating
+            # the label distribution (see triple_barrier's label
+            # balance) without needing a separate sample-weighting
+            # scheme; multi_class handling and solver are left at
+            # sklearn defaults (lbfgs, one-vs-rest for 3 classes) since
+            # this model is a diagnostic floor, not a tuned deployment
+            # candidate. hgb_kwargs (HGB-specific) are intentionally
+            # ignored here.
+            base = LogisticRegression(
+                max_iter=2000, class_weight="balanced", random_state=random_state,
+            )
+            base.fit(X_fit, y_fit)
+        else:
+            hgb_kwargs.setdefault("max_iter", 150)
+            hgb_kwargs.setdefault("learning_rate", 0.04)
+            hgb_kwargs.setdefault("max_depth", 4)
+            hgb_kwargs.setdefault("max_leaf_nodes", 15)
+            hgb_kwargs.setdefault("min_samples_leaf", 200)
+            hgb_kwargs.setdefault("l2_regularization", 5.0)
+            hgb_kwargs.setdefault("validation_fraction", 0.15)
+            hgb_kwargs.setdefault("n_iter_no_change", 15)
+            # max_features (per-split feature subsampling) needs sklearn>=1.2;
+            # degrade gracefully on older installs rather than hard-failing.
+            hgb_kwargs.setdefault("max_features", 0.7)
 
-        try:
-            base = HistGradientBoostingClassifier(
-                early_stopping=True, random_state=random_state, **hgb_kwargs,
-            )
-            base.fit(X_fit, y_fit)
-        except TypeError:
-            hgb_kwargs.pop("max_features", None)
-            base = HistGradientBoostingClassifier(
-                early_stopping=True, random_state=random_state, **hgb_kwargs,
-            )
-            base.fit(X_fit, y_fit)
+            try:
+                base = HistGradientBoostingClassifier(
+                    early_stopping=True, random_state=random_state, **hgb_kwargs,
+                )
+                base.fit(X_fit, y_fit)
+            except TypeError:
+                hgb_kwargs.pop("max_features", None)
+                base = HistGradientBoostingClassifier(
+                    early_stopping=True, random_state=random_state, **hgb_kwargs,
+                )
+                base.fit(X_fit, y_fit)
 
         if _supports_prefit():
             self.model = CalibratedClassifierCV(base, method="isotonic", cv="prefit")
@@ -346,10 +393,13 @@ class GBTAgent:
     through explicitly if you extend UnifiedExecutor for this agent.
     """
 
-    def __init__(self, state_dim: int = 122, action_dim: int = 4, entry_threshold: float = 0.5):
+    def __init__(self, state_dim: int = 122, action_dim: int = 4, entry_threshold: float = 0.5,
+                model_type: str = "hgb"):
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.actor = GBTPolicy(action_dim=action_dim, entry_threshold=entry_threshold)
+        self.model_type = model_type
+        self.actor = GBTPolicy(action_dim=action_dim, entry_threshold=entry_threshold,
+                               model_type=model_type)
         self.device = "cpu"
 
     # Deliberately NOT declaring query_tick/query_episode_id — see
@@ -374,7 +424,8 @@ class GBTAgent:
     def fit(self, X: np.ndarray, y: np.ndarray, purge_ticks: int = 0, **kwargs):
         self.actor.fit(X, y, purge_ticks=purge_ticks, **kwargs)
         print(f"[GBTAgent] ✅ Fit complete on {len(X):,} rows  "
-              f"(classes={self.actor.classes_.tolist()}, purge_ticks={purge_ticks})")
+              f"(model_type={self.model_type}, classes={self.actor.classes_.tolist()}, "
+              f"purge_ticks={purge_ticks})")
 
     def update(self, episode_buffer=None):
         # No-op — kept for interface parity with MCKNNAgent.update(),
@@ -388,8 +439,10 @@ class GBTAgent:
             "model": self.actor.model, "classes_": self.actor.classes_,
             "state_dim": self.state_dim, "action_dim": self.action_dim,
             "entry_threshold": self.actor.entry_threshold,
+            "model_type": self.model_type,
         }, path)
-        print(f"[GBTAgent] ✅ Saved → {path}  (entry_threshold={self.actor.entry_threshold:.2f})")
+        print(f"[GBTAgent] ✅ Saved → {path}  "
+              f"(model_type={self.model_type}, entry_threshold={self.actor.entry_threshold:.2f})")
 
     def load(self, path: str = "outcomes/gbt_agent.joblib"):
         if not os.path.exists(path):
@@ -401,7 +454,11 @@ class GBTAgent:
         self.state_dim = data["state_dim"]
         self.action_dim = data["action_dim"]
         # Backward-compat: checkpoints saved before this revision won't
-        # have entry_threshold — fall back to the old implicit behaviour
-        # (0.5, i.e. plain argmax-eligible) rather than erroring.
+        # have entry_threshold/model_type — fall back to the old
+        # implicit behaviour (0.5 threshold, "hgb" model) rather than
+        # erroring.
         self.actor.entry_threshold = data.get("entry_threshold", 0.5)
-        print(f"[GBTAgent] ✅ Loaded ← {path}  (entry_threshold={self.actor.entry_threshold:.2f})")
+        self.model_type = data.get("model_type", "hgb")
+        self.actor.model_type = self.model_type
+        print(f"[GBTAgent] ✅ Loaded ← {path}  "
+              f"(model_type={self.model_type}, entry_threshold={self.actor.entry_threshold:.2f})")
