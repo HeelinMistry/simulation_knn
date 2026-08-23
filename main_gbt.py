@@ -162,13 +162,44 @@ regime problem rather than something further GBT tuning can fix. Runs
 automatically before threshold selection unless --skip-baseline is
 passed; is purely informational and does not gate the pipeline.
 
+CHANGES IN THIS REVISION — BAGGED FITS + WIDER CONFIRMATION POOL
+───────────────────────────────────────────────────────────────────────
+Diagnosis of the previous nested-gate run: confirmation seeds 2/3/4
+disagreed on pass/fail (1/3 passed) even though generate_cpcv_paths()'s
+train/test masks are ROW-COUNT based and therefore IDENTICAL across
+those seeds — only the classifier's internal RNG (HGB's max_features
+subsampling, early-stopping's validation carve-out) differed. That's a
+stronger instability signal than "different folds disagreed" would be:
+the verdict on the SAME evidence flips depending on fit randomness.
+
+Two changes address this directly:
+  1. gbt_agent.py's GBTPolicy.fit() now supports `n_bagged_fits`: it
+     fits several independently-seeded members on the SAME fit/cal
+     split and averages their calibrated probabilities
+     (_BaggedGBTModel). This is threaded through run_cpcv(),
+     select_threshold_nested(), confirm_gate_nested(), and
+     run_final_training() here via DEFAULT_N_BAGGED_FITS / the new
+     --n-bagged-fits flag. Logistic-baseline fits are unaffected
+     (bagging is a no-op there — see gbt_agent.py).
+  2. DEFAULT_CONFIRMATION_SEEDS widened from 3 to 6 seeds — a 3-seed
+     pass-fraction only ever takes 3 possible values (0%, 33%, 67%,
+     100%), too coarse to tell "bagging helped" from noise. 6 seeds
+     gives a finer read on whether stability actually improved.
+
+Additionally, run_logistic_baseline() now reports PER-SEED pass/fail
+(previously pooled-only), so it can be compared apples-to-apples
+against the GBT's own per-seed confirmation breakdown — needed to
+actually tell whether the simpler model is more STABLE, not just
+whether its pooled average looks fine.
+
 Run
 ────
     python main_gbt.py                                              # gated pipeline, live data
     python main_gbt.py --frozen-data                                 # reproducible comparisons
     python main_gbt.py --frozen-data --selection-seeds 0 1 \\
-                        --confirmation-seeds 2 3 4                   # explicit nested seed pools
+                        --confirmation-seeds 2 3 4 5 6 7             # explicit nested seed pools
     python main_gbt.py --frozen-data --no-multi-timeframe            # 4h-only baseline
+    python main_gbt.py --frozen-data --n-bagged-fits 5                # override bag size
     python main_gbt.py --force-final-training                        # override an unstable gate
 """
 
@@ -296,7 +327,21 @@ DEFAULT_MIN_PASS_FRAC   = 0.6   # >= 60% of seeds must independently pass
 # CPCV numbers, the gate verdict, and the deployed model are all drawn
 # from the confirmation pool alone.
 DEFAULT_SELECTION_SEEDS    = (0, 1)
-DEFAULT_CONFIRMATION_SEEDS = (2, 3, 4)
+# Widened from (2, 3, 4) — a 3-seed pass-fraction only takes 4 possible
+# values (0/3, 1/3, 2/3, 3/3), too coarse to distinguish "bagging fixed
+# the instability" from noise. 6 seeds gives finer resolution on the
+# per-seed stability check in confirm_gate_nested(). See module
+# docstring's "BAGGED FITS + WIDER CONFIRMATION POOL" section.
+DEFAULT_CONFIRMATION_SEEDS = (2, 3, 4, 5, 6, 7)
+
+# ── Bagged fits (this revision) ──────────────────────────────────────────────
+# Number of independently-seeded base-estimator fits GBTPolicy.fit()
+# averages together per (fold, seed) call — see gbt_agent.py's
+# "BAGGED FITS" docstring section for the full rationale. Threaded
+# through run_cpcv()/select_threshold_nested()/confirm_gate_nested()/
+# run_final_training() below and overridable via --n-bagged-fits.
+# Ignored (forced to 1) for model_type="logistic" — see gbt_agent.py.
+DEFAULT_N_BAGGED_FITS = 5
 
 # ── Final holdout deployment gate ────────────────────────────────────────────
 # Distinct from VAL_AVG_TRADE_FLOOR (a CPCV-path floor): this gates the
@@ -556,7 +601,7 @@ def bootstrap_ci(trade_returns: list, n_boot: int = 10_000, ci: float = 0.90,
 
 def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
              random_state: int = 0, model_type: str = "hgb",
-             hyperparams: dict = None) -> tuple:
+             hyperparams: dict = None, n_bagged_fits: int = None) -> tuple:
     """
     Returns (path_results, fitted_paths, valid).
 
@@ -573,6 +618,13 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
         machinery below. Defaults ("hgb", None -> GBT_HYPERPARAMS)
         reproduce the exact prior behaviour.
 
+    n_bagged_fits : forwarded to GBTAgent.fit()/GBTPolicy.fit() — number
+        of independently-seeded members averaged per fold (see
+        gbt_agent.py's "BAGGED FITS" docstring section). Defaults to
+        DEFAULT_N_BAGGED_FITS when None. Ignored (forced to 1) for
+        model_type="logistic", so run_logistic_baseline() doesn't pay
+        the extra compute for a no-op.
+
     fitted_paths: list of (CPCVPath, GBTAgent) for every path that was
     actually fit — kept so sweep_entry_thresholds()/
     evaluate_paths_at_threshold() can re-score the SAME fitted models
@@ -581,6 +633,7 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
     of refitting per threshold.
     """
     hp = GBT_HYPERPARAMS if hyperparams is None else hyperparams
+    nb = DEFAULT_N_BAGGED_FITS if n_bagged_fits is None else n_bagged_fits
 
     lookback_ticks = compute_required_lookback_ticks()
     paths = generate_cpcv_paths(
@@ -591,7 +644,8 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
     print(f"  Generated {len(paths)} CPCV paths "
           f"(groups={N_GROUPS}, test_groups={N_TEST_GROUPS}, "
           f"lookback_ticks={lookback_ticks}, random_state={random_state}, "
-          f"model_type={model_type})")
+          f"model_type={model_type}, "
+          f"n_bagged_fits={1 if model_type == 'logistic' else nb})")
 
     y = labels["best_action"]
     valid = labels["valid_mask"]
@@ -614,7 +668,7 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
         # could leak across overlapping rolling-window lookback.
         agent.fit(states[train_mask], y[train_mask],
                   purge_ticks=lookback_ticks, random_state=random_state,
-                  **hp)
+                  n_bagged_fits=nb, **hp)
         fitted_paths.append((path, agent))
 
         # Baseline (threshold=0.5) results — used for human-readable
@@ -929,13 +983,28 @@ def run_logistic_baseline(states: np.ndarray, labels: dict, aligned_df: pd.DataF
     GBT's confirmation-pool numbers) and reports the same PBO / mean
     test avg/trade / positive-path-fraction stats the GBT gate uses.
 
-    Returns the pooled evaluate_gate() stats dict and also writes them
-    to outcomes/gbt/logistic_baseline.json.
+    PER-SEED REPORTING (this revision): previously this only reported
+    the POOLED verdict, which can't distinguish "logistic is genuinely
+    more stable per-seed" from "logistic's pooled average happens to
+    look fine". confirm_gate_nested() already reports the GBT's own
+    per-seed pass/fail on these same confirmation seeds — this function
+    now computes the equivalent for logistic (evaluate_gate() on each
+    seed's own path_results) so the two are directly comparable. If
+    logistic is MORE stable per-seed at similar or better pooled
+    performance, that's stronger evidence the GBT's instability is a
+    fixable capacity/fit-variance problem (see gbt_agent.py's bagging)
+    rather than a broken label/regime floor; if logistic is EQUALLY
+    unstable per-seed, that points the other way (see docstring below).
+
+    Returns the pooled evaluate_gate() stats dict (with a "per_seed"
+    key added) and also writes the same information to
+    outcomes/gbt/logistic_baseline.json.
     """
     seeds = DEFAULT_CONFIRMATION_SEEDS if seeds is None else seeds
     print(f"\n{'#'*62}\n  LOGISTIC REGRESSION BASELINE (capacity floor check)  "
           f"seeds={list(seeds)}\n{'#'*62}")
 
+    per_seed = []
     pooled_results = []
     for seed in seeds:
         print(f"\n{'-'*62}\n  [baseline] seed {seed}\n{'-'*62}")
@@ -945,10 +1014,30 @@ def run_logistic_baseline(states: np.ndarray, labels: dict, aligned_df: pd.DataF
         )
         pooled_results.extend(path_results)
 
+        seed_passed, seed_stats = evaluate_gate(path_results)
+        per_seed.append({
+            "seed": seed, "passed": bool(seed_passed),
+            "n_total": seed_stats["n_total"], "n_pos": seed_stats.get("n_pos", 0),
+            "mean_test_avg_pnl": seed_stats["mean_test_avg_pnl"],
+            "min_test_avg_pnl": seed_stats["min_test_avg_pnl"],
+            "pbo": seed_stats["pbo"],
+        })
+        status = "PASS" if seed_passed else "FAIL"
+        pbo_seed_str = f"{seed_stats['pbo']:.1%}" if not np.isnan(seed_stats["pbo"]) else "n/a"
+        print(f"  [baseline] seed {seed}: {status}  "
+              f"mean_test_avg={seed_stats['mean_test_avg_pnl']:+.4%}  "
+              f"positive={seed_stats.get('n_pos', 0)}/{seed_stats['n_total']}  "
+              f"PBO={pbo_seed_str}")
+
     passed, stats = evaluate_gate(pooled_results)
+    n_pass = sum(r["passed"] for r in per_seed)
+    frac_pass = n_pass / len(seeds) if seeds else float("nan")
 
     print(f"\n{'='*62}\n  LOGISTIC BASELINE VERDICT  ({stats['n_total']} reliable paths)"
           f"\n{'='*62}")
+    print(f"  Per-seed stability  : {n_pass}/{len(seeds)} seeds passed "
+          f"({frac_pass:.0%}) — compare directly against the GBT's own "
+          f"per-seed confirmation result above.")
     print(f"  Mean test avg/trade : {stats['mean_test_avg_pnl']:+.4%}")
     print(f"  Std  test avg/trade : {stats['std_test_avg_pnl']:.4%}")
     print(f"  Min  test avg/trade : {stats['min_test_avg_pnl']:+.4%}")
@@ -960,23 +1049,24 @@ def run_logistic_baseline(states: np.ndarray, labels: dict, aligned_df: pd.DataF
         print(f"\n  → Baseline ALSO fails PBO<=50% at near-minimal model "
               f"capacity. This supports a label/regime explanation for the "
               f"GBT's instability over a pure capacity/overfitting "
-              f"explanation — further GBT regularization is unlikely to be "
-              f"the fix by itself; consider regime-conditional models, "
-              f"shorter re-fit windows, or a smaller/more selective "
-              f"trading footprint.")
+              f"explanation — further GBT regularization (or bagging) is "
+              f"unlikely to be the fix by itself; consider regime-"
+              f"conditional models, shorter re-fit windows, or a smaller/"
+              f"more selective trading footprint.")
     elif np.isnan(stats["pbo"]):
         print(f"\n  → Not enough reliable logistic paths to compute a PBO "
               f"verdict — treat as inconclusive, not a pass.")
     else:
         print(f"\n  → Baseline PASSES PBO<=50% at near-minimal capacity. "
               f"This supports treating the GBT's instability as an "
-              f"addressable capacity/tuning problem rather than a broken "
-              f"label/regime floor — the round-4 GBT_HYPERPARAMS tightening "
-              f"above is a reasonable next step to actually close that gap.")
+              f"addressable capacity/fit-variance problem rather than a "
+              f"broken label/regime floor.")
 
     with open(os.path.join(OUT_DIR, "logistic_baseline.json"), "w") as f:
         json.dump({
             "seeds": list(seeds),
+            "n_pass": n_pass, "frac_pass": frac_pass,
+            "per_seed": per_seed,
             "mean_test_avg_pnl": stats["mean_test_avg_pnl"],
             "std_test_avg_pnl": stats["std_test_avg_pnl"],
             "min_test_avg_pnl": stats["min_test_avg_pnl"],
@@ -985,6 +1075,9 @@ def run_logistic_baseline(states: np.ndarray, labels: dict, aligned_df: pd.DataF
         }, f, indent=2, default=_json_default)
     print(f"\n  ✓  Logistic baseline saved → {OUT_DIR}/logistic_baseline.json")
 
+    stats["per_seed"] = per_seed
+    stats["n_pass"] = n_pass
+    stats["frac_pass"] = frac_pass
     return stats
 
 
@@ -1106,7 +1199,8 @@ def _pick_representative_seed(seed_results: list) -> int:
 # confirming a threshold that was chosen to fit it.
 
 def select_threshold_nested(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
-                            selection_seeds: tuple = DEFAULT_SELECTION_SEEDS) -> dict:
+                            selection_seeds: tuple = DEFAULT_SELECTION_SEEDS,
+                            n_bagged_fits: int = None) -> dict:
     """
     Fit CPCV paths for every seed in `selection_seeds`, POOL all of
     their fitted (path, agent) pairs together, and run
@@ -1133,7 +1227,8 @@ def select_threshold_nested(states: np.ndarray, labels: dict, aligned_df: pd.Dat
     pooled_valid = None
     for seed in selection_seeds:
         print(f"\n{'-'*62}\n  [selection] seed {seed}\n{'-'*62}")
-        _, fitted_paths, valid = run_cpcv(states, labels, aligned_df, random_state=seed)
+        _, fitted_paths, valid = run_cpcv(states, labels, aligned_df, random_state=seed,
+                                          n_bagged_fits=n_bagged_fits)
         pooled_fitted_paths.extend(fitted_paths)
         pooled_valid = valid   # valid_mask is seed-independent (comes from labels)
 
@@ -1152,7 +1247,8 @@ def select_threshold_nested(states: np.ndarray, labels: dict, aligned_df: pd.Dat
 def confirm_gate_nested(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
                         entry_threshold: float,
                         confirmation_seeds: tuple = DEFAULT_CONFIRMATION_SEEDS,
-                        min_pass_frac: float = DEFAULT_MIN_PASS_FRAC) -> dict:
+                        min_pass_frac: float = DEFAULT_MIN_PASS_FRAC,
+                        n_bagged_fits: int = None) -> dict:
     """
     Evaluate the ALREADY-CHOSEN `entry_threshold` (no further tuning)
     against CPCV paths built from `confirmation_seeds` — seeds that
@@ -1186,7 +1282,8 @@ def confirm_gate_nested(states: np.ndarray, labels: dict, aligned_df: pd.DataFra
     pooled_path_results = []
     for seed in confirmation_seeds:
         print(f"\n{'-'*62}\n  [confirmation] seed {seed}\n{'-'*62}")
-        _, fitted_paths, valid = run_cpcv(states, labels, aligned_df, random_state=seed)
+        _, fitted_paths, valid = run_cpcv(states, labels, aligned_df, random_state=seed,
+                                          n_bagged_fits=n_bagged_fits)
         evaluated = evaluate_paths_at_threshold(states, labels, fitted_paths,
                                                 valid, entry_threshold)
         passed, stats = evaluate_gate(evaluated)
@@ -1269,9 +1366,15 @@ def _pick_representative_confirmation_seed(per_seed: list) -> int:
 # ─────────────────────────────────────────────
 
 def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
-                       entry_threshold: float = 0.5, random_state: int = 0):
+                       entry_threshold: float = 0.5, random_state: int = 0,
+                       n_bagged_fits: int = None):
     """Train the deployable model on all rows except the most recent
     embargo-safe holdout block, then report calibration on that holdout.
+
+    n_bagged_fits : forwarded to GBTAgent.fit() so the DEPLOYED model
+        benefits from the same variance-averaging used during CPCV/
+        gate confirmation (default: DEFAULT_N_BAGGED_FITS when None) —
+        see gbt_agent.py's "BAGGED FITS" docstring section.
 
     entry_threshold: the value chosen by main()'s CPCV-only sweep
     (sweep_entry_thresholds()) — baked into the saved GBTAgent so live
@@ -1307,16 +1410,18 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
     holdout_mask[holdout_start:] = True
     holdout_mask &= valid
 
+    nb = DEFAULT_N_BAGGED_FITS if n_bagged_fits is None else n_bagged_fits
     print(f"\n  Final train: {train_mask.sum():,} rows  |  "
           f"Holdout: {holdout_mask.sum():,} rows  |  "
           f"embargo: {holdout_start - embargo_start} rows  |  "
-          f"entry_threshold: {entry_threshold:.2f}  |  random_state: {random_state}")
+          f"entry_threshold: {entry_threshold:.2f}  |  random_state: {random_state}  |  "
+          f"n_bagged_fits: {nb}")
 
     agent = GBTAgent(state_dim=states.shape[1], action_dim=ACTION_DIM,
                      entry_threshold=entry_threshold)
     agent.fit(states[train_mask], labels["best_action"][train_mask],
               purge_ticks=lookback_ticks, random_state=random_state,
-              **GBT_HYPERPARAMS)
+              n_bagged_fits=nb, **GBT_HYPERPARAMS)
 
     # ── Calibration report on the genuinely held-out block ──────────
     probs = agent.actor.model.predict_proba(states[holdout_mask])
@@ -1473,6 +1578,14 @@ def main():
                              "seed but loses the capacity-vs-label/regime "
                              "diagnostic signal — see run_logistic_baseline()'s "
                              "docstring.")
+    parser.add_argument("--n-bagged-fits", type=int, default=DEFAULT_N_BAGGED_FITS,
+                        help="Number of independently-seeded base-estimator "
+                             "fits to average per (fold, seed) — see "
+                             "gbt_agent.py's 'BAGGED FITS' docstring section "
+                             "(default: %(default)s). Increases CPCV/"
+                             "confirmation/final-training compute roughly "
+                             "linearly; ignored (forced to 1) for the "
+                             "logistic baseline, which is deterministic.")
     args = parser.parse_args()
 
     print("Building states + triple-barrier labels...")
@@ -1511,7 +1624,8 @@ def main():
 
     # ── STEP 0 — nested threshold selection (selection seeds only) ────────
     selection = select_threshold_nested(states, labels, aligned_df,
-                                        selection_seeds=selection_seeds)
+                                        selection_seeds=selection_seeds,
+                                        n_bagged_fits=args.n_bagged_fits)
     entry_threshold = selection["chosen_threshold"]
 
     # ── STEP 1 — gate confirmation (confirmation seeds only, disjoint
@@ -1519,6 +1633,7 @@ def main():
     confirmation = confirm_gate_nested(
         states, labels, aligned_df, entry_threshold=entry_threshold,
         confirmation_seeds=confirmation_seeds, min_pass_frac=args.min_pass_frac,
+        n_bagged_fits=args.n_bagged_fits,
     )
 
     # Save the pooled confirmation result in the same shape/location
@@ -1538,7 +1653,7 @@ def main():
     print(f"\n{'#'*62}\n  STEP 2 — FINAL DEPLOYABLE TRAINING + CALIBRATION  "
           f"(representative confirmation seed={chosen_seed})\n{'#'*62}")
     run_final_training(states, labels, aligned_df, entry_threshold=entry_threshold,
-                       random_state=chosen_seed)
+                       random_state=chosen_seed, n_bagged_fits=args.n_bagged_fits)
 
 
 if __name__ == "__main__":

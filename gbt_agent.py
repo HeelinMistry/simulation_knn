@@ -66,6 +66,38 @@ GBT uses gives a cheap floor check for that question — see
 main_gbt.py's run_logistic_baseline() docstring for the full
 reasoning. "logistic" is not intended as a deployment candidate, only
 a diagnostic.
+
+BAGGED FITS (this revision) — fixing seed-to-seed fit variance
+────────────────────────────────────────────────────────────────
+main_gbt.py's nested gate confirmation showed confirmation seeds 2/3/4
+disagreeing on pass/fail (1/3 passed) even though — critically —
+generate_cpcv_paths()'s train/test masks are derived purely from row
+counts and are therefore IDENTICAL across those three seeds.
+random_state only ever reaches HistGradientBoostingClassifier's own
+internal randomness (max_features per-split feature subsampling, the
+early-stopping validation carve-out). Getting PASS/FAIL/FAIL on the
+exact same evidence, purely from re-rolling the classifier's RNG, is a
+stronger overfitting signal than "different folds gave different
+results" would be — the model's conclusion about whether it has an
+edge is not settled by the data alone.
+
+GBTPolicy.fit() now accepts `n_bagged_fits`: instead of one base
+estimator per (fold, seed), it fits `n_bagged_fits` independently-
+seeded base estimators on the SAME chronological fit/calibration
+split, calibrates each independently, and averages their predict_proba
+output at inference time (see _BaggedGBTModel below). This is the
+standard bagging remedy for exactly this kind of fit-variance, and
+because max_features<1.0 already makes each member see a different
+random feature subset per tree split — much like the base learners in
+a random forest — the members are usefully decorrelated rather than
+near-duplicates of one another, so averaging them should actually
+reduce variance rather than just adding compute.
+
+Logistic-regression members are deterministic given the same
+(X_fit, y_fit) (lbfgs has no data-dependent randomness here), so
+bagging is a no-op for model_type="logistic" and fit() forces
+n_bagged_fits=1 for that branch regardless of what's requested — no
+point spending compute re-fitting an identical model.
 """
 
 import os
@@ -117,6 +149,87 @@ class _ManualIsotoneCalibrator:
         row_sums = out.sum(axis=1, keepdims=True)
         row_sums[row_sums == 0] = 1.0
         return out / row_sums
+
+
+class _BaggedGBTModel:
+    """
+    Averages predict_proba() across several independently-seeded,
+    independently-calibrated members fit on the SAME chronological
+    fit/calibration split — see GBTPolicy.fit()'s `n_bagged_fits` and
+    the module docstring's "BAGGED FITS" section for why this exists
+    (seed-to-seed CPCV pass/fail flips on IDENTICAL train/test folds,
+    driven purely by the base estimator's internal RNG).
+
+    Deliberately not a scikit-learn estimator with its own fit() —
+    every member is already fully fit/calibrated by the time this
+    wraps them. This is a thin inference-time averaging shim so
+    GBTPolicy._raw_probs() and every downstream caller (get_action,
+    act, GBTAgent.select_action) don't need to know whether bagging is
+    in effect; with n_bagged_fits=1 this reduces to exactly one
+    member's predict_proba(), i.e. byte-for-byte the old behaviour.
+    """
+    def __init__(self, members: list):
+        if not members:
+            raise ValueError("_BaggedGBTModel requires at least one fitted member.")
+        self.members = members
+        self.classes_ = members[0].classes_
+
+    def predict_proba(self, X):
+        probs = np.stack([m.predict_proba(X) for m in self.members], axis=0)
+        return probs.mean(axis=0)
+
+
+def _fit_hgb_base(X_fit, y_fit, random_state: int, hgb_kwargs: dict):
+    """
+    Construct + fit one HistGradientBoostingClassifier member. Factored
+    out of GBTPolicy.fit() so the bagging loop there can call this once
+    per member with a fresh copy of hgb_kwargs (avoids one member's
+    max_features-unsupported fallback silently affecting a different
+    member's kwargs dict).
+    """
+    hgb_kwargs.setdefault("max_iter", 150)
+    hgb_kwargs.setdefault("learning_rate", 0.04)
+    hgb_kwargs.setdefault("max_depth", 4)
+    hgb_kwargs.setdefault("max_leaf_nodes", 15)
+    hgb_kwargs.setdefault("min_samples_leaf", 200)
+    hgb_kwargs.setdefault("l2_regularization", 5.0)
+    hgb_kwargs.setdefault("validation_fraction", 0.15)
+    hgb_kwargs.setdefault("n_iter_no_change", 15)
+    # max_features (per-split feature subsampling) needs sklearn>=1.2;
+    # degrade gracefully on older installs rather than hard-failing.
+    hgb_kwargs.setdefault("max_features", 0.7)
+    try:
+        base = HistGradientBoostingClassifier(
+            early_stopping=True, random_state=random_state, **hgb_kwargs,
+        )
+        base.fit(X_fit, y_fit)
+    except TypeError:
+        hgb_kwargs.pop("max_features", None)
+        base = HistGradientBoostingClassifier(
+            early_stopping=True, random_state=random_state, **hgb_kwargs,
+        )
+        base.fit(X_fit, y_fit)
+    return base
+
+
+def _calibrate_member(base, X_fit, y_fit, X_cal, y_cal):
+    """Wrap one fitted base estimator in an isotonic calibrator, using
+    the same prefit/manual-fallback logic GBTPolicy.fit() always used —
+    factored out so it's called once per bagged member."""
+    if _supports_prefit():
+        cal = CalibratedClassifierCV(base, method="isotonic", cv="prefit")
+    else:
+        cal = _ManualIsotoneCalibrator(base)
+
+    if len(np.unique(y_cal)) < 2:
+        # Calibration split is degenerate (e.g. very short fold) —
+        # fall back to calibrating on the fit split rather than
+        # crashing; isotonic regression still runs, just without a
+        # genuinely held-out calibration slice for this fold.
+        cal.fit(X_fit, y_fit)
+    else:
+        cal.fit(X_cal, y_cal)
+    return cal
 
 
 class GBTPolicy:
@@ -173,11 +286,29 @@ class GBTPolicy:
             random_state: int = 0,
             purge_ticks: int = 0,
             min_fit_rows: int = 200,
+            n_bagged_fits: int = 1,
+            bag_seed_stride: int = 1000,
             **hgb_kwargs):
         """
         Fit the base classifier on a chronological "fit" prefix, then
         calibrate on a chronological "calibration" suffix via isotonic
         regression, with an optional purge gap removed from between them.
+
+        BAGGING (n_bagged_fits, this revision): instead of a single
+        (base, calibrator) pair, fits `n_bagged_fits` independently-
+        seeded members on the SAME X_fit/y_fit and X_cal/y_cal splits
+        (random_state, random_state + bag_seed_stride, + 2*stride, ...)
+        and wraps them in _BaggedGBTModel, which averages predict_proba
+        across members at inference time. See the module docstring's
+        "BAGGED FITS" section for why: CPCV confirmation seeds were
+        shown to flip pass/fail on IDENTICAL train/test folds purely
+        from the base estimator's internal RNG, and averaging several
+        such fits is the standard remedy. n_bagged_fits=1 (the default)
+        is byte-for-byte the old single-fit behaviour. Forced to 1 for
+        model_type="logistic" regardless of the requested value, since
+        LogisticRegression(lbfgs) here is deterministic given the data
+        and bagging it would just re-fit an identical model for no
+        benefit.
 
         CHANGE (overfitting fix): the fit/calibration split used to be a
         RANDOM train_test_split (optionally stratified). X/y arrive here
@@ -232,60 +363,32 @@ class GBTPolicy:
                 f"classifier. Check class balance / fold size."
             )
 
-        if self.model_type == "logistic":
-            # Near-minimal-capacity baseline — see module docstring on
-            # why this exists (capacity-vs-label/regime floor check).
-            # class_weight="balanced" compensates for HOLD dominating
-            # the label distribution (see triple_barrier's label
-            # balance) without needing a separate sample-weighting
-            # scheme; multi_class handling and solver are left at
-            # sklearn defaults (lbfgs, one-vs-rest for 3 classes) since
-            # this model is a diagnostic floor, not a tuned deployment
-            # candidate. hgb_kwargs (HGB-specific) are intentionally
-            # ignored here.
-            base = LogisticRegression(
-                max_iter=2000, class_weight="balanced", random_state=random_state,
-            )
-            base.fit(X_fit, y_fit)
-        else:
-            hgb_kwargs.setdefault("max_iter", 150)
-            hgb_kwargs.setdefault("learning_rate", 0.04)
-            hgb_kwargs.setdefault("max_depth", 4)
-            hgb_kwargs.setdefault("max_leaf_nodes", 15)
-            hgb_kwargs.setdefault("min_samples_leaf", 200)
-            hgb_kwargs.setdefault("l2_regularization", 5.0)
-            hgb_kwargs.setdefault("validation_fraction", 0.15)
-            hgb_kwargs.setdefault("n_iter_no_change", 15)
-            # max_features (per-split feature subsampling) needs sklearn>=1.2;
-            # degrade gracefully on older installs rather than hard-failing.
-            hgb_kwargs.setdefault("max_features", 0.7)
+        effective_n_bags = 1 if self.model_type == "logistic" else max(1, n_bagged_fits)
 
-            try:
-                base = HistGradientBoostingClassifier(
-                    early_stopping=True, random_state=random_state, **hgb_kwargs,
+        members = []
+        for b in range(effective_n_bags):
+            member_seed = random_state + b * bag_seed_stride
+            if self.model_type == "logistic":
+                # Near-minimal-capacity baseline — see module docstring on
+                # why this exists (capacity-vs-label/regime floor check).
+                # class_weight="balanced" compensates for HOLD dominating
+                # the label distribution (see triple_barrier's label
+                # balance) without needing a separate sample-weighting
+                # scheme; multi_class handling and solver are left at
+                # sklearn defaults (lbfgs, one-vs-rest for 3 classes) since
+                # this model is a diagnostic floor, not a tuned deployment
+                # candidate. hgb_kwargs (HGB-specific) are intentionally
+                # ignored here.
+                base = LogisticRegression(
+                    max_iter=2000, class_weight="balanced", random_state=member_seed,
                 )
                 base.fit(X_fit, y_fit)
-            except TypeError:
-                hgb_kwargs.pop("max_features", None)
-                base = HistGradientBoostingClassifier(
-                    early_stopping=True, random_state=random_state, **hgb_kwargs,
-                )
-                base.fit(X_fit, y_fit)
+            else:
+                base = _fit_hgb_base(X_fit, y_fit, member_seed, dict(hgb_kwargs))
 
-        if _supports_prefit():
-            self.model = CalibratedClassifierCV(base, method="isotonic", cv="prefit")
-        else:
-            self.model = _ManualIsotoneCalibrator(base)
+            members.append(_calibrate_member(base, X_fit, y_fit, X_cal, y_cal))
 
-        if len(np.unique(y_cal)) < 2:
-            # Calibration split is degenerate (e.g. very short fold) —
-            # fall back to calibrating on the fit split rather than
-            # crashing; isotonic regression still runs, just without a
-            # genuinely held-out calibration slice for this fold.
-            self.model.fit(X_fit, y_fit)
-        else:
-            self.model.fit(X_cal, y_cal)
-
+        self.model = _BaggedGBTModel(members)
         self.classes_ = np.array(sorted(np.unique(y)))
         return self
 
@@ -421,11 +524,13 @@ class GBTAgent:
             return action, probs
         return self.actor.act(state, deterministic=deterministic, action_mask=action_mask)
 
-    def fit(self, X: np.ndarray, y: np.ndarray, purge_ticks: int = 0, **kwargs):
-        self.actor.fit(X, y, purge_ticks=purge_ticks, **kwargs)
+    def fit(self, X: np.ndarray, y: np.ndarray, purge_ticks: int = 0,
+            n_bagged_fits: int = 1, **kwargs):
+        self.actor.fit(X, y, purge_ticks=purge_ticks, n_bagged_fits=n_bagged_fits, **kwargs)
+        effective_bags = 1 if self.model_type == "logistic" else max(1, n_bagged_fits)
         print(f"[GBTAgent] ✅ Fit complete on {len(X):,} rows  "
               f"(model_type={self.model_type}, classes={self.actor.classes_.tolist()}, "
-              f"purge_ticks={purge_ticks})")
+              f"purge_ticks={purge_ticks}, n_bagged_fits={effective_bags})")
 
     def update(self, episode_buffer=None):
         # No-op — kept for interface parity with MCKNNAgent.update(),
