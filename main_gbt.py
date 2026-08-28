@@ -192,6 +192,68 @@ against the GBT's own per-seed confirmation breakdown — needed to
 actually tell whether the simpler model is more STABLE, not just
 whether its pooled average looks fine.
 
+CHANGES IN THIS REVISION — CAPACITY ROUND 5 + PURGED EARLY STOPPING +
+BOOTSTRAP BAGGING (DIAGNOSED FROM THE BAGGED-FITS RUN'S OWN RESULTS)
+───────────────────────────────────────────────────────────────────────
+The BAGGED FITS revision above did not fix the instability it targeted:
+confirmation still split 2/6 pass vs 4/6 fail with pooled PBO=52.6%
+(> 50%, gate FAIL), while run_logistic_baseline() on the SAME
+confirmation seeds passed 6/6 at a matching-or-better mean test
+avg/trade (+0.243% vs the GBT's +0.209%) and better positive-path
+fraction. Per run_logistic_baseline()'s own diagnostic logic: a
+passing near-minimal-capacity baseline alongside a failing GBT is
+evidence the GBT "genuinely has room to give back capacity" — i.e. a
+still-fixable capacity/overfitting problem, not a broken label/regime
+floor (which would show the baseline failing too). Per-path CPCV logs
+confirm this directly: train avg/trade sat at +0.7%-+1.4%/trade across
+hundreds of trades while test avg/trade on the SAME seed's other paths
+routinely collapsed toward zero or went negative — the standard
+train/test-gap signature of overfitting.
+
+Three changes follow directly from that diagnosis:
+
+  1. GBT_HYPERPARAMS tightened a 5th round, still targeting capacity/
+     iterations directly (as round 4 did) rather than feature count
+     (already ruled out by the --no-multi-timeframe A/B test): shallower
+     trees (max_depth 2->2, max_leaf_nodes 4->3), fewer/smaller boosting
+     steps (max_iter 80->50, learning_rate 0.02->0.015), a much larger
+     min_samples_leaf (1000->1600), higher L2 (20.0->28.0), and a lower
+     max_features (0.35->0.25).
+
+  2. gbt_agent.py's GBTPolicy.fit() no longer relies on sklearn's own
+     `early_stopping=True`/`validation_fraction`, which carves out its
+     internal validation rows via a RANDOM split of the fit data — a
+     leak given this project's rolling-window features (up to 200
+     ticks) and 15m/1h context, and one that tends to green-light MORE
+     boosting iterations than a genuinely held-out signal would. The
+     iteration count is now chosen ONCE per fit() call via a manual,
+     PURGED chronological validation slice (`_select_n_iterations()`,
+     using the same `purge_ticks` buffer already used between the fit
+     and calibration splits) — see gbt_agent.py's module docstring for
+     the full mechanism.
+
+  3. Bagged members (n_bagged_fits, still DEFAULT_N_BAGGED_FITS=5) now
+     default to fitting on an independent BOOTSTRAP RESAMPLE (with
+     replacement) of the fit rows, not the same rows with only
+     random_state varied. The previous seed-only bagging only
+     decorrelated the classifier's internal RNG (max_features
+     subsampling, the now-removed early-stopping carve-out); bootstrap
+     resampling decorrelates which ROWS each member actually trains on,
+     directly targeting fold-specific overfitting the way a random
+     forest's trees are decorrelated — see gbt_agent.py's
+     `bootstrap_bags` parameter (default True; set False to restore the
+     old seed-only behaviour).
+
+None of run_cpcv() / select_threshold_nested() / confirm_gate_nested()
+/ run_final_training() needed to change here — n_bagged_fits threading
+and purge_ticks were already plumbed through in the BAGGED FITS
+revision, and the iteration-selection + bootstrap-resampling changes
+are entirely internal to gbt_agent.py's fit(). Re-run with
+--frozen-data against the SAME dataset/seed split used for the failing
+run above before drawing conclusions, so any improvement reflects
+these changes and not data drift from update_master_data() appending
+new candles between runs.
+
 Run
 ────
     python main_gbt.py                                              # gated pipeline, live data
@@ -266,24 +328,44 @@ MIN_TRAIN_TICKS = 2000
 # was supposedly caused by dimensionality. That falsifies "too many
 # features" as the dominant cause.
 #
-# Round 4 therefore attacks CAPACITY/ITERATIONS DIRECTLY instead of via
+# Round 4 attacked CAPACITY/ITERATIONS DIRECTLY instead of via
 # dimensionality: much shallower trees (depth 3->2, leaf nodes 8->4),
 # a much larger min_samples_leaf (650->1000), fewer/smaller boosting
 # steps (max_iter 150->80, learning_rate 0.04->0.02), and higher L2
 # (14->20) — while KEEPING the full multi-timeframe state (see
 # ENABLE_MULTI_TIMEFRAME below), since removing it measurably hurt
 # out-of-sample performance in the A/B test above.
+#
+# Round 5 (this revision — see module docstring's "CAPACITY ROUND 5"
+# section): round 4 + seed-only bagging still left confirmation at
+# 2/6 pass (pooled PBO=52.6%) while a near-minimal-capacity logistic
+# baseline passed 6/6 on the SAME seeds at a matching-or-better
+# avg/trade — clear evidence of remaining, addressable capacity, not
+# a broken label/regime floor. Tightened further, again attacking
+# capacity/iterations directly: max_leaf_nodes 4->3, max_iter 80->50,
+# learning_rate 0.02->0.015, min_samples_leaf 1000->1600,
+# l2_regularization 20.0->28.0, max_features 0.35->0.25.
+#
+# NOTE: validation_fraction/n_iter_no_change below are now only a
+# FALLBACK for standalone/direct GBTPolicy.fit() calls that skip
+# _select_n_iterations() (see gbt_agent.py's "PURGED EARLY STOPPING"
+# docstring section). The normal path through this pipeline
+# (run_cpcv/run_final_training) chooses the iteration count via a
+# manually-purged validation slice instead of sklearn's own randomly-
+# split early stopping, so these two keys are effectively unused in
+# the main pipeline — kept only so hgb_kwargs remains well-formed if
+# something calls GBTPolicy.fit() directly without going through
+# _select_n_iterations() first.
 GBT_HYPERPARAMS = dict(
-    max_iter=80,               # was 150 -> 80
-    learning_rate=0.02,        # was 0.04 -> 0.02
-    max_depth=2,                # was 3 -> 2
-    max_leaf_nodes=4,           # was 8 -> 4
-    min_samples_leaf=1000,      # was 650 -> 1000
-    l2_regularization=20.0,     # was 14.0 -> 20.0
-    validation_fraction=0.15,
-    n_iter_no_change=15,
-    max_features=0.35,          # unchanged — dimensionality already
-                                 # ruled out as the dominant lever above
+    max_iter=50,                # was 150 -> 80 -> 50
+    learning_rate=0.015,        # was 0.04 -> 0.02 -> 0.015
+    max_depth=2,                 # was 3 -> 2 (unchanged since round 4)
+    max_leaf_nodes=3,            # was 8 -> 4 -> 3
+    min_samples_leaf=1600,       # was 650 -> 1000 -> 1600
+    l2_regularization=28.0,      # was 14.0 -> 20.0 -> 28.0
+    validation_fraction=0.15,    # fallback only — see note above
+    n_iter_no_change=15,         # fallback only — see note above
+    max_features=0.25,           # was 0.45 -> 0.35 -> 0.25
 )
 
 # ── Entry-conviction threshold sweep (CPCV-only — see module docstring) ─────

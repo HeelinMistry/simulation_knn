@@ -98,6 +98,79 @@ Logistic-regression members are deterministic given the same
 bagging is a no-op for model_type="logistic" and fit() forces
 n_bagged_fits=1 for that branch regardless of what's requested — no
 point spending compute re-fitting an identical model.
+
+PURGED EARLY STOPPING + BOOTSTRAP BAGGING (this revision)
+────────────────────────────────────────────────────────────────
+The BAGGED FITS remedy above reduced but did not fix the instability:
+confirmation seeds still split 2/6 pass vs 4/6 fail, with a pooled
+PBO of 52.6% (still > 50%), while a near-minimal-capacity logistic
+regression run through the IDENTICAL CPCV paths/purge/embargo/labels
+passed 6/6 seeds at a matching-or-better mean test avg/trade
+(+0.243% vs the GBT's +0.209%). Per run_logistic_baseline()'s own
+diagnostic logic: "If logistic passes while the GBT still fails,
+that's evidence... the GBT genuinely has room to give back capacity."
+Per-path logs back this up directly — train avg/trade sat at
++0.7%–+1.4%/trade (hundreds of trades) while test avg/trade on the
+SAME seed's other paths routinely collapsed to ~0 or went negative,
+the standard train/test-gap signature of overfitting, not just noisy
+folds.
+
+Two root causes were identified and fixed here, on top of round-4's
+hyperparameter tightening (kept, see main_gbt.py's GBT_HYPERPARAMS,
+now round 5):
+
+1. LEAKY EARLY STOPPING. Every previous revision's base HGB fit used
+   sklearn's built-in `early_stopping=True` / `validation_fraction`,
+   which carves out its internal validation slice via a RANDOM split
+   of X_fit. Because several features here have rolling lookbacks up
+   to 200 ticks (preprocessing.py) and the state can include 15m/1h
+   context (multi_timeframe_state.py), a randomly-selected validation
+   row can sit tick-adjacent to a training row and share most of its
+   information — precisely the leak walkforward.py's purge/embargo
+   logic exists to prevent everywhere else in this codebase, just
+   reintroduced one level down inside sklearn's own fit(). A leaky
+   validation signal tends to green-light MORE boosting iterations
+   than a genuinely held-out signal would, directly enabling the
+   fold-specific overfitting seen above.
+
+   Fix: `_select_n_iterations()` below manually reproduces HGB's
+   early-stopping loop (via `warm_start=True`, incrementally growing
+   `max_iter` and monitoring log-loss), but against a CHRONOLOGICAL
+   tail slice of X_fit with a `purge_ticks`-wide gap removed before it
+   — the same purge discipline `GBTPolicy.fit()` already applies
+   between the fit and calibration splits. This is computed ONCE per
+   `fit()` call (not once per bagged member — it is selecting model
+   CAPACITY, a property of the data/hyperparameters, not something
+   bagging should decorrelate across) and the resulting iteration
+   count is then used as a fixed `max_iter` (with sklearn's own
+   `early_stopping` disabled) for every bagged member's actual fit.
+
+2. BAGGING DIDN'T DECORRELATE FOLD-FIT, ONLY RNG. The previous
+   bagging loop fit every member on the exact same `X_fit`/`y_fit`
+   rows, varying only `random_state` — which only reaches
+   `max_features` per-split subsampling and (previously) the leaky
+   validation carve-out. That decorrelates *fit noise* but does
+   nothing about a model that has genuinely found fold-specific
+   structure in that one set of rows, which is what the train/test
+   gap above indicates.
+
+   Fix: each bagged member (model_type="hgb" only — see below) is now
+   fit on an independent BOOTSTRAP RESAMPLE (with replacement) of
+   `X_fit`/`y_fit`, at the fixed `max_iter` chosen in (1). This is
+   the standard bagging construction (as in a random forest) and
+   directly targets fold-specific overfit rather than just RNG noise.
+   Calibration (`_calibrate_member`) is still fit against the REAL
+   (non-resampled) `X_cal`/`y_cal` — and, in the empty-`X_fit`
+   fallback used when a fold's calibration split is degenerate, the
+   real (non-resampled) `X_fit`/`y_fit` — so calibrated probabilities
+   are never fit against a resampled distribution.
+
+   Bootstrap resampling is skipped for model_type="logistic" (already
+   forced to n_bagged_fits=1, deterministic, no bagging benefit) and
+   is safe to apply independently of chronological order for "hgb"
+   members precisely because it happens AFTER `_select_n_iterations()`
+   has already made its (order-sensitive) purged-validation decision
+   on the original, unshuffled `X_fit`/`y_fit`.
 """
 
 import os
@@ -107,6 +180,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import log_loss
 import joblib
 
 ACTION_NAMES = {0: "LONG", 1: "SHORT", 2: "CLOSE", 3: "HOLD"}
@@ -179,13 +253,112 @@ class _BaggedGBTModel:
         return probs.mean(axis=0)
 
 
-def _fit_hgb_base(X_fit, y_fit, random_state: int, hgb_kwargs: dict):
+def _select_n_iterations(X_fit: np.ndarray, y_fit: np.ndarray, purge_ticks: int,
+                         hgb_kwargs: dict, random_state: int,
+                         min_train_rows: int = 200) -> int:
+    """
+    Choose the boosting-iteration count (`max_iter`) via a
+    CHRONOLOGICALLY PURGED validation slice of X_fit itself, replacing
+    sklearn's own `early_stopping=True` / `validation_fraction`, which
+    carves out its internal validation rows via a RANDOM split — see
+    the module docstring's "PURGED EARLY STOPPING + BOOTSTRAP BAGGING"
+    section for why that random split leaks given this project's
+    rolling-window features (up to 200 ticks) and 15m/1h context.
+
+    Runs ONCE per GBTPolicy.fit() call, on the ORIGINAL (unshuffled)
+    X_fit/y_fit — this selects model CAPACITY, a property of the data/
+    hyperparameters, not something bagging should decorrelate across.
+    Bagged members then reuse this fixed iteration count (see fit()'s
+    bagging loop), each fit with sklearn's own early_stopping disabled.
+
+    Mechanically reproduces HGB's own early-stopping algorithm via
+    `warm_start=True` (each `set_params(max_iter=it); fit(...)` call
+    only grows the ensemble by the newly-added iterations, so this is
+    an incremental, not a from-scratch, refit each step) and manual
+    log-loss monitoring against the purged validation slice, stopping
+    after `n_iter_no_change` consecutive non-improving iterations —
+    identical stopping semantics to sklearn's internal loop, just
+    pointed at leakage-safe validation rows.
+
+    Returns
+    -------
+    int — the chosen `max_iter`. Falls back to the requested
+    `max_iter` cap (unpurged) if there isn't enough purged data to run
+    a meaningful validation loop (e.g. a short CPCV fold) — this keeps
+    fit() usable on small folds rather than crashing, at the cost of
+    losing the leakage-safety benefit for that fold only.
+    """
+    kw = dict(hgb_kwargs)
+    val_frac         = kw.pop("validation_fraction", 0.15)
+    n_iter_no_change = kw.pop("n_iter_no_change", 15)
+    tol              = kw.pop("tol", 1e-7)
+    max_total_iter   = kw.pop("max_iter", 150)
+    kw.pop("early_stopping", None)   # controlled manually below
+
+    n = len(X_fit)
+    val_size   = max(1, int(n * val_frac))
+    val_start  = n - val_size
+    purge_start = max(0, val_start - purge_ticks)
+
+    X_tr, y_tr   = X_fit[:purge_start], y_fit[:purge_start]
+    X_val, y_val = X_fit[val_start:], y_fit[val_start:]
+
+    if (len(X_tr) < min_train_rows or len(np.unique(y_tr)) < 2
+            or len(X_val) == 0 or len(np.unique(y_val)) < 1):
+        # Not enough purged data (short fold) to run a trustworthy
+        # manual validation loop — fall back to the requested cap
+        # rather than crashing or guessing.
+        return max_total_iter
+
+    try:
+        model = HistGradientBoostingClassifier(
+            early_stopping=False, warm_start=True, random_state=random_state,
+            max_iter=1, **kw,
+        )
+    except TypeError:
+        kw.pop("max_features", None)
+        model = HistGradientBoostingClassifier(
+            early_stopping=False, warm_start=True, random_state=random_state,
+            max_iter=1, **kw,
+        )
+
+    best_score, best_iter, no_improve = -np.inf, 1, 0
+    for it in range(1, max_total_iter + 1):
+        model.set_params(max_iter=it)
+        model.fit(X_tr, y_tr)
+        proba = model.predict_proba(X_val)
+        score = -log_loss(y_val, proba, labels=model.classes_)
+        if score > best_score + tol:
+            best_score, best_iter, no_improve = score, it, 0
+        else:
+            no_improve += 1
+            if no_improve >= n_iter_no_change:
+                break
+
+    return best_iter
+
+
+def _fit_hgb_base(X_fit, y_fit, random_state: int, hgb_kwargs: dict,
+                  n_iter: int = None):
     """
     Construct + fit one HistGradientBoostingClassifier member. Factored
     out of GBTPolicy.fit() so the bagging loop there can call this once
     per member with a fresh copy of hgb_kwargs (avoids one member's
     max_features-unsupported fallback silently affecting a different
     member's kwargs dict).
+
+    n_iter : when given (the normal path — see `_select_n_iterations()`
+        and the module docstring's "PURGED EARLY STOPPING" section),
+        this member is fit for EXACTLY `n_iter` boosting iterations
+        with sklearn's own (leaky, randomly-split) `early_stopping`
+        disabled — the iteration count was already chosen once, up
+        front, against a purged validation slice, so re-running
+        sklearn's internal early stopping per member would just
+        reintroduce the leak this revision removes. When None (e.g. a
+        direct/standalone caller that hasn't gone through
+        `_select_n_iterations()`), falls back to the old behaviour:
+        sklearn's own `early_stopping=True` with a random
+        `validation_fraction` split.
     """
     hgb_kwargs.setdefault("max_iter", 150)
     hgb_kwargs.setdefault("learning_rate", 0.04)
@@ -198,15 +371,27 @@ def _fit_hgb_base(X_fit, y_fit, random_state: int, hgb_kwargs: dict):
     # max_features (per-split feature subsampling) needs sklearn>=1.2;
     # degrade gracefully on older installs rather than hard-failing.
     hgb_kwargs.setdefault("max_features", 0.7)
+
+    if n_iter is not None:
+        hgb_kwargs = dict(hgb_kwargs)
+        hgb_kwargs["max_iter"] = n_iter
+        # These are meaningless once early_stopping is disabled — drop
+        # them so they don't get silently passed through unused.
+        hgb_kwargs.pop("validation_fraction", None)
+        hgb_kwargs.pop("n_iter_no_change", None)
+        early_stopping = False
+    else:
+        early_stopping = True
+
     try:
         base = HistGradientBoostingClassifier(
-            early_stopping=True, random_state=random_state, **hgb_kwargs,
+            early_stopping=early_stopping, random_state=random_state, **hgb_kwargs,
         )
         base.fit(X_fit, y_fit)
     except TypeError:
         hgb_kwargs.pop("max_features", None)
         base = HistGradientBoostingClassifier(
-            early_stopping=True, random_state=random_state, **hgb_kwargs,
+            early_stopping=early_stopping, random_state=random_state, **hgb_kwargs,
         )
         base.fit(X_fit, y_fit)
     return base
@@ -288,54 +473,89 @@ class GBTPolicy:
             min_fit_rows: int = 200,
             n_bagged_fits: int = 1,
             bag_seed_stride: int = 1000,
+            bootstrap_bags: bool = True,
             **hgb_kwargs):
         """
         Fit the base classifier on a chronological "fit" prefix, then
         calibrate on a chronological "calibration" suffix via isotonic
         regression, with an optional purge gap removed from between them.
 
-        BAGGING (n_bagged_fits, this revision): instead of a single
-        (base, calibrator) pair, fits `n_bagged_fits` independently-
-        seeded members on the SAME X_fit/y_fit and X_cal/y_cal splits
-        (random_state, random_state + bag_seed_stride, + 2*stride, ...)
-        and wraps them in _BaggedGBTModel, which averages predict_proba
-        across members at inference time. See the module docstring's
-        "BAGGED FITS" section for why: CPCV confirmation seeds were
-        shown to flip pass/fail on IDENTICAL train/test folds purely
-        from the base estimator's internal RNG, and averaging several
-        such fits is the standard remedy. n_bagged_fits=1 (the default)
-        is byte-for-byte the old single-fit behaviour. Forced to 1 for
+        BAGGING (n_bagged_fits): instead of a single (base, calibrator)
+        pair, fits `n_bagged_fits` independently-seeded members and
+        wraps them in _BaggedGBTModel, which averages predict_proba
+        across members at inference time. n_bagged_fits=1 (the default)
+        is byte-for-byte a single-fit behaviour. Forced to 1 for
         model_type="logistic" regardless of the requested value, since
         LogisticRegression(lbfgs) here is deterministic given the data
         and bagging it would just re-fit an identical model for no
         benefit.
 
-        CHANGE (overfitting fix): the fit/calibration split used to be a
-        RANDOM train_test_split (optionally stratified). X/y arrive here
-        in original tick order — train_mask/np.flatnonzero indexing in
-        main_gbt.py's run_cpcv()/run_final_training() never reorders rows
-        — so a random split let calibration rows land tick-adjacent to
-        fit rows. Because several features here have rolling lookbacks up
+        PURGED ITERATION SELECTION + BOOTSTRAP BAGGING (this revision)
+        ────────────────────────────────────────────────────────────────
+        The original seed-only bagging (vary random_state, same rows)
+        reduced but did not fix CPCV instability: confirmation seeds
+        still split 2/6 pass vs 4/6 fail (pooled PBO 52.6%), while a
+        near-minimal-capacity logistic regression on the IDENTICAL CPCV
+        paths passed 6/6 at a matching-or-better mean test avg/trade —
+        per run_logistic_baseline()'s own diagnostic logic, that's
+        evidence the GBT "genuinely has room to give back capacity"
+        rather than a broken label/regime floor. See the module
+        docstring's "PURGED EARLY STOPPING + BOOTSTRAP BAGGING" section
+        for the full reasoning; in short, two changes for model_type=
+        "hgb":
+
+          1. Boosting-iteration count (`max_iter`) is chosen ONCE, up
+             front, via `_select_n_iterations()` — a manual early-
+             stopping loop against a CHRONOLOGICALLY PURGED validation
+             slice of X_fit (purge width = `purge_ticks`, same buffer
+             used between fit/calibration below), replacing sklearn's
+             own `early_stopping=True` / `validation_fraction`, whose
+             RANDOM validation split can sit tick-adjacent to training
+             rows given this project's rolling-window features (up to
+             200 ticks) — a leak that tends to green-light MORE
+             iterations than a genuinely held-out signal would.
+          2. Each bagged member (bootstrap_bags=True, the default) is
+             then fit at that FIXED iteration count on an independent
+             BOOTSTRAP RESAMPLE (with replacement) of X_fit/y_fit,
+             rather than all members sharing the exact same rows. This
+             targets fold-specific overfitting directly — the thing
+             seed-only bagging (varying only the classifier's internal
+             RNG on identical data) could not touch — the same way a
+             random forest's trees are decorrelated. Calibration always
+             uses the REAL (non-resampled) X_cal/y_cal.
+
+        Set bootstrap_bags=False to restore the previous seed-only
+        bagging behaviour (same rows, only random_state varies) if you
+        need to reproduce prior results; iteration selection is still
+        purged either way. Ignored (no-op) for model_type="logistic".
+
+        CHANGE (overfitting fix, prior revision): the fit/calibration
+        split used to be a RANDOM train_test_split (optionally
+        stratified). X/y arrive here in original tick order —
+        train_mask/np.flatnonzero indexing in main_gbt.py's
+        run_cpcv()/run_final_training() never reorders rows — so a
+        random split let calibration rows land tick-adjacent to fit
+        rows. Because several features here have rolling lookbacks up
         to 200 ticks (see preprocessing.py) and the state can include
         15m/1h context (multi_timeframe_state.py), tick-adjacent rows
         share substantial overlapping information: the "held-out"
-        calibration split wasn't actually held out. This is precisely the
-        leak walkforward.py's purge/embargo logic exists to prevent
-        everywhere else in this codebase, so the fit/calibration split
-        now follows the same discipline: calibration is the LAST
-        `calibration_frac` of rows (chronologically), and a `purge_ticks`
-        buffer (pass walkforward.compute_required_lookback_ticks(), sized
-        to whatever CPCV/walk-forward fold this X/y came from) is dropped
+        calibration split wasn't actually held out. This is precisely
+        the leak walkforward.py's purge/embargo logic exists to
+        prevent everywhere else in this codebase, so the fit/
+        calibration split follows the same discipline: calibration is
+        the LAST `calibration_frac` of rows (chronologically), and a
+        `purge_ticks` buffer (pass
+        walkforward.compute_required_lookback_ticks(), sized to
+        whatever CPCV/walk-forward fold this X/y came from) is dropped
         from the fit set immediately before it.
 
-        Also tightened base-model regularization (max_depth, max_leaf_nodes,
-        min_samples_leaf, l2_regularization, max_features where supported)
-        — the prior defaults (depth=6, l2=1.0, no leaf/feature cap) were
-        producing >1000% train P/L against negative median test P/L in
-        CPCV (see main_gbt.py's gate output), a classic small-n/high-dim
-        (state_dim up to 122) overfitting signature for tree ensembles.
-        (`hgb_kwargs` is ignored entirely when self.model_type=="logistic"
-        — see the model_type branch below and the module docstring.)
+        Base-model regularization (max_depth, max_leaf_nodes,
+        min_samples_leaf, l2_regularization, max_features where
+        supported) is set by the caller via `hgb_kwargs` — see
+        main_gbt.py's GBT_HYPERPARAMS, now on its 5th tightening round.
+        (`hgb_kwargs` is ignored entirely when self.model_type==
+        "logistic" — see the model_type branch below and the module
+        docstring.)
 
         IMPORTANT: X/y here should already be the TRAIN-fold data from
         an outer CPCV/walk-forward split (see main_gbt.py) — this
@@ -364,6 +584,18 @@ class GBTPolicy:
             )
 
         effective_n_bags = 1 if self.model_type == "logistic" else max(1, n_bagged_fits)
+        use_bootstrap = bootstrap_bags and self.model_type == "hgb"
+
+        # Choose the boosting-iteration count ONCE (not per bagged
+        # member — see docstring above), against the ORIGINAL, un-
+        # resampled, chronologically-ordered X_fit/y_fit. Only relevant
+        # for model_type="hgb"; logistic regression has no iteration
+        # count to select.
+        n_iter = None
+        if self.model_type == "hgb":
+            n_iter = _select_n_iterations(
+                X_fit, y_fit, purge_ticks, dict(hgb_kwargs), random_state,
+            )
 
         members = []
         for b in range(effective_n_bags):
@@ -383,9 +615,26 @@ class GBTPolicy:
                     max_iter=2000, class_weight="balanced", random_state=member_seed,
                 )
                 base.fit(X_fit, y_fit)
-            else:
-                base = _fit_hgb_base(X_fit, y_fit, member_seed, dict(hgb_kwargs))
+                members.append(_calibrate_member(base, X_fit, y_fit, X_cal, y_cal))
+                continue
 
+            if use_bootstrap:
+                # Bootstrap-resample WITH REPLACEMENT for this member.
+                # Safe to shuffle order here because _select_n_iterations()
+                # already made its (order-sensitive) purged-validation
+                # decision above, on the original unshuffled data.
+                rng = np.random.default_rng(member_seed)
+                boot_idx = rng.integers(0, len(X_fit), size=len(X_fit))
+                X_fit_b, y_fit_b = X_fit[boot_idx], y_fit[boot_idx]
+            else:
+                X_fit_b, y_fit_b = X_fit, y_fit
+
+            base = _fit_hgb_base(X_fit_b, y_fit_b, member_seed, dict(hgb_kwargs),
+                                 n_iter=n_iter)
+            # Calibration always uses the REAL (non-resampled) X_fit/y_fit
+            # as its fallback and X_cal/y_cal as its primary split — never
+            # the bootstrap resample — so calibrated probabilities reflect
+            # the true data distribution, not a resampled one.
             members.append(_calibrate_member(base, X_fit, y_fit, X_cal, y_cal))
 
         self.model = _BaggedGBTModel(members)
