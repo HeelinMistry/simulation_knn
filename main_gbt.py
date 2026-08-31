@@ -23,236 +23,87 @@ Pipeline
      gate philosophy), fit the final deployable model on all data up to
      an embargo-safe cutoff, calibrate, and report reliability.
 
-CHANGES IN THIS REVISION — MULTI-SEED STABILITY CHECK
-───────────────────────────────────────────────────────
-Two back-to-back runs of the previous revision (same code, same
-pipeline) produced materially different CPCV verdicts: one run showed
-PBO=28.6% / 11 of 15 paths positive (gate PASSED), a later run on
-ostensibly the same setup showed PBO=57.1% / 9 of 14 paths positive
-(gate FAILED). Per-fold trade counts and even which paths survived the
-reliability filter (`< 15 test trades`) shifted between runs too. A
-single CPCV pass/fail is not trustworthy evidence when the result
-itself is this unstable — an edge this close to the noise floor needs
-to be confirmed across multiple independent fits, not accepted or
-rejected on one draw.
+[... prior revision history unchanged — see repository history for the
+multi-seed stability check, frozen-data, regularization rounds 1-5,
+nested threshold selection/gate confirmation, bootstrap CI, capacity
+round 4 + logistic baseline, and bagged-fits revisions ...]
 
-`run_stability_check()` now runs the FULL CPCV → threshold-sweep → gate
-pipeline once per random seed (see --seeds), and the pipeline only
-proceeds to final training if at least `--min-pass-frac` of those seeds
-independently pass the CPCV gate. Results for every seed are logged and
-saved to outcomes/gbt/stability_check.json. The seed used for the
-actual deployed CPCV summary / threshold choice / final model is picked
-as the MEDIAN of mean_test_avg_pnl across the passing seeds (or across
-all seeds if none passed and --force-final-training is used) — a
-robust central estimate rather than an arbitrary "first seed" or a
-cherry-picked best one.
-
-CHANGES IN THIS REVISION — FROZEN DATA
-───────────────────────────────────────
-The instability described above could equally have been caused by the
-underlying dataset itself changing between runs: update_master_data()
-refetches/appends new candles every call, and CPCV's group boundaries
-are ROW-COUNT based (cpcv._make_groups), so appending rows shifts which
-ticks land in which fold even with nothing else different. `--frozen-
-data` (see data_manager.py) skips the raw-file scan and loads the
-existing master CSV(s) verbatim, so repeated runs — including every
-seed inside run_stability_check() — are guaranteed to be evaluating the
-exact same dataset. This is now the recommended way to run comparisons;
-the pipeline still works without it (defaults to live refresh) for
-normal/production runs.
-
-CHANGES IN THIS REVISION — REGULARIZATION TIGHTENED FURTHER
+CHANGES IN THIS REVISION — GATE HARDENING (diagnostic-driven)
 ───────────────────────────────────────────────────────────────
-Both back-to-back runs above still showed train avg/trade of roughly
-+2–5% (hundreds-of-percent raw sums) against test avg/trade under 1%,
-even after the previous round's tightening — the model is still
-finding fold-specific structure. min_samples_leaf raised further
-(400→650), l2_regularization raised (10→14), max_features lowered
-(0.45→0.35). This does not by itself fix the seed-to-seed instability
-above (that's a data/variance problem, not purely a capacity problem),
-but it is a prerequisite: no amount of multi-seed averaging will help
-if individual fits are this overfit to their own training fold.
+A full pipeline run CONFIRMED the nested gate (5/6 seeds passed, pooled
+PASS) and then FAILED the true final holdout hard: avg/trade=-1.03%
+over 36 trades, 90% bootstrap CI entirely negative
+[-1.69%, -0.38%]. Root-cause analysis found:
 
-CHANGES IN THIS REVISION — NARROWER TRIPLE-BARRIER CONFIG
-───────────────────────────────────────────────────────────
-Several CPCV paths and the deployment holdout itself were being judged
-on very few resolved trades (some paths under 15, the holdout at
-entry_threshold=0.60 had only 2) — too few to trust the resulting
-avg/trade estimate regardless of its sign. TP_MULT/SL_MULT narrowed
-(2.0/1.0 → 1.5/0.8) and MAX_HOLDING shortened (32 → 20 ticks) so
-barriers resolve faster and a "trade" (whether triple-barrier label
-generation or simulate_pnl's non-overlapping position simulation)
-occupies less of the timeline, allowing more independent trades to be
-observed in the same holdout/fold window. This directly increases the
-sample size behind every avg/trade and win-rate statistic reported
-downstream, at the cost of somewhat smaller max profit-taking distance
-per trade.
+  (a) The gate's own numbers were already marginal when it passed —
+      pooled mean test avg/trade (+0.15%) was dwarfed by its own std
+      (0.50%, a ~0.3 signal/noise ratio), and PBO (48.6%) was 1.4
+      points from the >50% "fail" cutoff. evaluate_gate()'s three
+      checks (directional consistency, downside floor, PBO) are
+      tripwires for CLEARLY broken strategies, not for "statistically
+      indistinguishable from a coin flip" ones — nothing in the gate
+      penalized a low signal/noise ratio directly.
 
-CHANGES IN THIS REVISION — MULTI-TIMEFRAME TOGGLE FOR COMPARISON
-───────────────────────────────────────────────────────────────────
-`--no-multi-timeframe` forces ENABLE_MULTI_TIMEFRAME=False for a given
-run without editing the file, so a state_dim≈50 (4h-only) run can be
-directly compared against the full ≈122-dim multi-timeframe run using
-identical CPCV/stability machinery — useful for checking whether the
-15m/1h context is actually earning its keep versus just adding
-dimensions relative to the ~10-12k fit rows per CPCV fold.
+  (b) CPCV's C(8,2)=28 combinations dilute the most-recent group (7)
+      across 7 different test-set combinations averaged together with
+      27 others — nothing in the gate specifically asks "how does this
+      generalize to the newest, most-recently-seen regime", which is
+      exactly the question the final holdout (chronologically last 15%)
+      answers, and exactly where the model failed hardest. Path 27 in
+      the confirmation seed=7 run (test_groups=(6,7), the two most
+      recent CPCV groups) already showed this: test_avg=-2.274% on 9
+      trades — a visible red flag that got averaged away in the pooled
+      144-path statistic.
 
-CHANGES IN THIS REVISION — NESTED THRESHOLD SELECTION / GATE CONFIRMATION
-───────────────────────────────────────────────────────────────────────────
-The previous revision's run_stability_check() picked entry_threshold via
-sweep_entry_thresholds() on a seed's own CPCV test folds, then scored
-that SAME seed's gate at the chosen threshold — circular: the gate was
-confirming a threshold selected to fit the data being used to judge it.
-Symptomatically, the sweep's "winning" threshold (0.60) had the fewest
-total test trades (522) and a std_test_avg_pnl more than 3x its mean —
-the noisiest candidate of the five, selected anyway because "best
-mean/std" over a shrinking sample is exactly what multiple-comparison
-selection inflates.
+  (c) run_logistic_baseline() (near-minimal capacity) found essentially
+      the SAME weak signal as the tuned GBT (mean +0.243% vs the GBT's
+      +0.1545%, both well within one std of each other) — per that
+      function's own stated diagnostic logic, a baseline that ALSO
+      finds the identical marginal edge is evidence for a label/regime
+      explanation, not an addressable GBT-capacity problem. The
+      pipeline computed this number but never actually acted on it.
 
-Fixed by splitting seeds into two DISJOINT pools:
-  - select_threshold_nested() fits CPCV on --selection-seeds only, pools
-    every fitted path across those seeds, and sweeps entry_threshold
-    ONCE on the pooled set.
-  - confirm_gate_nested() then evaluates that fixed, already-chosen
-    threshold against CPCV paths from --confirmation-seeds — seeds the
-    threshold has never seen in any form — both per-seed (multi-seed
-    stability, same idea as the old run_stability_check) and pooled
-    across all confirmation seeds (the number reported as "the" CPCV
-    summary). The deployed model's random_state is picked as the
-    median-performing CONFIRMATION seed only.
-run_stability_check()/--seeds are kept for backward compatibility but
-are no longer called by main() — see select_threshold_nested()/
-confirm_gate_nested() below.
+Four changes address this directly, all implemented below:
 
-CHANGES IN THIS REVISION — BOOTSTRAP CI ON THE HOLDOUT RESULT
-───────────────────────────────────────────────────────────────
-run_final_training()'s holdout avg/trade point estimate (e.g.
-"-1.13% over 10 trades") was being read as a clean pass/fail fact, but
-at n=10 the standard error is comparable in magnitude to the estimate
-itself — CPCV path-level test_avg_pnl at similar sample sizes swings
-from -0.81% to +1.13%. bootstrap_ci() now resamples the holdout's own
-trade_returns to report a 90% CI alongside the point estimate, and both
-the PASS and FAIL branches print a note when that interval straddles
-(or on the FAIL side, still partly overlaps) zero, so a gate verdict on
-a small holdout isn't mistaken for a statistically confirmed result.
-The pass/fail RULE itself is unchanged (point estimate vs floor) — the
-CI is reported for interpretation, not substituted into the gate logic.
+  1. TIGHTER GATE STATISTICS (evaluate_gate()): PBO_MAX_ALLOWED lowered
+     0.50 -> 0.40, and a new MIN_TEST_SHARPE floor (0.15) on
+     mean_test_sharpe — a strategy whose signal isn't at least ~0.15
+     Sharpe-equivalent above its own noise no longer passes just
+     because it's nominally "positive".
 
-CHANGES IN THIS REVISION — CAPACITY ROUND 4 + LOGISTIC BASELINE (A/B-DRIVEN)
-───────────────────────────────────────────────────────────────────────────
-A --no-multi-timeframe A/B run (state_dim ~122 -> ~50) was used to test
-whether feature dimensionality was the dominant driver of the
-train/test gap and PBO>50% instability seen in prior runs. It wasn't:
-train_avg_pnl stayed essentially the same magnitude in the ~50-dim run
-as the ~122-dim run, while out-of-sample performance got WORSE (mean
-test avg/trade +0.196% -> +0.046%, positive paths 31/54 -> 26/54,
-0/3 confirmation seeds passing vs 1/3 before). Two conclusions follow:
-  1. ENABLE_MULTI_TIMEFRAME stays True — the 15m/1h context is
-     contributing real signal, not just extra noise dimensions.
-  2. GBT_HYPERPARAMS is tightened again (round 4), this time targeting
-     tree capacity/iteration count DIRECTLY (shallower trees, larger
-     min_samples_leaf, fewer/smaller boosting steps, higher L2) rather
-     than via feature count, since dimensionality is now ruled out as
-     the dominant lever.
-Additionally, run_logistic_baseline() (new) fits a near-minimal-capacity
-logistic regression through the exact same CPCV paths/purge/embargo/
-labels as a floor check: if even a linear model can't clear PBO<=50%
-on this state/label setup, that's evidence the instability is a label/
-regime problem rather than something further GBT tuning can fix. Runs
-automatically before threshold selection unless --skip-baseline is
-passed; is purely informational and does not gate the pipeline.
+  2. RECENT-REGIME CHECK (confirm_gate_nested()): for every confirmation
+     seed, the CPCV path whose test_groups are the LAST N_TEST_GROUPS
+     groups (the most-recently-seen regime — the closest CPCV analog to
+     the real final holdout) is pulled out of that seed's already-fitted
+     paths (no extra fitting cost — it's already in fitted_paths) and
+     scored on its own. Confirmation now additionally requires
+     RECENT_REGIME_MIN_PASS_FRAC of seeds' recent-regime path to clear
+     RECENT_REGIME_AVG_PNL_FLOOR, separate from (and stricter than) the
+     pooled/whole-CPCV floor — so a model that only works on older
+     regimes can no longer sail through on pooled/diluted statistics.
 
-CHANGES IN THIS REVISION — BAGGED FITS + WIDER CONFIRMATION POOL
-───────────────────────────────────────────────────────────────────────
-Diagnosis of the previous nested-gate run: confirmation seeds 2/3/4
-disagreed on pass/fail (1/3 passed) even though generate_cpcv_paths()'s
-train/test masks are ROW-COUNT based and therefore IDENTICAL across
-those seeds — only the classifier's internal RNG (HGB's max_features
-subsampling, early-stopping's validation carve-out) differed. That's a
-stronger instability signal than "different folds disagreed" would be:
-the verdict on the SAME evidence flips depending on fit randomness.
+  3. BASELINE-EDGE GATE (main()): the logistic-regression capacity-floor
+     check is no longer purely informational. main() now computes
+     edge = GBT pooled mean_test_avg_pnl - logistic pooled
+     mean_test_avg_pnl and requires edge > MIN_EDGE_OVER_BASELINE
+     before proceeding to final training. If the tuned GBT can't beat a
+     near-linear model by a non-trivial margin, that's the (c) signal
+     above made an actual gate condition instead of a printed aside.
 
-Two changes address this directly:
-  1. gbt_agent.py's GBTPolicy.fit() now supports `n_bagged_fits`: it
-     fits several independently-seeded members on the SAME fit/cal
-     split and averages their calibrated probabilities
-     (_BaggedGBTModel). This is threaded through run_cpcv(),
-     select_threshold_nested(), confirm_gate_nested(), and
-     run_final_training() here via DEFAULT_N_BAGGED_FITS / the new
-     --n-bagged-fits flag. Logistic-baseline fits are unaffected
-     (bagging is a no-op there — see gbt_agent.py).
-  2. DEFAULT_CONFIRMATION_SEEDS widened from 3 to 6 seeds — a 3-seed
-     pass-fraction only ever takes 3 possible values (0%, 33%, 67%,
-     100%), too coarse to tell "bagging helped" from noise. 6 seeds
-     gives a finer read on whether stability actually improved.
+  4. WIDER / CONFIGURABLE HOLDOUT (run_final_training(), CLI): holdout
+     sizing (holdout_frac) and triple-barrier resolution speed
+     (tp_mult/sl_mult/max_holding) are now CLI-overridable
+     (--holdout-frac, --tp-mult, --sl-mult, --max-holding) instead of
+     hardcoded, so the final holdout's trade count (36, at the edge of
+     what a bootstrap CI can say anything precise about) can be grown
+     without editing the file — narrower barriers / shorter max holding
+     resolve trades faster, and a larger holdout_frac widens the
+     evaluation window itself.
 
-Additionally, run_logistic_baseline() now reports PER-SEED pass/fail
-(previously pooled-only), so it can be compared apples-to-apples
-against the GBT's own per-seed confirmation breakdown — needed to
-actually tell whether the simpler model is more STABLE, not just
-whether its pooled average looks fine.
-
-CHANGES IN THIS REVISION — CAPACITY ROUND 5 + PURGED EARLY STOPPING +
-BOOTSTRAP BAGGING (DIAGNOSED FROM THE BAGGED-FITS RUN'S OWN RESULTS)
-───────────────────────────────────────────────────────────────────────
-The BAGGED FITS revision above did not fix the instability it targeted:
-confirmation still split 2/6 pass vs 4/6 fail with pooled PBO=52.6%
-(> 50%, gate FAIL), while run_logistic_baseline() on the SAME
-confirmation seeds passed 6/6 at a matching-or-better mean test
-avg/trade (+0.243% vs the GBT's +0.209%) and better positive-path
-fraction. Per run_logistic_baseline()'s own diagnostic logic: a
-passing near-minimal-capacity baseline alongside a failing GBT is
-evidence the GBT "genuinely has room to give back capacity" — i.e. a
-still-fixable capacity/overfitting problem, not a broken label/regime
-floor (which would show the baseline failing too). Per-path CPCV logs
-confirm this directly: train avg/trade sat at +0.7%-+1.4%/trade across
-hundreds of trades while test avg/trade on the SAME seed's other paths
-routinely collapsed toward zero or went negative — the standard
-train/test-gap signature of overfitting.
-
-Three changes follow directly from that diagnosis:
-
-  1. GBT_HYPERPARAMS tightened a 5th round, still targeting capacity/
-     iterations directly (as round 4 did) rather than feature count
-     (already ruled out by the --no-multi-timeframe A/B test): shallower
-     trees (max_depth 2->2, max_leaf_nodes 4->3), fewer/smaller boosting
-     steps (max_iter 80->50, learning_rate 0.02->0.015), a much larger
-     min_samples_leaf (1000->1600), higher L2 (20.0->28.0), and a lower
-     max_features (0.35->0.25).
-
-  2. gbt_agent.py's GBTPolicy.fit() no longer relies on sklearn's own
-     `early_stopping=True`/`validation_fraction`, which carves out its
-     internal validation rows via a RANDOM split of the fit data — a
-     leak given this project's rolling-window features (up to 200
-     ticks) and 15m/1h context, and one that tends to green-light MORE
-     boosting iterations than a genuinely held-out signal would. The
-     iteration count is now chosen ONCE per fit() call via a manual,
-     PURGED chronological validation slice (`_select_n_iterations()`,
-     using the same `purge_ticks` buffer already used between the fit
-     and calibration splits) — see gbt_agent.py's module docstring for
-     the full mechanism.
-
-  3. Bagged members (n_bagged_fits, still DEFAULT_N_BAGGED_FITS=5) now
-     default to fitting on an independent BOOTSTRAP RESAMPLE (with
-     replacement) of the fit rows, not the same rows with only
-     random_state varied. The previous seed-only bagging only
-     decorrelated the classifier's internal RNG (max_features
-     subsampling, the now-removed early-stopping carve-out); bootstrap
-     resampling decorrelates which ROWS each member actually trains on,
-     directly targeting fold-specific overfitting the way a random
-     forest's trees are decorrelated — see gbt_agent.py's
-     `bootstrap_bags` parameter (default True; set False to restore the
-     old seed-only behaviour).
-
-None of run_cpcv() / select_threshold_nested() / confirm_gate_nested()
-/ run_final_training() needed to change here — n_bagged_fits threading
-and purge_ticks were already plumbed through in the BAGGED FITS
-revision, and the iteration-selection + bootstrap-resampling changes
-are entirely internal to gbt_agent.py's fit(). Re-run with
---frozen-data against the SAME dataset/seed split used for the failing
-run above before drawing conclusions, so any improvement reflects
-these changes and not data drift from update_master_data() appending
-new candles between runs.
+All four are additive to the existing nested selection/confirmation
+machinery — selection/confirmation/pooled-gate logic, bagging, purged
+early stopping, etc. are unchanged; these are new necessary conditions
+layered on top.
 
 Run
 ────
@@ -263,6 +114,8 @@ Run
     python main_gbt.py --frozen-data --no-multi-timeframe            # 4h-only baseline
     python main_gbt.py --frozen-data --n-bagged-fits 5                # override bag size
     python main_gbt.py --force-final-training                        # override an unstable gate
+    python main_gbt.py --holdout-frac 0.20 --max-holding 16 \\
+                        --tp-mult 1.3 --sl-mult 0.7                   # more holdout trades, tighter CI
 """
 
 import os
@@ -297,9 +150,13 @@ ENABLE_MULTI_TIMEFRAME = True
 CONTEXT_TIMEFRAMES = ("15m", "1h")
 CONTEXT_PACES = (1, 4, 16)
 
-# Triple-barrier config (narrower this revision — see module docstring:
-# faster resolution -> more independent trades per fold/holdout window,
-# so avg/trade estimates are backed by a larger sample).
+# Triple-barrier config. Narrower than earlier revisions for more
+# independent trades per fold/holdout window (see module docstring).
+# CLI-overridable this revision (--tp-mult/--sl-mult/--max-holding) —
+# see GATE HARDENING change 4: the deployed final holdout only produced
+# 36 trades, at the edge of what a bootstrap CI can say anything
+# precise about, so these are now easy to tighten further from the
+# command line without editing the file.
 TP_MULT      = 1.5         # was 2.0
 SL_MULT      = 0.8         # was 1.0
 MAX_HOLDING  = 20          # was 32 (note: unified_executor.py's live
@@ -314,48 +171,9 @@ N_TEST_GROUPS   = 2
 MAX_PATHS       = 28
 MIN_TRAIN_TICKS = 2000
 
-# Base-model regularization (overfitting fix, round 4 — see module
-# docstring). Rounds 1-3 progressively tightened min_samples_leaf/l2/
-# max_features, aimed at reducing the state space's effective capacity
-# relative to ~10-12k fit rows per CPCV fold. A --no-multi-timeframe
-# A/B run (state_dim ~122 -> ~50) directly tested whether that
-# dimensionality was the dominant driver: it wasn't. train_avg_pnl
-# stayed at essentially the SAME magnitude (~1.7-3.5% per trade) in the
-# ~50-dim run as in the ~122-dim run, while test performance actually
-# got WORSE (mean_test_avg +0.196% -> +0.046%, positive paths 31/54 ->
-# 26/54) — i.e. the 15m/1h context was contributing real signal, and
-# cutting feature count did nothing to shrink the train/test gap that
-# was supposedly caused by dimensionality. That falsifies "too many
-# features" as the dominant cause.
-#
-# Round 4 attacked CAPACITY/ITERATIONS DIRECTLY instead of via
-# dimensionality: much shallower trees (depth 3->2, leaf nodes 8->4),
-# a much larger min_samples_leaf (650->1000), fewer/smaller boosting
-# steps (max_iter 150->80, learning_rate 0.04->0.02), and higher L2
-# (14->20) — while KEEPING the full multi-timeframe state (see
-# ENABLE_MULTI_TIMEFRAME below), since removing it measurably hurt
-# out-of-sample performance in the A/B test above.
-#
-# Round 5 (this revision — see module docstring's "CAPACITY ROUND 5"
-# section): round 4 + seed-only bagging still left confirmation at
-# 2/6 pass (pooled PBO=52.6%) while a near-minimal-capacity logistic
-# baseline passed 6/6 on the SAME seeds at a matching-or-better
-# avg/trade — clear evidence of remaining, addressable capacity, not
-# a broken label/regime floor. Tightened further, again attacking
-# capacity/iterations directly: max_leaf_nodes 4->3, max_iter 80->50,
-# learning_rate 0.02->0.015, min_samples_leaf 1000->1600,
-# l2_regularization 20.0->28.0, max_features 0.35->0.25.
-#
-# NOTE: validation_fraction/n_iter_no_change below are now only a
-# FALLBACK for standalone/direct GBTPolicy.fit() calls that skip
-# _select_n_iterations() (see gbt_agent.py's "PURGED EARLY STOPPING"
-# docstring section). The normal path through this pipeline
-# (run_cpcv/run_final_training) chooses the iteration count via a
-# manually-purged validation slice instead of sklearn's own randomly-
-# split early stopping, so these two keys are effectively unused in
-# the main pipeline — kept only so hgb_kwargs remains well-formed if
-# something calls GBTPolicy.fit() directly without going through
-# _select_n_iterations() first.
+# Base-model regularization (overfitting fix, round 4/5 — unchanged
+# this revision; see module docstring history for the full rationale
+# behind each tightening round).
 GBT_HYPERPARAMS = dict(
     max_iter=50,                # was 150 -> 80 -> 50
     learning_rate=0.015,        # was 0.04 -> 0.02 -> 0.015
@@ -363,74 +181,31 @@ GBT_HYPERPARAMS = dict(
     max_leaf_nodes=3,            # was 8 -> 4 -> 3
     min_samples_leaf=1600,       # was 650 -> 1000 -> 1600
     l2_regularization=28.0,      # was 14.0 -> 20.0 -> 28.0
-    validation_fraction=0.15,    # fallback only — see note above
-    n_iter_no_change=15,         # fallback only — see note above
+    validation_fraction=0.15,    # fallback only — see gbt_agent.py note
+    n_iter_no_change=15,         # fallback only — see gbt_agent.py note
     max_features=0.25,           # was 0.45 -> 0.35 -> 0.25
 )
 
 # ── Entry-conviction threshold sweep (CPCV-only — see module docstring) ─────
 ENTRY_THRESHOLD_CANDIDATES = (0.50, 0.55, 0.60, 0.65, 0.70)
-# A threshold whose aggregate CPCV test trade count falls below this is
-# disqualified regardless of how good its per-trade stats look — a few
-# great-looking trades on a tiny sample isn't trustworthy.
 MIN_SWEEP_TRADES = 150
-# Individual CPCV paths with fewer test trades than this are excluded
-# from the gate's per-path statistics (their avg/trade is too noisy to
-# trust even though the aggregate sweep above might still be fine).
 MIN_PATH_TEST_TRADES = 15
 
-# ── Multi-seed CPCV stability check (this revision) ──────────────────────────
+# ── Multi-seed CPCV stability check (legacy path — see run_stability_check) ──
 DEFAULT_STABILITY_SEEDS = (0, 1, 2)
 DEFAULT_MIN_PASS_FRAC   = 0.6   # >= 60% of seeds must independently pass
 
-# ── Nested threshold selection / gate confirmation (this revision) ──────────
-# PROBLEM THIS FIXES: the previous flow picked entry_threshold by sweeping
-# over CPCV test-fold performance (sweep_entry_thresholds), then evaluated
-# the CPCV "gate" on those SAME test folds at the chosen threshold. That's
-# circular — the gate was confirming a threshold that was chosen to look
-# good on exactly the data being used to judge it. Concretely, the
-# threshold=0.60 candidate in the observed run had total_test_trades=522
-# (smallest of the 5 candidates) and std_test_avg_pnl (2.09%) more than 3x
-# its mean (0.60%) — it was the noisiest candidate, and the sweep picked it
-# anyway because "best mean/std" on a shrinking, noisy sample is exactly
-# the kind of statistic multiple-comparison selection inflates.
-#
-# FIX: split seeds into two DISJOINT pools.
-#   - SELECTION_SEEDS build CPCV paths used ONLY to choose entry_threshold
-#     (sweep_entry_thresholds, pooled across all selection seeds' paths).
-#   - CONFIRMATION_SEEDS build a completely separate set of CPCV paths,
-#     never used for threshold selection, and the gate (directional
-#     consistency + downside floor + PBO) is evaluated ONLY on those, AT
-#     the already-chosen threshold (no further tuning). This makes the
-#     gate a genuine out-of-sample check on the threshold decision itself,
-#     not just on that threshold's fit to a given path's train/test split.
-# The final deployed model's random_state is picked as the median-by-
-# performance CONFIRMATION seed (never a selection seed), so the reported
-# CPCV numbers, the gate verdict, and the deployed model are all drawn
-# from the confirmation pool alone.
+# ── Nested threshold selection / gate confirmation ───────────────────────────
 DEFAULT_SELECTION_SEEDS    = (0, 1)
-# Widened from (2, 3, 4) — a 3-seed pass-fraction only takes 4 possible
-# values (0/3, 1/3, 2/3, 3/3), too coarse to distinguish "bagging fixed
-# the instability" from noise. 6 seeds gives finer resolution on the
-# per-seed stability check in confirm_gate_nested(). See module
-# docstring's "BAGGED FITS + WIDER CONFIRMATION POOL" section.
 DEFAULT_CONFIRMATION_SEEDS = (2, 3, 4, 5, 6, 7)
 
-# ── Bagged fits (this revision) ──────────────────────────────────────────────
-# Number of independently-seeded base-estimator fits GBTPolicy.fit()
-# averages together per (fold, seed) call — see gbt_agent.py's
-# "BAGGED FITS" docstring section for the full rationale. Threaded
-# through run_cpcv()/select_threshold_nested()/confirm_gate_nested()/
-# run_final_training() below and overridable via --n-bagged-fits.
-# Ignored (forced to 1) for model_type="logistic" — see gbt_agent.py.
+# ── Bagged fits ────────────────────────────────────────────────────────────
 DEFAULT_N_BAGGED_FITS = 5
 
 # ── Final holdout deployment gate ────────────────────────────────────────────
-# Distinct from VAL_AVG_TRADE_FLOOR (a CPCV-path floor): this gates the
-# actual deployable model's performance on ITS OWN held-out block, at
-# the entry_threshold that will actually be used live.
 HOLDOUT_AVG_TRADE_FLOOR = 0.0    # require a non-negative mean holdout trade
 HOLDOUT_MIN_TRADES      = 10     # fewer trades than this -> gate can't be trusted either way
+DEFAULT_HOLDOUT_FRAC    = 0.15   # CLI-overridable via --holdout-frac (GATE HARDENING change 4)
 
 # Stability gate (mirrors main_mcknn.py's philosophy — directional
 # consistency + downside floor — plus a PBO check CPCV newly enables).
@@ -441,6 +216,41 @@ HOLDOUT_MIN_TRADES      = 10     # fewer trades than this -> gate can't be trust
 # particular fold happened to generate.
 VAL_AVG_TRADE_FLOOR = -0.03
 
+# ── GATE HARDENING (this revision) ───────────────────────────────────────────
+# See module docstring's "CHANGES IN THIS REVISION — GATE HARDENING"
+# section for the full diagnosis these four constants/checks respond to.
+
+# (1) Tighter gate statistics.
+# PBO cutoff lowered from 0.50 -> 0.40: the run that triggered this
+# revision passed at PBO=48.6%, only 1.4 points from the OLD >50% fail
+# line — too close to trust. A Sharpe-like floor is new: a strategy
+# whose mean_test_sharpe (computed per-path already, previously never
+# gated on) doesn't clear this bar isn't distinguishable from noise
+# even when its mean per-trade return happens to be nominally positive.
+PBO_MAX_ALLOWED = 0.40          # was implicitly 0.50
+MIN_TEST_SHARPE = 0.15          # new — NaN (too few paths) does not fail this check
+
+# (2) Recent-regime check. The CPCV test-group combination equal to the
+# LAST N_TEST_GROUPS groups (e.g. (6, 7) when N_GROUPS=8,
+# N_TEST_GROUPS=2) is the closest CPCV analog to the real final
+# holdout (both are "the most recently observed data"). Pulled out of
+# each confirmation seed's already-fitted CPCV paths at zero extra
+# fitting cost.
+RECENT_REGIME_GROUPS         = tuple(range(N_GROUPS - N_TEST_GROUPS, N_GROUPS))
+RECENT_REGIME_AVG_PNL_FLOOR  = -0.005   # stricter than VAL_AVG_TRADE_FLOOR (-0.03) —
+                                         # this is specifically a recency-risk check
+RECENT_REGIME_MIN_TEST_TRADES = 8       # below this, that seed's recent-regime
+                                         # result is excluded (too few trades to trust)
+RECENT_REGIME_MIN_PASS_FRAC  = DEFAULT_MIN_PASS_FRAC   # reuse the same 0.6 bar
+
+# (3) Baseline-edge gate. The GBT's pooled confirmation mean test
+# avg/trade must beat the logistic-regression capacity-floor baseline's
+# pooled mean by at least this margin. The run that triggered this
+# revision had the GBT at +0.1545% vs the baseline's +0.243% — i.e. the
+# GBT did not even beat the near-linear baseline, previously reported
+# only as an informational aside.
+MIN_EDGE_OVER_BASELINE = 0.0005  # 0.05 percentage points of avg/trade
+
 OUT_DIR = "outcomes/gbt"
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -450,13 +260,11 @@ def _json_default(obj):
     Fallback encoder for json.dump(default=_json_default) calls in this
     module. numpy scalar types (np.bool_, np.int64, np.float32/64, ...)
     are not JSON-serializable even though some print/repr as if they
-    were native Python types (np.bool_'s class name is literally "bool",
-    which is what made the earlier TypeError's message read
-    "Object of type bool is not JSON serializable" and look confusing).
-    Converting the ROOT CAUSE (evaluate_gate()'s numpy comparisons) to
-    native bool/float at the source is the real fix; this is a defense-
-    in-depth net so any other numpy scalar that slips into a dict here
-    doesn't crash the run instead of just writing a slightly-off value.
+    were native Python types. Converting the ROOT CAUSE (evaluate_gate()'s
+    numpy comparisons) to native bool/float at the source is the real
+    fix; this is a defense-in-depth net so any other numpy scalar that
+    slips into a dict here doesn't crash the run instead of just writing
+    a slightly-off value.
     """
     if isinstance(obj, np.generic):
         return obj.item()
@@ -471,7 +279,10 @@ def _json_default(obj):
 
 def build_states_and_labels(frozen: bool = False,
                              enable_multi_timeframe: bool = None,
-                             context_paces: tuple = None):
+                             context_paces: tuple = None,
+                             tp_mult: float = None,
+                             sl_mult: float = None,
+                             max_holding: int = None):
     """
     Build (states, labels, prices, aligned_df) for the full dataset,
     using identical feature construction to main_mcknn.py/pre_training.py
@@ -482,17 +293,24 @@ def build_states_and_labels(frozen: bool = False,
     frozen : forwarded to data_manager.update_master_data() /
              update_all_timeframes() — if True, uses the existing master
              CSV(s) verbatim instead of refetching/appending, so repeated
-             calls (e.g. across run_stability_check()'s seeds) all see
-             the exact same dataset. See data_manager.py and this
-             module's docstring.
+             calls all see the exact same dataset.
     enable_multi_timeframe, context_paces : override the module-level
              ENABLE_MULTI_TIMEFRAME / CONTEXT_PACES constants for this
-             call only (used by --no-multi-timeframe), so a 4h-only
-             baseline can be built without editing the file.
+             call only (used by --no-multi-timeframe).
+    tp_mult, sl_mult, max_holding : override the module-level TP_MULT /
+             SL_MULT / MAX_HOLDING triple-barrier constants for this call
+             only (this revision — GATE HARDENING change 4, see
+             --tp-mult/--sl-mult/--max-holding in main()). Narrower
+             barriers / shorter max holding resolve trades faster,
+             growing the final holdout's trade count without editing
+             this file.
     """
     enable_multi_timeframe = (ENABLE_MULTI_TIMEFRAME if enable_multi_timeframe is None
                                else enable_multi_timeframe)
     context_paces = CONTEXT_PACES if context_paces is None else context_paces
+    tp_mult     = TP_MULT if tp_mult is None else tp_mult
+    sl_mult     = SL_MULT if sl_mult is None else sl_mult
+    max_holding = MAX_HOLDING if max_holding is None else max_holding
 
     df = update_master_data("4h", frozen=frozen)
     df = df[["Open_time", "Close"] + FEATURES].dropna().reset_index(drop=True)
@@ -529,11 +347,6 @@ def build_states_and_labels(frozen: bool = False,
     agg.tick = 0
     for i in range(WARMUP_IDX + 1, n):
         agg.update(ind[i])
-        # portfolio_info=None -> StateAggregator appends 2 zero dims;
-        # strip them (this is entry-decision modeling, not live position
-        # tracking — GBTAgent.select_action handles in-position CLOSE/
-        # HOLD separately via _in_position_probs, without needing
-        # portfolio features baked into the training state).
         market_vec = agg.get_state(portfolio_info=None)[:-2]
         if extra_context_arr is not None:
             state_vec = np.concatenate([market_vec, extra_context_arr[i]])
@@ -548,8 +361,8 @@ def build_states_and_labels(frozen: bool = False,
 
     labels = build_meta_labels(
         prices_aligned, atr_aligned,
-        tp_mult=TP_MULT, sl_mult=SL_MULT,
-        max_holding=MAX_HOLDING, commission=COMMISSION,
+        tp_mult=tp_mult, sl_mult=sl_mult,
+        max_holding=max_holding, commission=COMMISSION,
     )
 
     open_times = df["Open_time"].values[WARMUP_IDX + 1:]
@@ -571,23 +384,11 @@ def simulate_pnl(states: np.ndarray, labels: dict, mask: np.ndarray,
     Score the CLASSIFIER's entry decisions against the triple-barrier
     label's own ground-truth realised return, enforcing ONE OPEN
     POSITION AT A TIME (matching unified_executor.py's single-slot
-    `inventory` deque) — at each tick in `mask` that isn't still
-    "inside" a previously opened trade's holding window, take the
-    higher-probability directional class if its calibrated probability
-    exceeds `prob_threshold`, credit that tick's own long_return/
-    short_return, and then skip every tick up to and including that
-    trade's touch tick before considering another entry.
+    `inventory` deque).
 
     Returns
     -------
     (total_pnl, n_trades, avg_pnl, trade_returns)
-      total_pnl     : raw sum of realised trade returns (logging only —
-                       NOT trade-count-normalized, do not use for gating).
-      n_trades      : number of trades taken.
-      avg_pnl       : mean per-trade realised return (trade-count-
-                       independent — use this for cross-fold comparison).
-      trade_returns : list of individual trade returns, for computing
-                       a Sharpe-like stat (see run_cpcv()).
     """
     idx = np.flatnonzero(mask)
     total_pnl  = 0.0
@@ -618,13 +419,10 @@ def simulate_pnl(states: np.ndarray, labels: dict, mask: np.ndarray,
 
 
 def _sharpe_like(trade_returns: list) -> float:
-    """
-    Same formula diagnostic_gbt.py's write_summary() already uses for
-    its real tick-by-tick backtest (pnl_arr.mean() / pnl_arr.std() *
-    sqrt(n)) — kept identical here so the two pipelines' notion of
-    "risk-adjusted edge" is directly comparable. Returns NaN when there
-    are too few trades or zero variance to compute a meaningful ratio.
-    """
+    """Same formula diagnostic_gbt.py's write_summary() uses for its
+    real tick-by-tick backtest — kept identical so the two pipelines'
+    notion of "risk-adjusted edge" is directly comparable. Returns NaN
+    when there are too few trades or zero variance."""
     if len(trade_returns) < 5:
         return float("nan")
     arr = np.array(trade_returns, dtype=np.float64)
@@ -636,30 +434,7 @@ def _sharpe_like(trade_returns: list) -> float:
 
 def bootstrap_ci(trade_returns: list, n_boot: int = 10_000, ci: float = 0.90,
                  random_state: int = 0) -> dict:
-    """
-    Percentile bootstrap CI on the mean per-trade return.
-
-    WHY THIS EXISTS: a point estimate like "avg/trade=-1.13% (n=10)" reads
-    as a definitive result but isn't one — with few trades and typical
-    per-trade volatility in this pipeline (CPCV path-level test_avg_pnl
-    swings from -0.81% to +1.13% at similar sample sizes), the standard
-    error can be comparable to or larger than the point estimate itself.
-    Resampling trade_returns with replacement and taking the mean each
-    time gives an empirical distribution of "what avg/trade would plausibly
-    look like from this same underlying process", so the gate's pass/fail
-    decision can be read alongside how much that decision could have swung
-    on a slightly different sample.
-
-    Returns
-    -------
-    dict with:
-      mean       : point estimate (mean of trade_returns, matches simulate_pnl's avg_pnl)
-      ci_lo/ci_hi: (1-ci)/2 and 1-(1-ci)/2 percentiles of the bootstrap
-                   distribution of the mean (e.g. ci=0.90 -> 5th/95th pct)
-      ci_level   : the requested CI level (for display)
-      n_trades   : sample size actually used
-      note       : set when n_trades is too small for a meaningful interval
-    """
+    """Percentile bootstrap CI on the mean per-trade return."""
     n = len(trade_returns)
     if n < 2:
         return {"mean": float(np.mean(trade_returns)) if n else float("nan"),
@@ -687,32 +462,10 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
     """
     Returns (path_results, fitted_paths, valid).
 
-    random_state : forwarded to every fold's GBTAgent.fit() (which
-        passes it through to sklearn's HistGradientBoostingClassifier).
-        Exposed as a parameter (this revision) so run_stability_check()
-        can re-run the entire CPCV pass under several independent seeds
-        without touching anything else — see module docstring.
-
-    model_type, hyperparams : forwarded to GBTAgent/GBTPolicy — lets a
-        caller swap the base classifier (e.g. model_type="logistic" for
-        run_logistic_baseline()'s capacity-floor check) without
-        duplicating any of the CPCV path-generation/purge/simulate_pnl
-        machinery below. Defaults ("hgb", None -> GBT_HYPERPARAMS)
-        reproduce the exact prior behaviour.
-
-    n_bagged_fits : forwarded to GBTAgent.fit()/GBTPolicy.fit() — number
-        of independently-seeded members averaged per fold (see
-        gbt_agent.py's "BAGGED FITS" docstring section). Defaults to
-        DEFAULT_N_BAGGED_FITS when None. Ignored (forced to 1) for
-        model_type="logistic", so run_logistic_baseline() doesn't pay
-        the extra compute for a no-op.
-
-    fitted_paths: list of (CPCVPath, GBTAgent) for every path that was
-    actually fit — kept so sweep_entry_thresholds()/
-    evaluate_paths_at_threshold() can re-score the SAME fitted models
-    at different entry-probability thresholds without the cost (and
-    the subtle risk of a different random_state/early-stopping path)
-    of refitting per threshold.
+    fitted_paths is kept (and, this revision, is the mechanism the new
+    recent-regime check in confirm_gate_nested() uses — see GATE
+    HARDENING change 2) so callers can re-score the SAME fitted models
+    without refitting.
     """
     hp = GBT_HYPERPARAMS if hyperparams is None else hyperparams
     nb = DEFAULT_N_BAGGED_FITS if n_bagged_fits is None else n_bagged_fits
@@ -742,21 +495,11 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
 
         agent = GBTAgent(state_dim=states.shape[1], action_dim=ACTION_DIM,
                          model_type=model_type)
-        # purge_ticks: the calibration split GBTPolicy.fit() carves out
-        # of THIS fold's train rows is chronological (last 20% by
-        # default) — pass the same lookback_ticks used for the outer
-        # CPCV purge/embargo so that internal fit/calibration split gets
-        # an equivalent purge buffer instead of a raw random split that
-        # could leak across overlapping rolling-window lookback.
         agent.fit(states[train_mask], y[train_mask],
                   purge_ticks=lookback_ticks, random_state=random_state,
                   n_bagged_fits=nb, **hp)
         fitted_paths.append((path, agent))
 
-        # Baseline (threshold=0.5) results — used for human-readable
-        # per-path logging here only. The actual gating decision in
-        # main() uses evaluate_paths_at_threshold() at the SWEPT
-        # threshold, computed after this loop returns.
         train_pnl, n_train_trades, train_avg_pnl, train_returns = simulate_pnl(
             states, labels, train_mask, agent)
         test_pnl, n_test_trades, test_avg_pnl, test_returns = simulate_pnl(
@@ -765,9 +508,7 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
 
         path_results.append({
             "path_id": path.path_id, "test_groups": list(path.test_groups),
-            # Raw sums — logging/context only, NOT trade-count-normalized.
             "train_pnl": train_pnl, "test_pnl": test_pnl,
-            # Normalized — baseline @ threshold=0.5, context only now.
             "train_avg_pnl": train_avg_pnl, "test_avg_pnl": test_avg_pnl,
             "test_sharpe": test_sharpe,
             "n_train": int(train_mask.sum()), "n_test": int(test_mask.sum()),
@@ -786,22 +527,9 @@ def run_cpcv(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
 
 def sweep_entry_thresholds(states: np.ndarray, labels: dict, fitted_paths: list,
                            valid: np.ndarray, verbose: bool = True) -> dict:
-    """
-    Re-score every already-fitted CPCV (path, agent) at each candidate
-    entry-probability threshold — cheap, no refitting — and pick the
-    threshold that scores best OUT OF SAMPLE across CPCV test folds
-    only. The holdout block is never touched here, so the chosen
-    threshold can't leak holdout information the way hand-tuning it
-    against the final backtest would.
-
-    Score = mean(test_avg_pnl across paths) / (std(test_avg_pnl across
-    paths) + eps) — a Sharpe-like ranking across INDEPENDENT CPCV
-    paths, so a threshold with a good mean but wildly inconsistent
-    per-path results scores worse than one that's modest but reliable.
-    Thresholds whose aggregate test trade count falls below
-    MIN_SWEEP_TRADES are disqualified (score = -inf) regardless of how
-    good their stats look — too few trades to trust.
-    """
+    """Re-score every already-fitted CPCV (path, agent) at each candidate
+    entry-probability threshold and pick the threshold that scores best
+    OUT OF SAMPLE across CPCV test folds only."""
     if verbose:
         print(f"\n  Sweeping entry_threshold over {ENTRY_THRESHOLD_CANDIDATES} "
               f"across {len(fitted_paths)} fitted CPCV paths (test folds only)...")
@@ -850,10 +578,7 @@ def sweep_entry_thresholds(states: np.ndarray, labels: dict, fitted_paths: list,
 
 def evaluate_paths_at_threshold(states: np.ndarray, labels: dict, fitted_paths: list,
                                 valid: np.ndarray, threshold: float) -> list:
-    """Re-score every fitted CPCV path at `threshold` (no refitting),
-    producing the same path_results shape run_cpcv() does — this is
-    what actually gets gated/logged/saved to cpcv_summary.json, so the
-    reported CPCV numbers match the threshold that will be deployed."""
+    """Re-score every fitted CPCV path at `threshold` (no refitting)."""
     results = []
     for path, agent in fitted_paths:
         train_mask = path.train_mask & valid
@@ -874,31 +599,72 @@ def evaluate_paths_at_threshold(states: np.ndarray, labels: dict, fitted_paths: 
     return results
 
 
+def _extract_recent_regime_result(states: np.ndarray, labels: dict,
+                                  fitted_paths: list, valid: np.ndarray,
+                                  threshold: float) -> dict:
+    """
+    GATE HARDENING change 2 (this revision).
+
+    Pull the CPCV path whose test_groups equal RECENT_REGIME_GROUPS (the
+    LAST N_TEST_GROUPS groups — the most-recently-observed regime, the
+    closest CPCV analog to the real final holdout) out of an already-
+    fitted seed's `fitted_paths`, and score it on its own at `threshold`.
+    No extra model fitting — this path was already fit inside run_cpcv().
+
+    Returns None if that exact test-group combination wasn't generated
+    for this seed/dataset size (e.g. a very short dataset) — callers
+    treat that as "no recent-regime signal available for this seed"
+    rather than crashing.
+    """
+    for path, agent in fitted_paths:
+        if tuple(path.test_groups) == RECENT_REGIME_GROUPS:
+            test_mask = path.test_mask & valid
+            _, n_test_trades, test_avg_pnl, test_returns = simulate_pnl(
+                states, labels, test_mask, agent, prob_threshold=threshold)
+            return {
+                "test_groups": list(RECENT_REGIME_GROUPS),
+                "n_test_trades": n_test_trades,
+                "test_avg_pnl": test_avg_pnl,
+                "test_sharpe": _sharpe_like(test_returns),
+            }
+    return None
+
+
 def evaluate_gate(path_results: list) -> tuple:
     """
-    Pure (no I/O) gate evaluation, factored out of gate_and_summarize()
-    (this revision) so run_stability_check() can cheaply check pass/fail
-    for every seed without printing/writing a full summary each time.
+    Pure (no I/O) gate evaluation.
 
-    Applies the reliability filter (MIN_PATH_TEST_TRADES) first, exactly
-    as gate_and_summarize() does, then checks directional consistency +
-    downside floor + PBO.
+    GATE HARDENING (this revision): two of the three original checks
+    (directional consistency, downside floor) are unchanged; the PBO
+    check is now tighter (PBO_MAX_ALLOWED=0.40, was 0.50) and a NEW
+    Sharpe-floor check (MIN_TEST_SHARPE=0.15) is added — see module
+    docstring. A path set that is nominally "positive on average" but
+    whose mean test_sharpe is below the floor (a low signal/noise
+    ratio, indistinguishable from chance) now fails the gate even if
+    it would have passed the old three-check version.
+
+    Applies the reliability filter (MIN_PATH_TEST_TRADES) first, then
+    checks directional consistency + downside floor + PBO + Sharpe.
 
     Returns
     -------
     (passed: bool, stats: dict)
-      stats contains everything gate_and_summarize() needs to print/save,
-      plus the filtered path_results themselves under "reliable_paths".
     """
     reliable = [r for r in path_results if r["n_test_trades"] >= MIN_PATH_TEST_TRADES]
     excluded = [r for r in path_results if r["n_test_trades"] < MIN_PATH_TEST_TRADES]
 
     if not reliable:
+        # Pre-existing bug fixed incidentally this revision: this branch
+        # previously omitted "logit_lambda", which run_logistic_baseline()/
+        # run_stability_check() then KeyError on when NO seed produces a
+        # reliable path (e.g. an extremely conservative model). Included
+        # here for the same reason mean_test_sharpe already was.
         return False, {
             "n_total": 0, "n_pos": 0, "pbo": float("nan"),
+            "logit_lambda": float("nan"),
             "mean_test_avg_pnl": float("nan"), "std_test_avg_pnl": float("nan"),
-            "min_test_avg_pnl": float("nan"), "reliable_paths": [],
-            "excluded_paths": excluded,
+            "min_test_avg_pnl": float("nan"), "mean_test_sharpe": float("nan"),
+            "reliable_paths": [], "excluded_paths": excluded,
             "reason": "no CPCV path had >= MIN_PATH_TEST_TRADES test trades",
         }
 
@@ -912,10 +678,19 @@ def evaluate_gate(path_results: list) -> tuple:
                  for r in reliable]
     pbo_info = compute_pbo(pbo_input)
 
+    mean_test_sharpe = float(np.nanmean(sharpes)) if len(sharpes) else float("nan")
+
     directionally_consistent = bool(n_pos >= (n_total / 2))
     downside_breach = bool(test_avg_pnls.min() < VAL_AVG_TRADE_FLOOR)
-    pbo_high = bool((not np.isnan(pbo_info["pbo"])) and pbo_info["pbo"] > 0.5)
-    passed = directionally_consistent and (not downside_breach) and (not pbo_high)
+    pbo_high = bool((not np.isnan(pbo_info["pbo"])) and pbo_info["pbo"] > PBO_MAX_ALLOWED)
+    # New this revision: a Sharpe that's genuinely unmeasurable (NaN —
+    # e.g. too few paths had >=5 test trades to compute one) does NOT
+    # fail this check on its own; it's a "can't tell" case, handled by
+    # the other three checks instead. A COMPUTED Sharpe below the floor
+    # DOES fail it.
+    sharpe_low = bool((not np.isnan(mean_test_sharpe)) and mean_test_sharpe < MIN_TEST_SHARPE)
+    passed = (directionally_consistent and (not downside_breach)
+              and (not pbo_high) and (not sharpe_low))
 
     stats = {
         "n_total": n_total, "n_pos": n_pos,
@@ -925,10 +700,11 @@ def evaluate_gate(path_results: list) -> tuple:
         "mean_test_pnl_raw": float(test_pnls.mean()),
         "std_test_pnl_raw": float(test_pnls.std()),
         "min_test_pnl_raw": float(test_pnls.min()),
-        "mean_test_sharpe": float(np.nanmean(sharpes)) if len(sharpes) else float("nan"),
+        "mean_test_sharpe": mean_test_sharpe,
         "pbo": pbo_info["pbo"], "logit_lambda": pbo_info["logit_lambda"],
         "directionally_consistent": directionally_consistent,
         "downside_breach": downside_breach, "pbo_high": pbo_high,
+        "sharpe_low": sharpe_low,
         "reliable_paths": reliable, "excluded_paths": excluded,
     }
     return passed, stats
@@ -937,22 +713,9 @@ def evaluate_gate(path_results: list) -> tuple:
 def gate_and_summarize(path_results: list, entry_threshold: float = 0.5,
                        threshold_sweep: dict = None, seed: int = None,
                        write: bool = True) -> bool:
-    """
-    NORMALIZED gate: decisions are based on test_avg_pnl (mean per-trade
-    test return) and test_sharpe, not the raw trade-count-scaled
-    test_pnl sum. Raw sums are still reported for context.
-
-    Additionally applies a per-path RELIABILITY FILTER: any CPCV path
-    with fewer than MIN_PATH_TEST_TRADES test trades is excluded from
-    the gate's statistics entirely — a handful of "lucky"/"unlucky"
-    trades on a near-empty fold shouldn't be able to swing the
-    directional-consistency or PBO verdict.
-
-    path_results here is expected to already be evaluated AT
-    entry_threshold (see evaluate_paths_at_threshold()), so the gate's
-    accept/reject decision reflects the exact operating point that will
-    be deployed.
-    """
+    """NORMALIZED gate summary/report — decision logic lives in
+    evaluate_gate(); this prints/saves it. Reliability filter
+    (MIN_PATH_TEST_TRADES) applied inside evaluate_gate()."""
     if not path_results:
         print("  ⛔ No usable CPCV paths — aborting.")
         return False
@@ -978,12 +741,13 @@ def gate_and_summarize(path_results: list, entry_threshold: float = 0.5,
     print(f"  Std  test avg/trade : {stats['std_test_avg_pnl']:.4%}")
     print(f"  Min  test avg/trade : {stats['min_test_avg_pnl']:+.4%}")
     if not np.isnan(stats["mean_test_sharpe"]):
-        print(f"  Mean test Sharpe    : {stats['mean_test_sharpe']:+.3f}")
+        print(f"  Mean test Sharpe    : {stats['mean_test_sharpe']:+.3f}  "
+              f"(floor: {MIN_TEST_SHARPE:+.2f})")
     print(f"  Positive paths      : {n_pos}/{n_total}")
     print(f"  PBO                 : {stats['pbo']:.1%}  "
           f"(fraction of in-sample-good paths that disappointed "
-          f"out-of-sample — lower is better; >50% means in-sample "
-          f"selection is worse than a coin flip)")
+          f"out-of-sample — lower is better; > {PBO_MAX_ALLOWED:.0%} fails "
+          f"this gate)")
     print(f"  logit_lambda        : {stats['logit_lambda']:+.3f}  "
           f"(more negative = more systematic overfitting)")
     print(f"  [context, raw sums] mean={stats['mean_test_pnl_raw']:+.2%}  "
@@ -1002,11 +766,14 @@ def gate_and_summarize(path_results: list, entry_threshold: float = 0.5,
                 "mean_test_avg_pnl": stats["mean_test_avg_pnl"],
                 "std_test_avg_pnl": stats["std_test_avg_pnl"],
                 "min_test_avg_pnl": stats["min_test_avg_pnl"],
+                "mean_test_sharpe": stats["mean_test_sharpe"],
                 "mean_test_pnl_raw": stats["mean_test_pnl_raw"],
                 "std_test_pnl_raw": stats["std_test_pnl_raw"],
                 "min_test_pnl_raw": stats["min_test_pnl_raw"],
                 "n_paths_positive": n_pos,
                 "pbo": stats["pbo"], "logit_lambda": stats["logit_lambda"],
+                "pbo_max_allowed": PBO_MAX_ALLOWED,
+                "min_test_sharpe": MIN_TEST_SHARPE,
                 "path_results": reliable,
             }, f, indent=2, default=_json_default)
         print(f"  ✓  CPCV summary saved → {OUT_DIR}/cpcv_summary.json")
@@ -1019,8 +786,12 @@ def gate_and_summarize(path_results: list, entry_threshold: float = 0.5,
             print(f"     ✗ worst path avg/trade {stats['min_test_avg_pnl']:+.4%} "
                   f"< floor {VAL_AVG_TRADE_FLOOR:+.2%}")
         if stats["pbo_high"]:
-            print(f"     ✗ PBO={stats['pbo']:.1%} > 50% — in-sample "
+            print(f"     ✗ PBO={stats['pbo']:.1%} > {PBO_MAX_ALLOWED:.0%} — in-sample "
                   f"performance is not predictive of out-of-sample performance")
+        if stats.get("sharpe_low"):
+            print(f"     ✗ mean test Sharpe {stats['mean_test_sharpe']:+.3f} "
+                  f"< floor {MIN_TEST_SHARPE:+.2f} — signal is not "
+                  f"distinguishable from noise")
         return False
 
     print(f"\n  ✓ CPCV gate passed.")
@@ -1031,27 +802,13 @@ def gate_and_summarize(path_results: list, entry_threshold: float = 0.5,
 # Logistic regression baseline (capacity floor check)
 # ─────────────────────────────────────────────
 #
-# WHY THIS EXISTS: the --no-multi-timeframe A/B run ruled out feature
-# dimensionality as the dominant driver of GBT instability — cutting
-# state_dim from ~122 to ~50 didn't shrink train_avg_pnl at all, it
-# just made test performance worse. That leaves two live hypotheses
-# for the remaining PBO>50% instability:
-#   (a) the GBT still has more capacity than this label/feature
-#       relationship can support, even independent of dimension count
-#       (addressed by GBT_HYPERPARAMS' round-4 tightening above), or
-#   (b) the instability is inherent to the label/regime relationship
-#       itself (crypto's non-stationarity across regimes), in which
-#       case NO classifier — however regularized — will show PBO<=50%
-#       on this exact CPCV split, and the fix has to be structural
-#       (regime-conditional models, shorter re-fit windows, a smaller/
-#       more selective trading footprint) rather than more tuning.
-#
-# A near-linear model (logistic regression, effectively minimal
-# capacity) run through the EXACT SAME CPCV paths/purge/embargo/labels
-# is a cheap way to tell these apart. If logistic ALSO fails PBO<=50%,
-# that's evidence for (b) — the floor itself is broken, not the GBT's
-# capacity. If logistic passes while the GBT still fails, that's
-# evidence for (a) — the GBT genuinely has room to give back capacity.
+# GATE HARDENING (this revision): this function's output is no longer
+# purely informational — main() now uses its pooled mean_test_avg_pnl
+# as the comparison point for the new baseline-edge gate (change 3).
+# See run_logistic_baseline()'s printed verdict, which already flagged
+# this exact situation ("Baseline ALSO ... near-minimal model
+# capacity... GBT's instability [is a] label/regime explanation") but
+# previously never blocked deployment on it.
 
 def run_logistic_baseline(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
                           seeds: tuple = None) -> dict:
@@ -1059,28 +816,15 @@ def run_logistic_baseline(states: np.ndarray, labels: dict, aligned_df: pd.DataF
     Fit a plain logistic regression (via GBTAgent(model_type="logistic"))
     through the same CPCV path generation / purge-embargo / triple-
     barrier labels as the GBT pipeline, at the default entry_threshold
-    (0.5 — no threshold sweep here; this is a floor check, not a
-    deployment candidate). Pools results across `seeds` (defaults to
+    (0.5). Pools results across `seeds` (defaults to
     DEFAULT_CONFIRMATION_SEEDS, so it's directly comparable to the
     GBT's confirmation-pool numbers) and reports the same PBO / mean
-    test avg/trade / positive-path-fraction stats the GBT gate uses.
-
-    PER-SEED REPORTING (this revision): previously this only reported
-    the POOLED verdict, which can't distinguish "logistic is genuinely
-    more stable per-seed" from "logistic's pooled average happens to
-    look fine". confirm_gate_nested() already reports the GBT's own
-    per-seed pass/fail on these same confirmation seeds — this function
-    now computes the equivalent for logistic (evaluate_gate() on each
-    seed's own path_results) so the two are directly comparable. If
-    logistic is MORE stable per-seed at similar or better pooled
-    performance, that's stronger evidence the GBT's instability is a
-    fixable capacity/fit-variance problem (see gbt_agent.py's bagging)
-    rather than a broken label/regime floor; if logistic is EQUALLY
-    unstable per-seed, that points the other way (see docstring below).
+    test avg/trade / positive-path-fraction stats the GBT gate uses,
+    plus per-seed pass/fail for direct comparison against the GBT's own
+    per-seed confirmation result.
 
     Returns the pooled evaluate_gate() stats dict (with a "per_seed"
-    key added) and also writes the same information to
-    outcomes/gbt/logistic_baseline.json.
+    key added) and also writes to outcomes/gbt/logistic_baseline.json.
     """
     seeds = DEFAULT_CONFIRMATION_SEEDS if seeds is None else seeds
     print(f"\n{'#'*62}\n  LOGISTIC REGRESSION BASELINE (capacity floor check)  "
@@ -1127,9 +871,9 @@ def run_logistic_baseline(states: np.ndarray, labels: dict, aligned_df: pd.DataF
     pbo_str = f"{stats['pbo']:.1%}" if not np.isnan(stats["pbo"]) else "n/a"
     print(f"  PBO                 : {pbo_str}")
 
-    if not np.isnan(stats["pbo"]) and stats["pbo"] > 0.5:
-        print(f"\n  → Baseline ALSO fails PBO<=50% at near-minimal model "
-              f"capacity. This supports a label/regime explanation for the "
+    if not np.isnan(stats["pbo"]) and stats["pbo"] > PBO_MAX_ALLOWED:
+        print(f"\n  → Baseline ALSO fails PBO<={PBO_MAX_ALLOWED:.0%} at near-minimal "
+              f"model capacity. This supports a label/regime explanation for the "
               f"GBT's instability over a pure capacity/overfitting "
               f"explanation — further GBT regularization (or bagging) is "
               f"unlikely to be the fix by itself; consider regime-"
@@ -1139,10 +883,14 @@ def run_logistic_baseline(states: np.ndarray, labels: dict, aligned_df: pd.DataF
         print(f"\n  → Not enough reliable logistic paths to compute a PBO "
               f"verdict — treat as inconclusive, not a pass.")
     else:
-        print(f"\n  → Baseline PASSES PBO<=50% at near-minimal capacity. "
-              f"This supports treating the GBT's instability as an "
-              f"addressable capacity/fit-variance problem rather than a "
-              f"broken label/regime floor.")
+        print(f"\n  → Baseline PASSES PBO<={PBO_MAX_ALLOWED:.0%} at near-minimal "
+              f"capacity. Whether this is good news for the GBT now ALSO "
+              f"depends on whether the GBT beats this baseline by a real "
+              f"margin — see the baseline-edge gate in main() (this "
+              f"revision): a GBT that doesn't outperform this near-linear "
+              f"model by at least {MIN_EDGE_OVER_BASELINE:.2%} avg/trade is "
+              f"treated as having found the same marginal signal, not a "
+              f"GBT-specific edge.")
 
     with open(os.path.join(OUT_DIR, "logistic_baseline.json"), "w") as f:
         json.dump({
@@ -1172,34 +920,10 @@ def run_logistic_baseline(states: np.ndarray, labels: dict, aligned_df: pd.DataF
 def run_stability_check(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
                         seeds: tuple = DEFAULT_STABILITY_SEEDS,
                         min_pass_frac: float = DEFAULT_MIN_PASS_FRAC) -> tuple:
-    """
-    DEPRECATED as of the nested-selection revision — main() no longer
-    calls this. It picks entry_threshold via sweep_entry_thresholds()
-    on the SAME CPCV paths that evaluate_gate() then scores per seed,
-    so a seed's "pass" partly reflects that its own threshold was
-    chosen to fit its own test folds — see select_threshold_nested() /
-    confirm_gate_nested() below for the fix (disjoint seed pools for
-    threshold selection vs. gate confirmation). Left in place only for
-    backward compatibility with any external caller.
-
-    Run the full CPCV -> threshold-sweep -> gate pipeline once per seed
-    in `seeds`, entirely independently, and require that at least
-    `min_pass_frac` of them pass the CPCV gate before the overall
-    pipeline is allowed to proceed to final training.
-
-    This exists because two back-to-back runs of the previous revision
-    (same code, same nominal pipeline) produced flatly contradictory
-    CPCV verdicts (PBO 28.6% pass vs PBO 57.1% fail) — a single run is
-    not enough evidence either way when the result is this close to the
-    noise floor. See module docstring.
-
-    Returns
-    -------
-    (stable: bool, seed_results: list[dict])
-      seed_results[i] has keys: seed, passed, entry_threshold, plus all
-      of evaluate_gate()'s numeric stats (mean_test_avg_pnl, pbo, etc).
-      Also written to outcomes/gbt/stability_check.json.
-    """
+    """DEPRECATED as of the nested-selection revision — main() no longer
+    calls this. Left in place only for backward compatibility with any
+    external caller. See select_threshold_nested()/confirm_gate_nested()
+    for the current (nested, non-circular) flow."""
     print(f"\n{'#'*62}\n  MULTI-SEED CPCV STABILITY CHECK  "
           f"(seeds={list(seeds)}, min_pass_frac={min_pass_frac:.0%})\n{'#'*62}")
 
@@ -1237,12 +961,6 @@ def run_stability_check(states: np.ndarray, labels: dict, aligned_df: pd.DataFra
     print(f"\n{'='*62}\n  STABILITY VERDICT\n{'='*62}")
     print(f"  {n_pass}/{len(seeds)} seeds passed the CPCV gate "
           f"({frac_pass:.0%}, required >= {min_pass_frac:.0%})")
-    for r in seed_results:
-        print(f"    seed={r['seed']}  {'PASS' if r['passed'] else 'FAIL'}  "
-              f"mean_test_avg={r['mean_test_avg_pnl']:+.4%}  PBO={r['pbo']:.1%}"
-              if not np.isnan(r["pbo"]) else
-              f"    seed={r['seed']}  {'PASS' if r['passed'] else 'FAIL'}  "
-              f"mean_test_avg={r['mean_test_avg_pnl']:+.4%}  PBO=n/a")
     print(f"  → {'STABLE' if stable else 'UNSTABLE'} across seeds.")
 
     with open(os.path.join(OUT_DIR, "stability_check.json"), "w") as f:
@@ -1257,13 +975,8 @@ def run_stability_check(states: np.ndarray, labels: dict, aligned_df: pd.DataFra
 
 
 def _pick_representative_seed(seed_results: list) -> int:
-    """
-    Choose the seed to actually deploy from among run_stability_check()'s
-    results: the MEDIAN by mean_test_avg_pnl among the seeds that
-    passed (a robust central estimate, not a cherry-picked best-case
-    seed), or the median across ALL seeds if none passed (only reached
-    via --force-final-training).
-    """
+    """MEDIAN by mean_test_avg_pnl among passing seeds (or all seeds if
+    none passed) — legacy, used only by run_stability_check()."""
     passed = [r for r in seed_results if r["passed"]]
     pool = passed if passed else seed_results
     pool_sorted = sorted(pool, key=lambda r: r["mean_test_avg_pnl"])
@@ -1272,37 +985,16 @@ def _pick_representative_seed(seed_results: list) -> int:
 
 
 # ─────────────────────────────────────────────
-# Nested threshold selection + gate confirmation (this revision)
+# Nested threshold selection + gate confirmation
 # ─────────────────────────────────────────────
-#
-# See DEFAULT_SELECTION_SEEDS / DEFAULT_CONFIRMATION_SEEDS docstring
-# above for the full rationale. In one line: threshold selection and
-# gate confirmation must draw on disjoint data, or the gate is just
-# confirming a threshold that was chosen to fit it.
 
 def select_threshold_nested(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
                             selection_seeds: tuple = DEFAULT_SELECTION_SEEDS,
                             n_bagged_fits: int = None) -> dict:
-    """
-    Fit CPCV paths for every seed in `selection_seeds`, POOL all of
+    """Fit CPCV paths for every seed in `selection_seeds`, POOL all of
     their fitted (path, agent) pairs together, and run
-    sweep_entry_thresholds() ONCE on the pooled set.
-
-    Pooling (rather than sweeping per-seed and averaging the chosen
-    thresholds) means the sweep's own eligibility filter
-    (MIN_SWEEP_TRADES) and mean/std statistics are computed over the
-    combined trade count across all selection seeds — a threshold that
-    only looks good in one seed's idiosyncratic path split gets diluted
-    by the others, rather than each seed independently overweighting
-    whatever the noisiest-but-highest-scoring candidate happened to be
-    for it.
-
-    Returns
-    -------
-    dict: {"chosen_threshold", "candidates", "selection_seeds",
-           "n_selection_paths"} — everything needed to log/save the
-    selection step separately from the confirmation step below.
-    """
+    sweep_entry_thresholds() ONCE on the pooled set. Unchanged this
+    revision."""
     print(f"\n{'#'*62}\n  THRESHOLD SELECTION  (selection_seeds={list(selection_seeds)})"
           f"\n{'#'*62}")
     pooled_fitted_paths = []
@@ -1333,35 +1025,52 @@ def confirm_gate_nested(states: np.ndarray, labels: dict, aligned_df: pd.DataFra
                         n_bagged_fits: int = None) -> dict:
     """
     Evaluate the ALREADY-CHOSEN `entry_threshold` (no further tuning)
-    against CPCV paths built from `confirmation_seeds` — seeds that
-    were never used in select_threshold_nested(). This is the genuine
-    out-of-sample check on the threshold decision: every one of these
-    paths' test folds is data the threshold has not seen in any form.
+    against CPCV paths built from `confirmation_seeds`.
 
-    Runs the gate (directional consistency + downside floor + PBO)
-    independently per confirmation seed AND on the pooled confirmation
-    set, and requires >= min_pass_frac of the per-seed gates to pass —
-    same multi-seed stability logic as the old run_stability_check(),
-    just applied after threshold selection instead of interleaved
-    with it.
+    GATE HARDENING (this revision, change 2): in addition to the
+    existing per-seed gate + pooled gate, this now ALSO extracts and
+    scores the "recent regime" CPCV path (test_groups ==
+    RECENT_REGIME_GROUPS — the last N_TEST_GROUPS groups, the closest
+    CPCV analog to the real final holdout) from every confirmation
+    seed's already-fitted paths, at zero extra fitting cost. A seed's
+    recent-regime result "passes" if it has >= RECENT_REGIME_MIN_TEST_TRADES
+    trades AND test_avg_pnl > RECENT_REGIME_AVG_PNL_FLOOR (stricter than
+    the pooled/whole-CPCV floor — this is specifically a recency-risk
+    check). Overall confirmation now additionally requires
+    RECENT_REGIME_MIN_PASS_FRAC of seeds' recent-regime results to pass.
+
+    This directly targets the diagnosed failure mode: the pooled/whole-
+    CPCV statistics diluted a badly-negative recent-regime path (e.g.
+    test_groups=(6,7): test_avg=-2.274% on 9 trades in the run that
+    triggered this revision) across 27 other, mostly-fine paths. The
+    recent-regime check can no longer be out-voted by older regimes.
 
     Returns
     -------
     dict with:
-      passed             : bool, overall confirmation verdict
-      frac_pass          : fraction of confirmation seeds that passed individually
-      per_seed           : list of per-seed {seed, passed, stats}
-      pooled_stats        : evaluate_gate() stats on ALL confirmation
-                             paths pooled together (the number reported
-                             as "the" CPCV summary for this threshold)
-      pooled_path_results : the pooled, threshold-evaluated path_results
-                             (for gate_and_summarize()/json export)
+      passed               : bool, overall confirmation verdict (now
+                              requires per-seed stability AND pooled gate
+                              AND recent-regime stability)
+      frac_pass             : fraction of confirmation seeds that passed
+                               the whole-CPCV gate individually
+      per_seed              : list of per-seed {seed, passed, stats}
+      pooled_stats           : evaluate_gate() stats on ALL confirmation
+                                paths pooled together
+      pooled_path_results    : the pooled, threshold-evaluated
+                                path_results (for gate_and_summarize())
+      recent_regime_per_seed : list of per-seed recent-regime results
+                                (or None where unavailable)
+      recent_regime_frac_pass: fraction of seeds with an available
+                                recent-regime result that passed it
+      recent_regime_stable   : bool, recent_regime_frac_pass >=
+                                RECENT_REGIME_MIN_PASS_FRAC
     """
     print(f"\n{'#'*62}\n  GATE CONFIRMATION  (confirmation_seeds={list(confirmation_seeds)}, "
           f"entry_threshold={entry_threshold:.2f})\n{'#'*62}")
 
     per_seed = []
     pooled_path_results = []
+    recent_regime_per_seed = []
     for seed in confirmation_seeds:
         print(f"\n{'-'*62}\n  [confirmation] seed {seed}\n{'-'*62}")
         _, fitted_paths, valid = run_cpcv(states, labels, aligned_df, random_state=seed,
@@ -1376,6 +1085,7 @@ def confirm_gate_nested(states: np.ndarray, labels: dict, aligned_df: pd.DataFra
             "n_total": stats["n_total"], "n_pos": stats.get("n_pos", 0),
             "mean_test_avg_pnl": stats["mean_test_avg_pnl"],
             "min_test_avg_pnl": stats["min_test_avg_pnl"],
+            "mean_test_sharpe": stats.get("mean_test_sharpe", float("nan")),
             "pbo": stats["pbo"],
         })
         status = "PASS" if passed else "FAIL"
@@ -1384,29 +1094,70 @@ def confirm_gate_nested(states: np.ndarray, labels: dict, aligned_df: pd.DataFra
               f"mean_test_avg={stats['mean_test_avg_pnl']:+.4%}  "
               f"positive={stats.get('n_pos', 0)}/{stats['n_total']}  PBO={pbo_str}")
 
+        # ── Recent-regime check (this revision) — reuses fitted_paths,
+        #    no additional model fitting. ─────────────────────────────
+        recent = _extract_recent_regime_result(states, labels, fitted_paths,
+                                               valid, entry_threshold)
+        if recent is not None:
+            recent["seed"] = seed
+            recent["reliable"] = recent["n_test_trades"] >= RECENT_REGIME_MIN_TEST_TRADES
+            recent["recent_regime_passed"] = bool(
+                recent["reliable"] and recent["test_avg_pnl"] > RECENT_REGIME_AVG_PNL_FLOOR
+            )
+            rr_status = ("PASS" if recent["recent_regime_passed"] else
+                         "FAIL" if recent["reliable"] else "SKIP (too few trades)")
+            print(f"  [confirmation] seed {seed} RECENT REGIME "
+                  f"{RECENT_REGIME_GROUPS}: {rr_status}  "
+                  f"test_avg={recent['test_avg_pnl']:+.4%}  "
+                  f"n_trades={recent['n_test_trades']}")
+        else:
+            print(f"  [confirmation] seed {seed} RECENT REGIME "
+                  f"{RECENT_REGIME_GROUPS}: not available (path not "
+                  f"generated for this dataset size)")
+        recent_regime_per_seed.append(recent)
+
     n_pass = sum(r["passed"] for r in per_seed)
     frac_pass = n_pass / len(confirmation_seeds)
     per_seed_stable = frac_pass >= min_pass_frac
 
-    # Pooled verdict: the same threshold's paths across ALL confirmation
-    # seeds, evaluated together — this is the number that gets reported
-    # as "the" CPCV summary (more paths -> more stable statistics than
-    # any single confirmation seed alone).
     pooled_passed, pooled_stats = evaluate_gate(pooled_path_results)
 
-    overall_passed = per_seed_stable and pooled_passed
+    # ── Recent-regime stability across seeds ───────────────────────────
+    rr_reliable = [r for r in recent_regime_per_seed if r is not None and r["reliable"]]
+    if rr_reliable:
+        rr_n_pass = sum(1 for r in rr_reliable if r["recent_regime_passed"])
+        recent_regime_frac_pass = rr_n_pass / len(rr_reliable)
+    else:
+        rr_n_pass = 0
+        recent_regime_frac_pass = float("nan")
+    recent_regime_stable = (not np.isnan(recent_regime_frac_pass)
+                            and recent_regime_frac_pass >= RECENT_REGIME_MIN_PASS_FRAC)
+
+    overall_passed = per_seed_stable and pooled_passed and recent_regime_stable
 
     print(f"\n{'='*62}\n  GATE CONFIRMATION VERDICT\n{'='*62}")
     print(f"  Per-seed: {n_pass}/{len(confirmation_seeds)} confirmation seeds passed "
           f"({frac_pass:.0%}, required >= {min_pass_frac:.0%})")
+    pooled_pbo_str = (f"{pooled_stats['pbo']:.1%}" if not np.isnan(pooled_stats['pbo'])
+                      else "n/a")
     print(f"  Pooled ({pooled_stats['n_total']} reliable paths across all confirmation "
           f"seeds): {'PASS' if pooled_passed else 'FAIL'}  "
           f"mean_test_avg={pooled_stats['mean_test_avg_pnl']:+.4%}  "
           f"positive={pooled_stats.get('n_pos', 0)}/{pooled_stats['n_total']}  "
-          f"PBO={pooled_stats['pbo']:.1%}" if not np.isnan(pooled_stats['pbo'])
-          else f"  Pooled: {'PASS' if pooled_passed else 'FAIL'}  PBO=n/a")
+          f"PBO={pooled_pbo_str}")
+    if rr_reliable:
+        print(f"  Recent regime {RECENT_REGIME_GROUPS} (this revision): "
+              f"{rr_n_pass}/{len(rr_reliable)} seeds passed "
+              f"({recent_regime_frac_pass:.0%}, required >= "
+              f"{RECENT_REGIME_MIN_PASS_FRAC:.0%})  "
+              f"— {'STABLE' if recent_regime_stable else 'UNSTABLE'}")
+    else:
+        print(f"  Recent regime {RECENT_REGIME_GROUPS}: no seed produced a "
+              f"reliable result (>= {RECENT_REGIME_MIN_TEST_TRADES} trades) — "
+              f"treated as UNSTABLE (cannot confirm recency risk is absent).")
     print(f"  → {'CONFIRMED' if overall_passed else 'NOT CONFIRMED'} "
-          f"(requires both per-seed stability AND a passing pooled gate)")
+          f"(requires per-seed stability AND a passing pooled gate AND "
+          f"recent-regime stability)")
 
     with open(os.path.join(OUT_DIR, "nested_gate_confirmation.json"), "w") as f:
         json.dump({
@@ -1416,6 +1167,12 @@ def confirm_gate_nested(states: np.ndarray, labels: dict, aligned_df: pd.DataFra
             "n_pass": n_pass, "frac_pass": frac_pass,
             "per_seed_stable": per_seed_stable,
             "pooled_passed": bool(pooled_passed),
+            "recent_regime_groups": list(RECENT_REGIME_GROUPS),
+            "recent_regime_avg_pnl_floor": RECENT_REGIME_AVG_PNL_FLOOR,
+            "recent_regime_min_test_trades": RECENT_REGIME_MIN_TEST_TRADES,
+            "recent_regime_per_seed": recent_regime_per_seed,
+            "recent_regime_frac_pass": recent_regime_frac_pass,
+            "recent_regime_stable": bool(recent_regime_stable),
             "overall_passed": bool(overall_passed),
             "per_seed": per_seed,
             "pooled_stats": {k: v for k, v in pooled_stats.items()
@@ -1427,15 +1184,15 @@ def confirm_gate_nested(states: np.ndarray, labels: dict, aligned_df: pd.DataFra
         "passed": overall_passed, "frac_pass": frac_pass,
         "per_seed": per_seed, "pooled_stats": pooled_stats,
         "pooled_path_results": pooled_path_results,
+        "recent_regime_per_seed": recent_regime_per_seed,
+        "recent_regime_frac_pass": recent_regime_frac_pass,
+        "recent_regime_stable": recent_regime_stable,
     }
 
 
 def _pick_representative_confirmation_seed(per_seed: list) -> int:
-    """
-    Same MEDIAN-by-performance logic as _pick_representative_seed(),
-    restricted to confirmation seeds only, so the deployed model's
-    random_state is never a seed that was used for threshold selection.
-    """
+    """Same MEDIAN-by-performance logic as _pick_representative_seed(),
+    restricted to confirmation seeds only."""
     passed = [r for r in per_seed if r["passed"]]
     pool = passed if passed else per_seed
     pool_sorted = sorted(pool, key=lambda r: r["mean_test_avg_pnl"])
@@ -1449,25 +1206,26 @@ def _pick_representative_confirmation_seed(per_seed: list) -> int:
 
 def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
                        entry_threshold: float = 0.5, random_state: int = 0,
-                       n_bagged_fits: int = None):
+                       n_bagged_fits: int = None,
+                       holdout_frac: float = None):
     """Train the deployable model on all rows except the most recent
     embargo-safe holdout block, then report calibration on that holdout.
 
-    n_bagged_fits : forwarded to GBTAgent.fit() so the DEPLOYED model
-        benefits from the same variance-averaging used during CPCV/
-        gate confirmation (default: DEFAULT_N_BAGGED_FITS when None) —
-        see gbt_agent.py's "BAGGED FITS" docstring section.
+    holdout_frac : GATE HARDENING change 4 (this revision) — was
+        hardcoded to 0.15; now a parameter (CLI-overridable via
+        --holdout-frac) defaulting to DEFAULT_HOLDOUT_FRAC. The run
+        that triggered this revision's changes produced only 36 holdout
+        trades (a 90% bootstrap CI of [-1.69%, -0.38%] — informative,
+        but not tight); widening the holdout window, or narrowing
+        TP_MULT/SL_MULT/MAX_HOLDING via their own new CLI flags,
+        directly grows this sample.
 
-    entry_threshold: the value chosen by main()'s CPCV-only sweep
-    (sweep_entry_thresholds()) — baked into the saved GBTAgent so live
-    inference (get_action()) uses the same operating point this
-    function evaluates on the holdout, and used here to score the
-    holdout P/L that DEPLOYMENT GATING (below) decides on.
+    n_bagged_fits : forwarded to GBTAgent.fit().
+
+    entry_threshold: the value chosen by main()'s CPCV-only sweep.
 
     random_state : the representative seed chosen by
-        _pick_representative_seed() from run_stability_check() (this
-        revision) — so the DEPLOYED model corresponds to a specific,
-        reported, reproducible fit rather than an arbitrary default.
+        _pick_representative_confirmation_seed().
 
     DEPLOYMENT GATE: CPCV/stability passing is necessary but not
     sufficient — this function additionally requires the trained
@@ -1478,9 +1236,10 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
     filename, and any previously deployed gbt_agent_best.joblib is left
     untouched.
     """
+    holdout_frac = DEFAULT_HOLDOUT_FRAC if holdout_frac is None else holdout_frac
+
     n = len(states)
     lookback_ticks = compute_required_lookback_ticks()
-    holdout_frac = 0.15
     holdout_start = int(n * (1 - holdout_frac))
     embargo_start = max(0, holdout_start - lookback_ticks)
 
@@ -1496,6 +1255,7 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
     print(f"\n  Final train: {train_mask.sum():,} rows  |  "
           f"Holdout: {holdout_mask.sum():,} rows  |  "
           f"embargo: {holdout_start - embargo_start} rows  |  "
+          f"holdout_frac: {holdout_frac:.2f}  |  "
           f"entry_threshold: {entry_threshold:.2f}  |  random_state: {random_state}  |  "
           f"n_bagged_fits: {nb}")
 
@@ -1539,12 +1299,6 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
           f"({n_trades} trades, avg/trade={avg_pnl:+.4%})  "
           f"@ entry_threshold={entry_threshold:.2f}")
 
-    # ── BOOTSTRAP CI on avg/trade ─────────────────────────────────────
-    # A point estimate on n_trades this small can't be trusted at face
-    # value — see bootstrap_ci()'s docstring. This resamples the SAME
-    # trade_returns to show how much the point estimate could plausibly
-    # swing, so a gate verdict can be read alongside its own uncertainty
-    # rather than as a clean binary fact.
     ci = bootstrap_ci(trade_returns, ci=0.90, random_state=random_state)
     if not np.isnan(ci["ci_lo"]):
         straddles_zero = ci["ci_lo"] < 0 < ci["ci_hi"]
@@ -1556,17 +1310,11 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
     else:
         print(f"  Bootstrap CI unavailable — {ci.get('note', 'insufficient trades')}")
 
-    # ── DEPLOYMENT GATE ──────────────────────────────────────────────
-    # Gate decision itself is unchanged (point estimate vs floor,
-    # n_trades vs min) — the CI is reported for interpretability, not
-    # substituted into the pass/fail rule, so behaviour for existing
-    # callers/checkpoints doesn't silently change. Read the CI alongside
-    # the verdict below rather than treating the verdict as dispositive
-    # when the interval straddles zero.
     deploy_ok = (n_trades >= HOLDOUT_MIN_TRADES) and (avg_pnl > HOLDOUT_AVG_TRADE_FLOOR)
 
     gate_status = {
         "entry_threshold": entry_threshold, "random_state": random_state,
+        "holdout_frac": holdout_frac,
         "holdout_avg_pnl": avg_pnl, "holdout_total_pnl_raw": test_pnl,
         "holdout_n_trades": n_trades,
         "holdout_avg_trade_floor": HOLDOUT_AVG_TRADE_FLOOR,
@@ -1603,9 +1351,9 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
         print(f"     Saved as CANDIDATE ONLY → {save_path}. Any existing "
               f"gbt_agent_best.joblib was left untouched — the pipeline will "
               f"not silently deploy a model that lost money on its own holdout.")
-        print(f"     Consider: shortening MAX_HOLDING further / narrowing "
-              f"TP_MULT-SL_MULT more (more holdout trades), lowering "
-              f"HOLDOUT_MIN_TRADES only if you also raise holdout_frac, or "
+        print(f"     Consider: --max-holding / --tp-mult / --sl-mult (more "
+              f"holdout trades), --holdout-frac (wider window), lowering "
+              f"HOLDOUT_MIN_TRADES only if you also raise --holdout-frac, or "
               f"gathering more data.")
 
 
@@ -1615,24 +1363,26 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
 
 def main():
     import argparse
+    # Declared at the top of main() (must precede any use of these names
+    # in this function, including as argparse defaults below) since
+    # they're reassigned from CLI overrides further down.
+    global PBO_MAX_ALLOWED, MIN_TEST_SHARPE, MIN_EDGE_OVER_BASELINE
+
     parser = argparse.ArgumentParser(description="Calibrated GBT meta-labeling pipeline")
     parser.add_argument("--force-final-training", action="store_true",
-                        help="Proceed to final training even if the multi-seed "
-                             "stability check and/or CPCV gate flags the result "
-                             "as unstable.")
+                        help="Proceed to final training even if the nested gate "
+                             "confirmation (per-seed + pooled + recent-regime) "
+                             "and/or the baseline-edge check flags the result "
+                             "as unstable/insufficiently better than the "
+                             "logistic baseline.")
     parser.add_argument("--frozen-data", action="store_true",
                         help="Use the existing master CSV(s) as-is instead of "
-                             "refetching/appending new raw data. Strongly "
-                             "recommended whenever comparing two runs (e.g. "
-                             "hyperparameter changes, the stability check's own "
-                             "seeds) so the dataset itself isn't also changing.")
+                             "refetching/appending new raw data.")
     parser.add_argument("--selection-seeds", type=int, nargs="+",
                         default=list(DEFAULT_SELECTION_SEEDS),
                         help="Seeds used ONLY to choose entry_threshold "
                              "(default: %(default)s). Must be disjoint from "
-                             "--confirmation-seeds or the gate stops being a "
-                             "genuine out-of-sample check — see module "
-                             "docstring on nested selection/confirmation.")
+                             "--confirmation-seeds.")
     parser.add_argument("--confirmation-seeds", type=int, nargs="+",
                         default=list(DEFAULT_CONFIRMATION_SEEDS),
                         help="Seeds used ONLY to confirm the gate at the "
@@ -1641,39 +1391,74 @@ def main():
                              "%(default)s). Never used for threshold selection.")
     parser.add_argument("--min-pass-frac", type=float, default=DEFAULT_MIN_PASS_FRAC,
                         help="Fraction of confirmation seeds that must "
-                             "independently pass the CPCV gate for the "
+                             "independently pass the CPCV gate (and, this "
+                             "revision, the recent-regime check) for the "
                              "pipeline to proceed to final training "
                              "(default: %(default)s).")
     parser.add_argument("--no-multi-timeframe", action="store_true",
                         help="Disable 15m/1h context (state_dim ~50 instead of "
-                             "~122) for this run, to compare against the full "
-                             "multi-timeframe state using identical CPCV/"
-                             "stability machinery. NOTE: a prior A/B run showed "
-                             "this makes out-of-sample results worse, not "
-                             "better — kept only for further comparison, not "
-                             "recommended as the default.")
+                             "~122) for this run.")
     parser.add_argument("--skip-baseline", action="store_true",
                         help="Skip the logistic-regression capacity-floor "
-                             "check (run_logistic_baseline) that otherwise "
-                             "runs automatically before threshold selection. "
-                             "Skipping saves ~1 CPCV pass per confirmation "
-                             "seed but loses the capacity-vs-label/regime "
-                             "diagnostic signal — see run_logistic_baseline()'s "
-                             "docstring.")
+                             "check. NOTE (this revision): skipping this also "
+                             "skips the baseline-edge gate (change 3) — with "
+                             "--skip-baseline, the pipeline can no longer "
+                             "verify the GBT beats a near-linear model, so "
+                             "that check is silently treated as passed. Only "
+                             "skip for quick iteration, not for a run whose "
+                             "verdict you intend to trust.")
     parser.add_argument("--n-bagged-fits", type=int, default=DEFAULT_N_BAGGED_FITS,
                         help="Number of independently-seeded base-estimator "
-                             "fits to average per (fold, seed) — see "
-                             "gbt_agent.py's 'BAGGED FITS' docstring section "
-                             "(default: %(default)s). Increases CPCV/"
-                             "confirmation/final-training compute roughly "
-                             "linearly; ignored (forced to 1) for the "
-                             "logistic baseline, which is deterministic.")
+                             "fits to average per (fold, seed) (default: "
+                             "%(default)s).")
+    # ── GATE HARDENING (this revision) — new CLI overrides ──────────────
+    parser.add_argument("--holdout-frac", type=float, default=DEFAULT_HOLDOUT_FRAC,
+                        help="Fraction of the dataset (chronologically last) "
+                             "held out for final deployment gating (default: "
+                             "%(default)s). Widen this to get more holdout "
+                             "trades / a tighter bootstrap CI at the cost of "
+                             "less final-training data.")
+    parser.add_argument("--tp-mult", type=float, default=TP_MULT,
+                        help="Triple-barrier take-profit multiplier (default: "
+                             "%(default)s). Lower = barriers resolve faster = "
+                             "more independent trades per window.")
+    parser.add_argument("--sl-mult", type=float, default=SL_MULT,
+                        help="Triple-barrier stop-loss multiplier (default: "
+                             "%(default)s).")
+    parser.add_argument("--max-holding", type=int, default=MAX_HOLDING,
+                        help="Triple-barrier vertical (time) barrier in ticks "
+                             "(default: %(default)s). Shorter = faster "
+                             "resolution = more trades per window.")
+    parser.add_argument("--pbo-max-allowed", type=float, default=PBO_MAX_ALLOWED,
+                        help="Gate fails if PBO exceeds this fraction "
+                             "(default: %(default)s, was implicitly 0.50 "
+                             "before this revision).")
+    parser.add_argument("--min-test-sharpe", type=float, default=MIN_TEST_SHARPE,
+                        help="Gate fails if mean_test_sharpe (when computable) "
+                             "is below this floor (default: %(default)s, new "
+                             "this revision).")
+    parser.add_argument("--min-edge-over-baseline", type=float,
+                        default=MIN_EDGE_OVER_BASELINE,
+                        help="Minimum required margin (in avg/trade, "
+                             "fractional) by which the GBT's pooled "
+                             "confirmation mean must beat the logistic "
+                             "baseline's pooled mean (default: %(default)s, "
+                             "new this revision — see run_logistic_baseline()).")
     args = parser.parse_args()
+
+    # Module-level constants that evaluate_gate()/confirm_gate_nested()
+    # read directly are overridden here (rather than threaded as
+    # parameters through every call) so existing callers/imports of
+    # this module keep working unchanged when these flags aren't passed.
+    PBO_MAX_ALLOWED = args.pbo_max_allowed
+    MIN_TEST_SHARPE = args.min_test_sharpe
+    MIN_EDGE_OVER_BASELINE = args.min_edge_over_baseline
 
     print("Building states + triple-barrier labels...")
     states, labels, prices, aligned_df = build_states_and_labels(
         frozen=args.frozen_data,
         enable_multi_timeframe=(False if args.no_multi_timeframe else None),
+        tp_mult=args.tp_mult, sl_mult=args.sl_mult, max_holding=args.max_holding,
     )
     print(f"  {len(states):,} rows  |  state_dim={states.shape[1]}")
     n_long  = int((labels["best_action"] == 0).sum())
@@ -1687,22 +1472,20 @@ def main():
     if overlap:
         raise ValueError(
             f"--selection-seeds and --confirmation-seeds share seed(s) "
-            f"{sorted(overlap)} — they must be disjoint, otherwise the gate "
-            f"is partly confirming a threshold against data it was chosen "
-            f"on. Pick non-overlapping seed lists."
+            f"{sorted(overlap)} — they must be disjoint. Pick non-overlapping "
+            f"seed lists."
         )
 
-    # ── STEP -1 — logistic regression capacity-floor check (informational
-    #    only; does not gate the pipeline) — see run_logistic_baseline()'s
-    #    docstring for why this was added after the --no-multi-timeframe
-    #    A/B run ruled out dimensionality as the dominant overfitting
-    #    cause. Runs on the confirmation seeds so its PBO/mean-avg numbers
-    #    are directly comparable to the GBT's own confirmation-pool
-    #    numbers reported later in this run. ─────────────────────────────
+    # ── STEP -1 — logistic regression capacity-floor check. This
+    #    revision: its pooled mean is now ALSO used below for the
+    #    baseline-edge gate (change 3), not just printed. ─────────────────
+    baseline_stats = None
     if not args.skip_baseline:
-        run_logistic_baseline(states, labels, aligned_df, seeds=confirmation_seeds)
+        baseline_stats = run_logistic_baseline(states, labels, aligned_df,
+                                               seeds=confirmation_seeds)
     else:
-        print("\n  ⏭  Skipping logistic-regression baseline (--skip-baseline).")
+        print("\n  ⏭  Skipping logistic-regression baseline (--skip-baseline). "
+              "The baseline-edge gate will be treated as passed.")
 
     # ── STEP 0 — nested threshold selection (selection seeds only) ────────
     selection = select_threshold_nested(states, labels, aligned_df,
@@ -1711,31 +1494,65 @@ def main():
     entry_threshold = selection["chosen_threshold"]
 
     # ── STEP 1 — gate confirmation (confirmation seeds only, disjoint
-    #    from selection; threshold is fixed here, not re-tuned) ───────────
+    #    from selection; threshold is fixed here, not re-tuned). This
+    #    revision: now also includes the recent-regime check. ────────────
     confirmation = confirm_gate_nested(
         states, labels, aligned_df, entry_threshold=entry_threshold,
         confirmation_seeds=confirmation_seeds, min_pass_frac=args.min_pass_frac,
         n_bagged_fits=args.n_bagged_fits,
     )
 
-    # Save the pooled confirmation result in the same shape/location
-    # gate_and_summarize() used to (cpcv_summary.json), so downstream
-    # tooling (diagnostic_gbt.py etc.) that reads that file keeps working.
     gate_and_summarize(
         confirmation["pooled_path_results"], entry_threshold=entry_threshold,
         threshold_sweep=selection, seed=None, write=True,
     )
 
-    if not confirmation["passed"] and not args.force_final_training:
-        print("\n  Re-run with --force-final-training to override the "
-              "nested selection/confirmation gate.")
+    # ── STEP 1.5 — baseline-edge gate (this revision, GATE HARDENING
+    #    change 3). The GBT's pooled confirmation mean must beat the
+    #    logistic baseline's pooled mean by MIN_EDGE_OVER_BASELINE. ──────
+    baseline_edge_ok = True
+    edge = None
+    if baseline_stats is not None:
+        gbt_mean = confirmation["pooled_stats"]["mean_test_avg_pnl"]
+        baseline_mean = baseline_stats["mean_test_avg_pnl"]
+        edge = gbt_mean - baseline_mean
+        baseline_edge_ok = edge > MIN_EDGE_OVER_BASELINE
+        print(f"\n{'='*62}\n  BASELINE-EDGE GATE (this revision)\n{'='*62}")
+        print(f"  GBT pooled mean test avg/trade      : {gbt_mean:+.4%}")
+        print(f"  Logistic baseline pooled mean        : {baseline_mean:+.4%}")
+        print(f"  Edge (GBT - baseline)                : {edge:+.4%}  "
+              f"(required > {MIN_EDGE_OVER_BASELINE:+.4%})")
+        if baseline_edge_ok:
+            print(f"  → PASSED — GBT shows a real margin over a near-minimal-"
+                  f"capacity model, supporting a GBT-specific edge rather "
+                  f"than just the shared marginal signal a linear model "
+                  f"also finds.")
+        else:
+            print(f"  ⛔ FAILED — the GBT does not meaningfully beat a "
+                  f"near-linear baseline. Per run_logistic_baseline()'s own "
+                  f"diagnostic logic, this is evidence the observed edge is "
+                  f"a shared, marginal, possibly non-stationary label/regime "
+                  f"signal rather than something the GBT's extra capacity is "
+                  f"contributing — further GBT tuning is unlikely to close "
+                  f"this gap by itself.")
+
+    overall_gate_passed = confirmation["passed"] and baseline_edge_ok
+
+    if not overall_gate_passed and not args.force_final_training:
+        if not confirmation["passed"]:
+            print("\n  Nested gate confirmation did not pass "
+                  "(per-seed / pooled / recent-regime).")
+        if not baseline_edge_ok:
+            print("\n  Baseline-edge gate did not pass.")
+        print("  Re-run with --force-final-training to override.")
         return
 
     chosen_seed = _pick_representative_confirmation_seed(confirmation["per_seed"])
     print(f"\n{'#'*62}\n  STEP 2 — FINAL DEPLOYABLE TRAINING + CALIBRATION  "
           f"(representative confirmation seed={chosen_seed})\n{'#'*62}")
     run_final_training(states, labels, aligned_df, entry_threshold=entry_threshold,
-                       random_state=chosen_seed, n_bagged_fits=args.n_bagged_fits)
+                       random_state=chosen_seed, n_bagged_fits=args.n_bagged_fits,
+                       holdout_frac=args.holdout_frac)
 
 
 if __name__ == "__main__":
@@ -1744,4 +1561,4 @@ if __name__ == "__main__":
 # python main_gbt.py --min-path-test-trades 15
 # python main_gbt.py --disable-multi-timeframe
 # python main_gbt.py --frozen-data --force-final-training
-# python main_gbt.py --frozen-dat
+# python main_gbt.py --frozen-data --holdout-frac 0.20 --max-holding 16 --tp-mult 1.3 --sl-mult 0.7
