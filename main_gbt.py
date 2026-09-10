@@ -277,46 +277,75 @@ def _json_default(obj):
 # State + label construction
 # ─────────────────────────────────────────────
 
-def build_states_and_labels(frozen: bool = False,
-                             enable_multi_timeframe: bool = None,
-                             context_paces: tuple = None,
-                             tp_mult: float = None,
-                             sl_mult: float = None,
-                             max_holding: int = None):
+def _load_master_and_indicators(frozen: bool = False):
     """
-    Build (states, labels, prices, aligned_df) for the full dataset,
-    using identical feature construction to main_mcknn.py/pre_training.py
-    so results are directly comparable.
+    Shared first step for every state/label-construction path below:
+    load+merge the 4h master CSV and compute the raw indicator array.
+    Factored out so `load_prices_for_labeling()` (label-only /
+    stationarity analysis — see regime_stationarity.py) doesn't pay for
+    anything beyond this, while `build_states()` (which needs the full
+    state vectors) shares this exact loading logic so the two paths can
+    never silently diverge on which rows/dtypes they see.
+    """
+    df = update_master_data("4h", frozen=frozen)
+    df = df[["Open_time", "Close"] + FEATURES].dropna().reset_index(drop=True)
+    ind = df[FEATURES].values.astype(np.float32)
+    prices = df["Close"].values.astype(np.float32)
+    return df, ind, prices
 
-    Parameters
-    ----------
-    frozen : forwarded to data_manager.update_master_data() /
-             update_all_timeframes() — if True, uses the existing master
-             CSV(s) verbatim instead of refetching/appending, so repeated
-             calls all see the exact same dataset.
-    enable_multi_timeframe, context_paces : override the module-level
-             ENABLE_MULTI_TIMEFRAME / CONTEXT_PACES constants for this
-             call only (used by --no-multi-timeframe).
-    tp_mult, sl_mult, max_holding : override the module-level TP_MULT /
-             SL_MULT / MAX_HOLDING triple-barrier constants for this call
-             only (this revision — GATE HARDENING change 4, see
-             --tp-mult/--sl-mult/--max-holding in main()). Narrower
-             barriers / shorter max holding resolve trades faster,
-             growing the final holdout's trade count without editing
-             this file.
+
+def load_prices_for_labeling(frozen: bool = False):
+    """
+    Lightweight path for label-only / stationarity analysis (see
+    regime_stationarity.py and label_sweep.py's phase-1 screen).
+    triple_barrier.build_meta_labels() only ever needs Close prices +
+    ATR_Scaled — NOT the full state vector — so this skips
+    StateAggregator entirely and, critically, skips
+    update_all_timeframes()'s 15m/1h fetch, which is by far the most
+    expensive part of build_states(). This lets a tp_mult/sl_mult/
+    max_holding sweep or a rolling-window edge/stationarity check
+    re-derive labels for many candidate configs without ever touching
+    the state-construction machinery.
+
+    Returns
+    -------
+    prices_aligned, atr_aligned, aligned_df — identical alignment/dtype
+    to what build_states_and_labels() hands to
+    triple_barrier.build_meta_labels(), i.e. row i here corresponds to
+    the SAME tick as state row i from build_states().
+    """
+    df, ind, prices = _load_master_and_indicators(frozen=frozen)
+    prices_aligned = prices[WARMUP_IDX + 1:]
+    atr_idx = FEATURES.index("ATR_Scaled")
+    atr_aligned = ind[WARMUP_IDX + 1:, atr_idx]
+    open_times = df["Open_time"].values[WARMUP_IDX + 1:]
+    aligned_df = pd.DataFrame({"Open_time": open_times})
+    return prices_aligned, atr_aligned, aligned_df
+
+
+def build_states(frozen: bool = False,
+                  enable_multi_timeframe: bool = None,
+                  context_paces: tuple = None):
+    """
+    Build ONLY the state matrix (+ its aligned prices/ATR/Open_time) —
+    NO triple-barrier labeling. States depend solely on
+    FEATURES/PACES/CONTEXT_* and the raw market data, never on
+    tp_mult/sl_mult/max_holding, so factoring this out lets
+    label_sweep.py build the (expensive — 15m/1h fetch + per-tick
+    aggregator loop) state matrix ONCE and reuse it across every
+    barrier-config candidate it screens, instead of rebuilding it from
+    scratch per config the way looping over the old monolithic
+    build_states_and_labels() would.
+
+    Returns
+    -------
+    states, prices_aligned, atr_aligned, aligned_df
     """
     enable_multi_timeframe = (ENABLE_MULTI_TIMEFRAME if enable_multi_timeframe is None
                                else enable_multi_timeframe)
     context_paces = CONTEXT_PACES if context_paces is None else context_paces
-    tp_mult     = TP_MULT if tp_mult is None else tp_mult
-    sl_mult     = SL_MULT if sl_mult is None else sl_mult
-    max_holding = MAX_HOLDING if max_holding is None else max_holding
 
-    df = update_master_data("4h", frozen=frozen)
-    df = df[["Open_time", "Close"] + FEATURES].dropna().reset_index(drop=True)
-
-    ind = df[FEATURES].values.astype(np.float32)
-    prices = df["Close"].values.astype(np.float32)
+    df, ind, prices = _load_master_and_indicators(frozen=frozen)
     n = len(df)
 
     agg = StateAggregator(PACES, num_indicators=len(FEATURES))
@@ -358,19 +387,79 @@ def build_states_and_labels(frozen: bool = False,
     prices_aligned = prices[WARMUP_IDX + 1:]
     atr_idx = FEATURES.index("ATR_Scaled")
     atr_aligned = ind[WARMUP_IDX + 1:, atr_idx]
-
-    labels = build_meta_labels(
-        prices_aligned, atr_aligned,
-        tp_mult=tp_mult, sl_mult=sl_mult,
-        max_holding=max_holding, commission=COMMISSION,
-    )
-
     open_times = df["Open_time"].values[WARMUP_IDX + 1:]
     aligned_df = pd.DataFrame({"Open_time": open_times})   # used only for
                                                             # its length by
                                                             # cpcv.py's group
                                                             # splitting
 
+    return states, prices_aligned, atr_aligned, aligned_df
+
+
+def labels_from_prices(prices_aligned: np.ndarray, atr_aligned: np.ndarray,
+                       tp_mult: float = None, sl_mult: float = None,
+                       max_holding: int = None) -> dict:
+    """
+    Thin wrapper around triple_barrier.build_meta_labels() that applies
+    this module's TP_MULT/SL_MULT/MAX_HOLDING defaults exactly like the
+    old monolithic build_states_and_labels() used to inline. Factored
+    out so label_sweep.py can re-label the SAME prices_aligned/
+    atr_aligned under many different barrier configs without ever
+    re-deriving them from build_states()/_load_master_and_indicators().
+    """
+    tp_mult     = TP_MULT if tp_mult is None else tp_mult
+    sl_mult     = SL_MULT if sl_mult is None else sl_mult
+    max_holding = MAX_HOLDING if max_holding is None else max_holding
+    return build_meta_labels(
+        prices_aligned, atr_aligned,
+        tp_mult=tp_mult, sl_mult=sl_mult,
+        max_holding=max_holding, commission=COMMISSION,
+    )
+
+
+def build_states_and_labels(frozen: bool = False,
+                             enable_multi_timeframe: bool = None,
+                             context_paces: tuple = None,
+                             tp_mult: float = None,
+                             sl_mult: float = None,
+                             max_holding: int = None):
+    """
+    Build (states, labels, prices, aligned_df) for the full dataset,
+    using identical feature construction to main_mcknn.py/pre_training.py
+    so results are directly comparable.
+
+    UNCHANGED call shape/behaviour from prior revisions — every
+    existing caller (main(), diagnostic scripts) keeps working with
+    zero changes. Internally this is now just a thin composition of
+    build_states() + labels_from_prices() (see above), so a caller that
+    wants to sweep tp_mult/sl_mult/max_holding without paying for
+    state-matrix reconstruction each time should call those two
+    functions directly instead — see label_sweep.py.
+
+    Parameters
+    ----------
+    frozen : forwarded to data_manager.update_master_data() /
+             update_all_timeframes() — if True, uses the existing master
+             CSV(s) verbatim instead of refetching/appending, so repeated
+             calls all see the exact same dataset.
+    enable_multi_timeframe, context_paces : override the module-level
+             ENABLE_MULTI_TIMEFRAME / CONTEXT_PACES constants for this
+             call only (used by --no-multi-timeframe).
+    tp_mult, sl_mult, max_holding : override the module-level TP_MULT /
+             SL_MULT / MAX_HOLDING triple-barrier constants for this call
+             only (GATE HARDENING change 4, see
+             --tp-mult/--sl-mult/--max-holding in main()). Narrower
+             barriers / shorter max holding resolve trades faster,
+             growing the final holdout's trade count without editing
+             this file.
+    """
+    states, prices_aligned, atr_aligned, aligned_df = build_states(
+        frozen=frozen, enable_multi_timeframe=enable_multi_timeframe,
+        context_paces=context_paces,
+    )
+    labels = labels_from_prices(prices_aligned, atr_aligned,
+                                tp_mult=tp_mult, sl_mult=sl_mult,
+                                max_holding=max_holding)
     return states, labels, prices_aligned, aligned_df
 
 
