@@ -28,86 +28,41 @@ multi-seed stability check, frozen-data, regularization rounds 1-5,
 nested threshold selection/gate confirmation, bootstrap CI, capacity
 round 4 + logistic baseline, and bagged-fits revisions ...]
 
-CHANGES IN THIS REVISION — GATE HARDENING (diagnostic-driven)
-───────────────────────────────────────────────────────────────
-A full pipeline run CONFIRMED the nested gate (5/6 seeds passed, pooled
-PASS) and then FAILED the true final holdout hard: avg/trade=-1.03%
-over 36 trades, 90% bootstrap CI entirely negative
-[-1.69%, -0.38%]. Root-cause analysis found:
+CHANGES IN THIS REVISION — MULTI-SYMBOL SUPPORT
+───────────────────────────────────────────────
+data_manager.py now accepts a `symbol` (and `frozen`) parameter on
+update_master_data()/update_all_timeframes() instead of hardcoding
+XRPUSDT. This file follows suit:
 
-  (a) The gate's own numbers were already marginal when it passed —
-      pooled mean test avg/trade (+0.15%) was dwarfed by its own std
-      (0.50%, a ~0.3 signal/noise ratio), and PBO (48.6%) was 1.4
-      points from the >50% "fail" cutoff. evaluate_gate()'s three
-      checks (directional consistency, downside floor, PBO) are
-      tripwires for CLEARLY broken strategies, not for "statistically
-      indistinguishable from a coin flip" ones — nothing in the gate
-      penalized a low signal/noise ratio directly.
-
-  (b) CPCV's C(8,2)=28 combinations dilute the most-recent group (7)
-      across 7 different test-set combinations averaged together with
-      27 others — nothing in the gate specifically asks "how does this
-      generalize to the newest, most-recently-seen regime", which is
-      exactly the question the final holdout (chronologically last 15%)
-      answers, and exactly where the model failed hardest. Path 27 in
-      the confirmation seed=7 run (test_groups=(6,7), the two most
-      recent CPCV groups) already showed this: test_avg=-2.274% on 9
-      trades — a visible red flag that got averaged away in the pooled
-      144-path statistic.
-
-  (c) run_logistic_baseline() (near-minimal capacity) found essentially
-      the SAME weak signal as the tuned GBT (mean +0.243% vs the GBT's
-      +0.1545%, both well within one std of each other) — per that
-      function's own stated diagnostic logic, a baseline that ALSO
-      finds the identical marginal edge is evidence for a label/regime
-      explanation, not an addressable GBT-capacity problem. The
-      pipeline computed this number but never actually acted on it.
-
-Four changes address this directly, all implemented below:
-
-  1. TIGHTER GATE STATISTICS (evaluate_gate()): PBO_MAX_ALLOWED lowered
-     0.50 -> 0.40, and a new MIN_TEST_SHARPE floor (0.15) on
-     mean_test_sharpe — a strategy whose signal isn't at least ~0.15
-     Sharpe-equivalent above its own noise no longer passes just
-     because it's nominally "positive".
-
-  2. RECENT-REGIME CHECK (confirm_gate_nested()): for every confirmation
-     seed, the CPCV path whose test_groups are the LAST N_TEST_GROUPS
-     groups (the most-recently-seen regime — the closest CPCV analog to
-     the real final holdout) is pulled out of that seed's already-fitted
-     paths (no extra fitting cost — it's already in fitted_paths) and
-     scored on its own. Confirmation now additionally requires
-     RECENT_REGIME_MIN_PASS_FRAC of seeds' recent-regime path to clear
-     RECENT_REGIME_AVG_PNL_FLOOR, separate from (and stricter than) the
-     pooled/whole-CPCV floor — so a model that only works on older
-     regimes can no longer sail through on pooled/diluted statistics.
-
-  3. BASELINE-EDGE GATE (main()): the logistic-regression capacity-floor
-     check is no longer purely informational. main() now computes
-     edge = GBT pooled mean_test_avg_pnl - logistic pooled
-     mean_test_avg_pnl and requires edge > MIN_EDGE_OVER_BASELINE
-     before proceeding to final training. If the tuned GBT can't beat a
-     near-linear model by a non-trivial margin, that's the (c) signal
-     above made an actual gate condition instead of a printed aside.
-
-  4. WIDER / CONFIGURABLE HOLDOUT (run_final_training(), CLI): holdout
-     sizing (holdout_frac) and triple-barrier resolution speed
-     (tp_mult/sl_mult/max_holding) are now CLI-overridable
-     (--holdout-frac, --tp-mult, --sl-mult, --max-holding) instead of
-     hardcoded, so the final holdout's trade count (36, at the edge of
-     what a bootstrap CI can say anything precise about) can be grown
-     without editing the file — narrower barriers / shorter max holding
-     resolve trades faster, and a larger holdout_frac widens the
-     evaluation window itself.
-
-All four are additive to the existing nested selection/confirmation
-machinery — selection/confirmation/pooled-gate logic, bagging, purged
-early stopping, etc. are unchanged; these are new necessary conditions
-layered on top.
+  - New `--symbol` CLI flag (default "XRPUSDT", choices = data_manager's
+    SYMBOLS list) selects which coin's data the whole pipeline —
+    state construction, labeling, CPCV, final training — runs against.
+  - Every state/label-construction function (_load_master_and_indicators,
+    load_prices_for_labeling, build_states, build_states_and_labels)
+    now takes a `symbol` parameter (default DEFAULT_SYMBOL, so existing
+    call sites/imports that don't pass it are unaffected) and forwards
+    it to data_manager.update_master_data()/update_all_timeframes().
+  - `data_manager.update_master_data(..., frozen=...)` is now a real
+    parameter (previously this file called it with `frozen=` before
+    data_manager.py actually accepted that kwarg — this revision's
+    data_manager.py update fixes that gap).
+  - OUTPUTS ARE NOW PER-SYMBOL to avoid two symbols silently clobbering
+    each other's CPCV summaries / calibration reports / deployed model:
+    every function that writes to OUT_DIR (gate_and_summarize,
+    run_logistic_baseline, confirm_gate_nested, run_final_training) now
+    accepts an explicit `out_dir` parameter. main() computes
+    `out_dir = OUT_DIR/<symbol>` once (e.g. "outcomes/gbt/BTCUSDT/") and
+    threads it through the whole run. The module-level OUT_DIR constant
+    is UNCHANGED ("outcomes/gbt") for backward compatibility with
+    existing importers (label_sweep.py, regime_stationarity.py,
+    diagnostic_gbt.py's module-level defaults) that haven't been
+    updated to the per-symbol layout — those still read/write the
+    flat, symbol-less path unless/until they're updated too.
 
 Run
 ────
-    python main_gbt.py                                              # gated pipeline, live data
+    python main_gbt.py                                              # gated pipeline, live data, XRPUSDT
+    python main_gbt.py --symbol BTCUSDT                              # same pipeline, BTCUSDT
     python main_gbt.py --frozen-data                                 # reproducible comparisons
     python main_gbt.py --frozen-data --selection-seeds 0 1 \\
                         --confirmation-seeds 2 3 4 5 6 7             # explicit nested seed pools
@@ -124,7 +79,10 @@ import numpy as np
 import pandas as pd
 
 from agents.state_aggregator import StateAggregator
-from data.data_manager import update_master_data, update_all_timeframes
+from data.data_manager import (
+    update_master_data, update_all_timeframes,
+    SYMBOLS as AVAILABLE_SYMBOLS, DEFAULT_SYMBOL,
+)
 from multi_timeframe_state import build_multi_timeframe_context
 from walkforward import compute_required_lookback_ticks
 from cpcv import generate_cpcv_paths, compute_pbo
@@ -138,6 +96,13 @@ FEATURES   = ["RSI_Scaled", "MACD_Scaled", "BB_Scaled",
 PACES      = (1, 6, 42, 90)
 WARMUP_IDX = 128
 ACTION_DIM = 4
+
+# Default trading symbol — CLI-overridable via --symbol (see main()).
+# Kept as a module constant (rather than only a CLI default) so
+# functions below that build states/labels can still be called
+# directly (e.g. from label_sweep.py / regime_stationarity.py) without
+# needing to know about argparse.
+SYMBOL = DEFAULT_SYMBOL
 
 # Kept True (default) deliberately: a --no-multi-timeframe A/B run
 # showed dropping context makes out-of-sample results WORSE (mean
@@ -216,9 +181,10 @@ DEFAULT_HOLDOUT_FRAC    = 0.15   # CLI-overridable via --holdout-frac (GATE HARD
 # particular fold happened to generate.
 VAL_AVG_TRADE_FLOOR = -0.03
 
-# ── GATE HARDENING (this revision) ───────────────────────────────────────────
+# ── GATE HARDENING (prior revision) ───────────────────────────────────────────
 # See module docstring's "CHANGES IN THIS REVISION — GATE HARDENING"
-# section for the full diagnosis these four constants/checks respond to.
+# section (previous revision) for the full diagnosis these four
+# constants/checks respond to.
 
 # (1) Tighter gate statistics.
 # PBO cutoff lowered from 0.50 -> 0.40: the run that triggered this
@@ -255,6 +221,22 @@ OUT_DIR = "outcomes/gbt"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
+def symbol_out_dir(symbol: str, base_out_dir: str = OUT_DIR) -> str:
+    """
+    MULTI-SYMBOL SUPPORT (this revision): every symbol's outputs
+    (CPCV summaries, calibration reports, deployed checkpoint, etc.)
+    live under their own subfolder — base_out_dir/<symbol>/ — so
+    running the pipeline for BTCUSDT right after XRPUSDT never
+    overwrites XRPUSDT's results. Callers that still want the old
+    flat/symbol-less layout (e.g. scripts not yet updated for
+    multi-symbol) can keep passing OUT_DIR directly to the
+    lower-level functions' `out_dir` parameter instead of calling this.
+    """
+    path = os.path.join(base_out_dir, symbol)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def _json_default(obj):
     """
     Fallback encoder for json.dump(default=_json_default) calls in this
@@ -277,7 +259,7 @@ def _json_default(obj):
 # State + label construction
 # ─────────────────────────────────────────────
 
-def _load_master_and_indicators(frozen: bool = False):
+def _load_master_and_indicators(frozen: bool = False, symbol: str = SYMBOL):
     """
     Shared first step for every state/label-construction path below:
     load+merge the 4h master CSV and compute the raw indicator array.
@@ -286,15 +268,18 @@ def _load_master_and_indicators(frozen: bool = False):
     anything beyond this, while `build_states()` (which needs the full
     state vectors) shares this exact loading logic so the two paths can
     never silently diverge on which rows/dtypes they see.
+
+    symbol : forwarded to data_manager.update_master_data() — selects
+        which coin's 4h master CSV is loaded (default SYMBOL/"XRPUSDT").
     """
-    df = update_master_data("4h", frozen=frozen)
+    df = update_master_data("4h", symbol=symbol, frozen=frozen)
     df = df[["Open_time", "Close"] + FEATURES].dropna().reset_index(drop=True)
     ind = df[FEATURES].values.astype(np.float32)
     prices = df["Close"].values.astype(np.float32)
     return df, ind, prices
 
 
-def load_prices_for_labeling(frozen: bool = False):
+def load_prices_for_labeling(frozen: bool = False, symbol: str = SYMBOL):
     """
     Lightweight path for label-only / stationarity analysis (see
     regime_stationarity.py and label_sweep.py's phase-1 screen).
@@ -307,6 +292,9 @@ def load_prices_for_labeling(frozen: bool = False):
     re-derive labels for many candidate configs without ever touching
     the state-construction machinery.
 
+    symbol : forwarded to _load_master_and_indicators() (default
+        SYMBOL/"XRPUSDT").
+
     Returns
     -------
     prices_aligned, atr_aligned, aligned_df — identical alignment/dtype
@@ -314,7 +302,7 @@ def load_prices_for_labeling(frozen: bool = False):
     triple_barrier.build_meta_labels(), i.e. row i here corresponds to
     the SAME tick as state row i from build_states().
     """
-    df, ind, prices = _load_master_and_indicators(frozen=frozen)
+    df, ind, prices = _load_master_and_indicators(frozen=frozen, symbol=symbol)
     prices_aligned = prices[WARMUP_IDX + 1:]
     atr_idx = FEATURES.index("ATR_Scaled")
     atr_aligned = ind[WARMUP_IDX + 1:, atr_idx]
@@ -325,7 +313,8 @@ def load_prices_for_labeling(frozen: bool = False):
 
 def build_states(frozen: bool = False,
                   enable_multi_timeframe: bool = None,
-                  context_paces: tuple = None):
+                  context_paces: tuple = None,
+                  symbol: str = SYMBOL):
     """
     Build ONLY the state matrix (+ its aligned prices/ATR/Open_time) —
     NO triple-barrier labeling. States depend solely on
@@ -337,6 +326,12 @@ def build_states(frozen: bool = False,
     scratch per config the way looping over the old monolithic
     build_states_and_labels() would.
 
+    symbol : which coin to build states for (default SYMBOL/"XRPUSDT").
+        Forwarded to _load_master_and_indicators() (4h master CSV) and
+        to data_manager.update_all_timeframes() (15m/1h context master
+        CSVs), so the primary and context timeframes are always the
+        SAME symbol — never accidentally mixed.
+
     Returns
     -------
     states, prices_aligned, atr_aligned, aligned_df
@@ -345,7 +340,7 @@ def build_states(frozen: bool = False,
                                else enable_multi_timeframe)
     context_paces = CONTEXT_PACES if context_paces is None else context_paces
 
-    df, ind, prices = _load_master_and_indicators(frozen=frozen)
+    df, ind, prices = _load_master_and_indicators(frozen=frozen, symbol=symbol)
     n = len(df)
 
     agg = StateAggregator(PACES, num_indicators=len(FEATURES))
@@ -354,7 +349,8 @@ def build_states(frozen: bool = False,
     extra_context_arr = None
     if enable_multi_timeframe:
         try:
-            timeframe_dfs = update_all_timeframes(CONTEXT_TIMEFRAMES, frozen=frozen)
+            timeframe_dfs = update_all_timeframes(CONTEXT_TIMEFRAMES, symbol=symbol,
+                                                  frozen=frozen)
             missing = [tf for tf in CONTEXT_TIMEFRAMES if tf not in timeframe_dfs]
             if missing:
                 raise FileNotFoundError(f"missing timeframe(s): {missing}")
@@ -422,7 +418,8 @@ def build_states_and_labels(frozen: bool = False,
                              context_paces: tuple = None,
                              tp_mult: float = None,
                              sl_mult: float = None,
-                             max_holding: int = None):
+                             max_holding: int = None,
+                             symbol: str = SYMBOL):
     """
     Build (states, labels, prices, aligned_df) for the full dataset,
     using identical feature construction to main_mcknn.py/pre_training.py
@@ -430,11 +427,12 @@ def build_states_and_labels(frozen: bool = False,
 
     UNCHANGED call shape/behaviour from prior revisions — every
     existing caller (main(), diagnostic scripts) keeps working with
-    zero changes. Internally this is now just a thin composition of
-    build_states() + labels_from_prices() (see above), so a caller that
-    wants to sweep tp_mult/sl_mult/max_holding without paying for
-    state-matrix reconstruction each time should call those two
-    functions directly instead — see label_sweep.py.
+    zero changes (symbol defaults to SYMBOL/"XRPUSDT"). Internally
+    this is now just a thin composition of build_states() +
+    labels_from_prices() (see above), so a caller that wants to sweep
+    tp_mult/sl_mult/max_holding without paying for state-matrix
+    reconstruction each time should call those two functions directly
+    instead — see label_sweep.py.
 
     Parameters
     ----------
@@ -452,10 +450,12 @@ def build_states_and_labels(frozen: bool = False,
              barriers / shorter max holding resolve trades faster,
              growing the final holdout's trade count without editing
              this file.
+    symbol : which coin to build states/labels for (default
+             SYMBOL/"XRPUSDT"). Forwarded to build_states().
     """
     states, prices_aligned, atr_aligned, aligned_df = build_states(
         frozen=frozen, enable_multi_timeframe=enable_multi_timeframe,
-        context_paces=context_paces,
+        context_paces=context_paces, symbol=symbol,
     )
     labels = labels_from_prices(prices_aligned, atr_aligned,
                                 tp_mult=tp_mult, sl_mult=sl_mult,
@@ -692,7 +692,7 @@ def _extract_recent_regime_result(states: np.ndarray, labels: dict,
                                   fitted_paths: list, valid: np.ndarray,
                                   threshold: float) -> dict:
     """
-    GATE HARDENING change 2 (this revision).
+    GATE HARDENING change 2 (prior revision).
 
     Pull the CPCV path whose test_groups equal RECENT_REGIME_GROUPS (the
     LAST N_TEST_GROUPS groups — the most-recently-observed regime, the
@@ -723,14 +723,14 @@ def evaluate_gate(path_results: list) -> tuple:
     """
     Pure (no I/O) gate evaluation.
 
-    GATE HARDENING (this revision): two of the three original checks
-    (directional consistency, downside floor) are unchanged; the PBO
-    check is now tighter (PBO_MAX_ALLOWED=0.40, was 0.50) and a NEW
-    Sharpe-floor check (MIN_TEST_SHARPE=0.15) is added — see module
-    docstring. A path set that is nominally "positive on average" but
-    whose mean test_sharpe is below the floor (a low signal/noise
-    ratio, indistinguishable from chance) now fails the gate even if
-    it would have passed the old three-check version.
+    GATE HARDENING: two of the three original checks (directional
+    consistency, downside floor) are unchanged; the PBO check is
+    tighter (PBO_MAX_ALLOWED=0.40) and a Sharpe-floor check
+    (MIN_TEST_SHARPE=0.15) is included — see module docstring history.
+    A path set that is nominally "positive on average" but whose mean
+    test_sharpe is below the floor (a low signal/noise ratio,
+    indistinguishable from chance) fails the gate even if it would have
+    passed the old three-check version.
 
     Applies the reliability filter (MIN_PATH_TEST_TRADES) first, then
     checks directional consistency + downside floor + PBO + Sharpe.
@@ -772,11 +772,10 @@ def evaluate_gate(path_results: list) -> tuple:
     directionally_consistent = bool(n_pos >= (n_total / 2))
     downside_breach = bool(test_avg_pnls.min() < VAL_AVG_TRADE_FLOOR)
     pbo_high = bool((not np.isnan(pbo_info["pbo"])) and pbo_info["pbo"] > PBO_MAX_ALLOWED)
-    # New this revision: a Sharpe that's genuinely unmeasurable (NaN —
-    # e.g. too few paths had >=5 test trades to compute one) does NOT
-    # fail this check on its own; it's a "can't tell" case, handled by
-    # the other three checks instead. A COMPUTED Sharpe below the floor
-    # DOES fail it.
+    # A Sharpe that's genuinely unmeasurable (NaN — e.g. too few paths
+    # had >=5 test trades to compute one) does NOT fail this check on
+    # its own; it's a "can't tell" case, handled by the other three
+    # checks instead. A COMPUTED Sharpe below the floor DOES fail it.
     sharpe_low = bool((not np.isnan(mean_test_sharpe)) and mean_test_sharpe < MIN_TEST_SHARPE)
     passed = (directionally_consistent and (not downside_breach)
               and (not pbo_high) and (not sharpe_low))
@@ -801,10 +800,17 @@ def evaluate_gate(path_results: list) -> tuple:
 
 def gate_and_summarize(path_results: list, entry_threshold: float = 0.5,
                        threshold_sweep: dict = None, seed: int = None,
-                       write: bool = True) -> bool:
+                       write: bool = True, out_dir: str = None) -> bool:
     """NORMALIZED gate summary/report — decision logic lives in
     evaluate_gate(); this prints/saves it. Reliability filter
-    (MIN_PATH_TEST_TRADES) applied inside evaluate_gate()."""
+    (MIN_PATH_TEST_TRADES) applied inside evaluate_gate().
+
+    out_dir : where to write cpcv_summary.json. Defaults to the
+        module-level OUT_DIR (flat, symbol-less path) for backward
+        compatibility with callers that don't pass it; main() passes
+        the per-symbol out_dir computed via symbol_out_dir().
+    """
+    out_dir = OUT_DIR if out_dir is None else out_dir
     if not path_results:
         print("  ⛔ No usable CPCV paths — aborting.")
         return False
@@ -843,7 +849,7 @@ def gate_and_summarize(path_results: list, entry_threshold: float = 0.5,
           f"std={stats['std_test_pnl_raw']:.2%}  min={stats['min_test_pnl_raw']:+.2%}")
 
     if write:
-        with open(os.path.join(OUT_DIR, "cpcv_summary.json"), "w") as f:
+        with open(os.path.join(out_dir, "cpcv_summary.json"), "w") as f:
             json.dump({
                 "n_paths": n_total,
                 "min_path_test_trades": MIN_PATH_TEST_TRADES,
@@ -865,7 +871,7 @@ def gate_and_summarize(path_results: list, entry_threshold: float = 0.5,
                 "min_test_sharpe": MIN_TEST_SHARPE,
                 "path_results": reliable,
             }, f, indent=2, default=_json_default)
-        print(f"  ✓  CPCV summary saved → {OUT_DIR}/cpcv_summary.json")
+        print(f"  ✓  CPCV summary saved → {out_dir}/cpcv_summary.json")
 
     if not passed:
         print(f"\n  ⛔ UNSTABLE — refusing to train final deployable model.")
@@ -891,16 +897,13 @@ def gate_and_summarize(path_results: list, entry_threshold: float = 0.5,
 # Logistic regression baseline (capacity floor check)
 # ─────────────────────────────────────────────
 #
-# GATE HARDENING (this revision): this function's output is no longer
-# purely informational — main() now uses its pooled mean_test_avg_pnl
-# as the comparison point for the new baseline-edge gate (change 3).
-# See run_logistic_baseline()'s printed verdict, which already flagged
-# this exact situation ("Baseline ALSO ... near-minimal model
-# capacity... GBT's instability [is a] label/regime explanation") but
-# previously never blocked deployment on it.
+# GATE HARDENING: this function's output is no longer purely
+# informational — main() uses its pooled mean_test_avg_pnl as the
+# comparison point for the baseline-edge gate. See
+# run_logistic_baseline()'s printed verdict.
 
 def run_logistic_baseline(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
-                          seeds: tuple = None) -> dict:
+                          seeds: tuple = None, out_dir: str = None) -> dict:
     """
     Fit a plain logistic regression (via GBTAgent(model_type="logistic"))
     through the same CPCV path generation / purge-embargo / triple-
@@ -912,9 +915,14 @@ def run_logistic_baseline(states: np.ndarray, labels: dict, aligned_df: pd.DataF
     plus per-seed pass/fail for direct comparison against the GBT's own
     per-seed confirmation result.
 
+    out_dir : where to write logistic_baseline.json. Defaults to the
+        module-level OUT_DIR for backward compatibility; main() passes
+        the per-symbol out_dir.
+
     Returns the pooled evaluate_gate() stats dict (with a "per_seed"
-    key added) and also writes to outcomes/gbt/logistic_baseline.json.
+    key added) and also writes to <out_dir>/logistic_baseline.json.
     """
+    out_dir = OUT_DIR if out_dir is None else out_dir
     seeds = DEFAULT_CONFIRMATION_SEEDS if seeds is None else seeds
     print(f"\n{'#'*62}\n  LOGISTIC REGRESSION BASELINE (capacity floor check)  "
           f"seeds={list(seeds)}\n{'#'*62}")
@@ -981,7 +989,7 @@ def run_logistic_baseline(states: np.ndarray, labels: dict, aligned_df: pd.DataF
               f"treated as having found the same marginal signal, not a "
               f"GBT-specific edge.")
 
-    with open(os.path.join(OUT_DIR, "logistic_baseline.json"), "w") as f:
+    with open(os.path.join(out_dir, "logistic_baseline.json"), "w") as f:
         json.dump({
             "seeds": list(seeds),
             "n_pass": n_pass, "frac_pass": frac_pass,
@@ -992,7 +1000,7 @@ def run_logistic_baseline(states: np.ndarray, labels: dict, aligned_df: pd.DataF
             "n_total": stats["n_total"], "n_pos": stats.get("n_pos", 0),
             "pbo": stats["pbo"], "logit_lambda": stats["logit_lambda"],
         }, f, indent=2, default=_json_default)
-    print(f"\n  ✓  Logistic baseline saved → {OUT_DIR}/logistic_baseline.json")
+    print(f"\n  ✓  Logistic baseline saved → {out_dir}/logistic_baseline.json")
 
     stats["per_seed"] = per_seed
     stats["n_pass"] = n_pass
@@ -1008,11 +1016,13 @@ def run_logistic_baseline(states: np.ndarray, labels: dict, aligned_df: pd.DataF
 
 def run_stability_check(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
                         seeds: tuple = DEFAULT_STABILITY_SEEDS,
-                        min_pass_frac: float = DEFAULT_MIN_PASS_FRAC) -> tuple:
+                        min_pass_frac: float = DEFAULT_MIN_PASS_FRAC,
+                        out_dir: str = None) -> tuple:
     """DEPRECATED as of the nested-selection revision — main() no longer
     calls this. Left in place only for backward compatibility with any
     external caller. See select_threshold_nested()/confirm_gate_nested()
     for the current (nested, non-circular) flow."""
+    out_dir = OUT_DIR if out_dir is None else out_dir
     print(f"\n{'#'*62}\n  MULTI-SEED CPCV STABILITY CHECK  "
           f"(seeds={list(seeds)}, min_pass_frac={min_pass_frac:.0%})\n{'#'*62}")
 
@@ -1052,13 +1062,13 @@ def run_stability_check(states: np.ndarray, labels: dict, aligned_df: pd.DataFra
           f"({frac_pass:.0%}, required >= {min_pass_frac:.0%})")
     print(f"  → {'STABLE' if stable else 'UNSTABLE'} across seeds.")
 
-    with open(os.path.join(OUT_DIR, "stability_check.json"), "w") as f:
+    with open(os.path.join(out_dir, "stability_check.json"), "w") as f:
         json.dump({
             "seeds": list(seeds), "min_pass_frac": min_pass_frac,
             "n_pass": n_pass, "frac_pass": frac_pass, "stable": stable,
             "results": seed_results,
         }, f, indent=2, default=_json_default)
-    print(f"  ✓  Stability check saved → {OUT_DIR}/stability_check.json")
+    print(f"  ✓  Stability check saved → {out_dir}/stability_check.json")
 
     return stable, seed_results
 
@@ -1111,28 +1121,26 @@ def confirm_gate_nested(states: np.ndarray, labels: dict, aligned_df: pd.DataFra
                         entry_threshold: float,
                         confirmation_seeds: tuple = DEFAULT_CONFIRMATION_SEEDS,
                         min_pass_frac: float = DEFAULT_MIN_PASS_FRAC,
-                        n_bagged_fits: int = None) -> dict:
+                        n_bagged_fits: int = None,
+                        out_dir: str = None) -> dict:
     """
     Evaluate the ALREADY-CHOSEN `entry_threshold` (no further tuning)
     against CPCV paths built from `confirmation_seeds`.
 
-    GATE HARDENING (this revision, change 2): in addition to the
-    existing per-seed gate + pooled gate, this now ALSO extracts and
-    scores the "recent regime" CPCV path (test_groups ==
-    RECENT_REGIME_GROUPS — the last N_TEST_GROUPS groups, the closest
-    CPCV analog to the real final holdout) from every confirmation
-    seed's already-fitted paths, at zero extra fitting cost. A seed's
-    recent-regime result "passes" if it has >= RECENT_REGIME_MIN_TEST_TRADES
-    trades AND test_avg_pnl > RECENT_REGIME_AVG_PNL_FLOOR (stricter than
-    the pooled/whole-CPCV floor — this is specifically a recency-risk
-    check). Overall confirmation now additionally requires
-    RECENT_REGIME_MIN_PASS_FRAC of seeds' recent-regime results to pass.
+    GATE HARDENING change 2: in addition to the existing per-seed gate
+    + pooled gate, this ALSO extracts and scores the "recent regime"
+    CPCV path (test_groups == RECENT_REGIME_GROUPS — the last
+    N_TEST_GROUPS groups, the closest CPCV analog to the real final
+    holdout) from every confirmation seed's already-fitted paths, at
+    zero extra fitting cost. A seed's recent-regime result "passes" if
+    it has >= RECENT_REGIME_MIN_TEST_TRADES trades AND test_avg_pnl >
+    RECENT_REGIME_AVG_PNL_FLOOR (stricter than the pooled/whole-CPCV
+    floor — this is specifically a recency-risk check). Overall
+    confirmation additionally requires RECENT_REGIME_MIN_PASS_FRAC of
+    seeds' recent-regime results to pass.
 
-    This directly targets the diagnosed failure mode: the pooled/whole-
-    CPCV statistics diluted a badly-negative recent-regime path (e.g.
-    test_groups=(6,7): test_avg=-2.274% on 9 trades in the run that
-    triggered this revision) across 27 other, mostly-fine paths. The
-    recent-regime check can no longer be out-voted by older regimes.
+    out_dir : where to write nested_gate_confirmation.json. Defaults to
+        the module-level OUT_DIR; main() passes the per-symbol out_dir.
 
     Returns
     -------
@@ -1154,6 +1162,7 @@ def confirm_gate_nested(states: np.ndarray, labels: dict, aligned_df: pd.DataFra
       recent_regime_stable   : bool, recent_regime_frac_pass >=
                                 RECENT_REGIME_MIN_PASS_FRAC
     """
+    out_dir = OUT_DIR if out_dir is None else out_dir
     print(f"\n{'#'*62}\n  GATE CONFIRMATION  (confirmation_seeds={list(confirmation_seeds)}, "
           f"entry_threshold={entry_threshold:.2f})\n{'#'*62}")
 
@@ -1183,8 +1192,8 @@ def confirm_gate_nested(states: np.ndarray, labels: dict, aligned_df: pd.DataFra
               f"mean_test_avg={stats['mean_test_avg_pnl']:+.4%}  "
               f"positive={stats.get('n_pos', 0)}/{stats['n_total']}  PBO={pbo_str}")
 
-        # ── Recent-regime check (this revision) — reuses fitted_paths,
-        #    no additional model fitting. ─────────────────────────────
+        # ── Recent-regime check — reuses fitted_paths, no additional
+        #    model fitting. ─────────────────────────────────────────────
         recent = _extract_recent_regime_result(states, labels, fitted_paths,
                                                valid, entry_threshold)
         if recent is not None:
@@ -1248,7 +1257,7 @@ def confirm_gate_nested(states: np.ndarray, labels: dict, aligned_df: pd.DataFra
           f"(requires per-seed stability AND a passing pooled gate AND "
           f"recent-regime stability)")
 
-    with open(os.path.join(OUT_DIR, "nested_gate_confirmation.json"), "w") as f:
+    with open(os.path.join(out_dir, "nested_gate_confirmation.json"), "w") as f:
         json.dump({
             "entry_threshold": entry_threshold,
             "confirmation_seeds": list(confirmation_seeds),
@@ -1267,7 +1276,7 @@ def confirm_gate_nested(states: np.ndarray, labels: dict, aligned_df: pd.DataFra
             "pooled_stats": {k: v for k, v in pooled_stats.items()
                              if k not in ("reliable_paths", "excluded_paths")},
         }, f, indent=2, default=_json_default)
-    print(f"  ✓  Gate confirmation saved → {OUT_DIR}/nested_gate_confirmation.json")
+    print(f"  ✓  Gate confirmation saved → {out_dir}/nested_gate_confirmation.json")
 
     return {
         "passed": overall_passed, "frac_pass": frac_pass,
@@ -1296,18 +1305,18 @@ def _pick_representative_confirmation_seed(per_seed: list) -> int:
 def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFrame,
                        entry_threshold: float = 0.5, random_state: int = 0,
                        n_bagged_fits: int = None,
-                       holdout_frac: float = None):
+                       holdout_frac: float = None,
+                       out_dir: str = None):
     """Train the deployable model on all rows except the most recent
     embargo-safe holdout block, then report calibration on that holdout.
 
-    holdout_frac : GATE HARDENING change 4 (this revision) — was
-        hardcoded to 0.15; now a parameter (CLI-overridable via
-        --holdout-frac) defaulting to DEFAULT_HOLDOUT_FRAC. The run
-        that triggered this revision's changes produced only 36 holdout
-        trades (a 90% bootstrap CI of [-1.69%, -0.38%] — informative,
-        but not tight); widening the holdout window, or narrowing
-        TP_MULT/SL_MULT/MAX_HOLDING via their own new CLI flags,
-        directly grows this sample.
+    holdout_frac : GATE HARDENING change 4 — was hardcoded to 0.15; now
+        a parameter (CLI-overridable via --holdout-frac) defaulting to
+        DEFAULT_HOLDOUT_FRAC. The run that triggered that revision's
+        changes produced only 36 holdout trades (a 90% bootstrap CI of
+        [-1.69%, -0.38%] — informative, but not tight); widening the
+        holdout window, or narrowing TP_MULT/SL_MULT/MAX_HOLDING via
+        their own CLI flags, directly grows this sample.
 
     n_bagged_fits : forwarded to GBTAgent.fit().
 
@@ -1315,6 +1324,13 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
 
     random_state : the representative seed chosen by
         _pick_representative_confirmation_seed().
+
+    out_dir : where to write reliability_diagram.png,
+        calibration_report.json, deployment_gate.json, and the
+        deployed/candidate .joblib checkpoint. Defaults to the
+        module-level OUT_DIR; main() passes the per-symbol out_dir
+        (e.g. "outcomes/gbt/BTCUSDT/") so different symbols' deployed
+        models never overwrite each other.
 
     DEPLOYMENT GATE: CPCV/stability passing is necessary but not
     sufficient — this function additionally requires the trained
@@ -1325,6 +1341,7 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
     filename, and any previously deployed gbt_agent_best.joblib is left
     untouched.
     """
+    out_dir = OUT_DIR if out_dir is None else out_dir
     holdout_frac = DEFAULT_HOLDOUT_FRAC if holdout_frac is None else holdout_frac
 
     n = len(states)
@@ -1375,11 +1392,11 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
 
     plot_reliability_diagram(full_probs, y_holdout_mapped,
                              ["LONG", "SHORT", "HOLD"],
-                             os.path.join(OUT_DIR, "reliability_diagram.png"))
+                             os.path.join(out_dir, "reliability_diagram.png"))
 
-    with open(os.path.join(OUT_DIR, "calibration_report.json"), "w") as f:
+    with open(os.path.join(out_dir, "calibration_report.json"), "w") as f:
         json.dump(report, f, indent=2, default=_json_default)
-    print(f"  ✓  Calibration report saved → {OUT_DIR}/calibration_report.json")
+    print(f"  ✓  Calibration report saved → {out_dir}/calibration_report.json")
 
     test_pnl, n_trades, avg_pnl, trade_returns = simulate_pnl(
         states, labels, holdout_mask, agent, prob_threshold=entry_threshold)
@@ -1411,11 +1428,11 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
         "holdout_avg_pnl_bootstrap_ci": ci,
         "deploy_gate_passed": bool(deploy_ok),
     }
-    with open(os.path.join(OUT_DIR, "deployment_gate.json"), "w") as f:
+    with open(os.path.join(out_dir, "deployment_gate.json"), "w") as f:
         json.dump(gate_status, f, indent=2, default=_json_default)
 
     if deploy_ok:
-        save_path = os.path.join(OUT_DIR, "gbt_agent_best.joblib")
+        save_path = os.path.join(out_dir, "gbt_agent_best.joblib")
         agent.save(save_path)
         print(f"\n  ✓ HOLDOUT GATE PASSED (avg/trade={avg_pnl:+.4%} > "
               f"floor={HOLDOUT_AVG_TRADE_FLOOR:+.2%}, n_trades={n_trades}) "
@@ -1426,7 +1443,7 @@ def run_final_training(states: np.ndarray, labels: dict, aligned_df: pd.DataFram
                   f"treat as a provisional deploy, not a confirmed edge, until "
                   f"more holdout trades accumulate.")
     else:
-        save_path = os.path.join(OUT_DIR, "gbt_agent_candidate_FAILED_HOLDOUT.joblib")
+        save_path = os.path.join(out_dir, "gbt_agent_candidate_FAILED_HOLDOUT.joblib")
         agent.save(save_path)
         print(f"\n  ⛔ HOLDOUT GATE FAILED — avg/trade={avg_pnl:+.4%} "
               f"(floor={HOLDOUT_AVG_TRADE_FLOOR:+.2%}, n_trades={n_trades} "
@@ -1458,6 +1475,13 @@ def main():
     global PBO_MAX_ALLOWED, MIN_TEST_SHARPE, MIN_EDGE_OVER_BASELINE
 
     parser = argparse.ArgumentParser(description="Calibrated GBT meta-labeling pipeline")
+    parser.add_argument("--symbol", default=SYMBOL, choices=AVAILABLE_SYMBOLS,
+                        help=f"Trading pair to run the pipeline for (default: "
+                             f"%(default)s). Choices: {list(AVAILABLE_SYMBOLS)}. "
+                             f"Each symbol's data comes from "
+                             f"data/raw/<symbol>/<timeframe>/ (see "
+                             f"data_manager.py) and its outputs are written "
+                             f"under outcomes/gbt/<symbol>/.")
     parser.add_argument("--force-final-training", action="store_true",
                         help="Proceed to final training even if the nested gate "
                              "confirmation (per-seed + pooled + recent-regime) "
@@ -1500,7 +1524,7 @@ def main():
                         help="Number of independently-seeded base-estimator "
                              "fits to average per (fold, seed) (default: "
                              "%(default)s).")
-    # ── GATE HARDENING (this revision) — new CLI overrides ──────────────
+    # ── GATE HARDENING — CLI overrides ────────────────────────────────
     parser.add_argument("--holdout-frac", type=float, default=DEFAULT_HOLDOUT_FRAC,
                         help="Fraction of the dataset (chronologically last) "
                              "held out for final deployment gating (default: "
@@ -1543,11 +1567,17 @@ def main():
     MIN_TEST_SHARPE = args.min_test_sharpe
     MIN_EDGE_OVER_BASELINE = args.min_edge_over_baseline
 
+    symbol = args.symbol
+    out_dir = symbol_out_dir(symbol)   # e.g. outcomes/gbt/BTCUSDT/ — see docstring
+
+    print(f"{'='*62}\n  SYMBOL: {symbol}\n  OUTPUT DIR: {out_dir}\n{'='*62}")
+
     print("Building states + triple-barrier labels...")
     states, labels, prices, aligned_df = build_states_and_labels(
         frozen=args.frozen_data,
         enable_multi_timeframe=(False if args.no_multi_timeframe else None),
         tp_mult=args.tp_mult, sl_mult=args.sl_mult, max_holding=args.max_holding,
+        symbol=symbol,
     )
     print(f"  {len(states):,} rows  |  state_dim={states.shape[1]}")
     n_long  = int((labels["best_action"] == 0).sum())
@@ -1571,7 +1601,8 @@ def main():
     baseline_stats = None
     if not args.skip_baseline:
         baseline_stats = run_logistic_baseline(states, labels, aligned_df,
-                                               seeds=confirmation_seeds)
+                                               seeds=confirmation_seeds,
+                                               out_dir=out_dir)
     else:
         print("\n  ⏭  Skipping logistic-regression baseline (--skip-baseline). "
               "The baseline-edge gate will be treated as passed.")
@@ -1588,17 +1619,17 @@ def main():
     confirmation = confirm_gate_nested(
         states, labels, aligned_df, entry_threshold=entry_threshold,
         confirmation_seeds=confirmation_seeds, min_pass_frac=args.min_pass_frac,
-        n_bagged_fits=args.n_bagged_fits,
+        n_bagged_fits=args.n_bagged_fits, out_dir=out_dir,
     )
 
     gate_and_summarize(
         confirmation["pooled_path_results"], entry_threshold=entry_threshold,
-        threshold_sweep=selection, seed=None, write=True,
+        threshold_sweep=selection, seed=None, write=True, out_dir=out_dir,
     )
 
-    # ── STEP 1.5 — baseline-edge gate (this revision, GATE HARDENING
-    #    change 3). The GBT's pooled confirmation mean must beat the
-    #    logistic baseline's pooled mean by MIN_EDGE_OVER_BASELINE. ──────
+    # ── STEP 1.5 — baseline-edge gate (GATE HARDENING change 3). The
+    #    GBT's pooled confirmation mean must beat the logistic
+    #    baseline's pooled mean by MIN_EDGE_OVER_BASELINE. ────────────────
     baseline_edge_ok = True
     edge = None
     if baseline_stats is not None:
@@ -1606,7 +1637,7 @@ def main():
         baseline_mean = baseline_stats["mean_test_avg_pnl"]
         edge = gbt_mean - baseline_mean
         baseline_edge_ok = edge > MIN_EDGE_OVER_BASELINE
-        print(f"\n{'='*62}\n  BASELINE-EDGE GATE (this revision)\n{'='*62}")
+        print(f"\n{'='*62}\n  BASELINE-EDGE GATE\n{'='*62}")
         print(f"  GBT pooled mean test avg/trade      : {gbt_mean:+.4%}")
         print(f"  Logistic baseline pooled mean        : {baseline_mean:+.4%}")
         print(f"  Edge (GBT - baseline)                : {edge:+.4%}  "
@@ -1638,16 +1669,17 @@ def main():
 
     chosen_seed = _pick_representative_confirmation_seed(confirmation["per_seed"])
     print(f"\n{'#'*62}\n  STEP 2 — FINAL DEPLOYABLE TRAINING + CALIBRATION  "
-          f"(representative confirmation seed={chosen_seed})\n{'#'*62}")
+          f"(symbol={symbol}, representative confirmation seed={chosen_seed})\n{'#'*62}")
     run_final_training(states, labels, aligned_df, entry_threshold=entry_threshold,
                        random_state=chosen_seed, n_bagged_fits=args.n_bagged_fits,
-                       holdout_frac=args.holdout_frac)
+                       holdout_frac=args.holdout_frac, out_dir=out_dir)
 
 
 if __name__ == "__main__":
     main()
 
 # python main_gbt.py --min-path-test-trades 15
+# python main_gbt.py --symbol BTCUSDT
 # python main_gbt.py --disable-multi-timeframe
 # python main_gbt.py --frozen-data --force-final-training
 # python main_gbt.py --frozen-data --holdout-frac 0.20 --max-holding 16 --tp-mult 1.3 --sl-mult 0.7

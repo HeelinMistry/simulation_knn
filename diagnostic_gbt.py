@@ -32,10 +32,32 @@ TWO REAL BUGS THIS FILE WORKS AROUND (see GBTExecutor below)
    GBTExecutor threads self.current_side through so in-position
    decisions use ground truth.
 
+CHANGES IN THIS REVISION — MULTI-SYMBOL SUPPORT
+───────────────────────────────────────────────
+Mirrors main_gbt.py's multi-symbol revision:
+
+  - New `--symbol` CLI flag (default main_gbt.SYMBOL i.e. "XRPUSDT",
+    choices = data_manager's SYMBOLS list via main_gbt.AVAILABLE_SYMBOLS).
+  - load_data() now takes a `symbol` parameter and forwards it to
+    data_manager.update_master_data()/update_all_timeframes(), so
+    diagnostics always run against the SAME symbol's data the
+    checkpoint being diagnosed was trained on.
+  - Outputs are read from / written to a per-symbol subfolder,
+    matching main_gbt.py's symbol_out_dir(): checkpoint default,
+    cpcv_summary.json / calibration_report.json lookups, and this
+    file's own `diagnostics/` output directory (OUT_DIR) are all
+    computed from `--symbol` inside main(), instead of the fixed,
+    symbol-less paths this file used before. OUT_DIR is a module-level
+    variable (not a constant) reassigned once at the top of main() —
+    every plotting/summary helper below reads it as a global at call
+    time, so this reassignment is picked up without needing to thread
+    an out_dir parameter through every function.
+
 Run
 ────
     python diagnostic_gbt.py --split val
-    python diagnostic_gbt.py --split both --checkpoint outcomes/gbt/gbt_agent_best.joblib
+    python diagnostic_gbt.py --symbol BTCUSDT --split val
+    python diagnostic_gbt.py --split both --checkpoint outcomes/gbt/XRPUSDT/gbt_agent_best.joblib
 """
 
 import argparse
@@ -64,7 +86,9 @@ from triple_barrier          import build_meta_labels, atr_to_frac
 
 # main_gbt.py is imported (not duplicated) as the single source of truth
 # for training config, so this file can never silently drift out of sync
-# with what the checkpoint was actually trained on.
+# with what the checkpoint was actually trained on. This also gives us
+# main_gbt's multi-symbol helpers (SYMBOL, AVAILABLE_SYMBOLS,
+# symbol_out_dir) for free — see module docstring.
 import main_gbt as gbt_cfg
 
 FEATURES               = gbt_cfg.FEATURES
@@ -76,12 +100,20 @@ CONTEXT_PACES          = gbt_cfg.CONTEXT_PACES
 TP_MULT, SL_MULT       = gbt_cfg.TP_MULT, gbt_cfg.SL_MULT
 MAX_HOLDING            = gbt_cfg.MAX_HOLDING
 COMMISSION             = gbt_cfg.COMMISSION
+DEFAULT_SYMBOL         = gbt_cfg.SYMBOL
+AVAILABLE_SYMBOLS      = gbt_cfg.AVAILABLE_SYMBOLS
 
 ACTION_DIM    = 4
 ACTION_NAMES  = ["LONG", "SHORT", "CLOSE", "HOLD"]
 ACTION_COLORS = ["#2ecc71", "#e74c3c", "#f39c12", "#95a5a6"]
 ATR_IDX       = FEATURES.index("ATR_Scaled")
 
+# NOTE (multi-symbol revision): these three are now just FALLBACK
+# defaults for the flat/symbol-less layout — main() recomputes all of
+# them (and reassigns OUT_DIR) from `--symbol` before running anything,
+# via gbt_cfg.symbol_out_dir(). Any caller that imports this module and
+# uses these constants directly (without going through main()) still
+# gets the pre-multi-symbol XRPUSDT-flat behaviour unchanged.
 CHECKPOINT_DEFAULT = os.path.join(gbt_cfg.OUT_DIR, "gbt_agent_best.joblib")
 CPCV_SUMMARY_PATH  = os.path.join(gbt_cfg.OUT_DIR, "cpcv_summary.json")
 CALIB_JSON_PATH    = os.path.join(gbt_cfg.OUT_DIR, "calibration_report.json")
@@ -125,8 +157,18 @@ def _to_gbt_state(state: np.ndarray) -> np.ndarray:
 # precomputed batch.
 # ─────────────────────────────────────────────────────────────────────────
 
-def load_data():
-    df = update_master_data("4h")
+def load_data(symbol: str = DEFAULT_SYMBOL, frozen: bool = False):
+    """
+    symbol : which coin's master CSV(s) to load (default
+        DEFAULT_SYMBOL/"XRPUSDT"). Forwarded to
+        data_manager.update_master_data()/update_all_timeframes() so
+        the primary (4h) and context (15m/1h) timeframes are always
+        the SAME symbol as the checkpoint being diagnosed.
+    frozen : forwarded to data_manager — if True, uses the existing
+        master CSV(s) as-is instead of refetching/appending new raw
+        data (mirrors main_gbt.py's --frozen-data).
+    """
+    df = update_master_data("4h", symbol=symbol, frozen=frozen)
     df = df[["Open_time", "Close"] + FEATURES].dropna().reset_index(drop=True)
     indicators_arr = df[FEATURES].values.astype(np.float32)
     prices_arr     = df["Close"].values.astype(np.float32)
@@ -135,7 +177,8 @@ def load_data():
     extra_context_arr = None
     if ENABLE_MULTI_TIMEFRAME:
         try:
-            timeframe_dfs = update_all_timeframes(CONTEXT_TIMEFRAMES)
+            timeframe_dfs = update_all_timeframes(CONTEXT_TIMEFRAMES, symbol=symbol,
+                                                  frozen=frozen)
             missing = [tf for tf in CONTEXT_TIMEFRAMES if tf not in timeframe_dfs]
             if missing:
                 raise FileNotFoundError(f"missing timeframe(s): {missing}")
@@ -312,6 +355,10 @@ def make_fig(rows, cols, title, figsize=None):
 
 
 def savefig(fig, name):
+    # OUT_DIR is a module-level variable (not a constant) reassigned by
+    # main() once --symbol is parsed — see module docstring. Reading it
+    # here (rather than capturing it at import time) is what makes that
+    # reassignment take effect for every plot this run produces.
     path = os.path.join(OUT_DIR, name)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(path, dpi=120, bbox_inches="tight", facecolor=STYLE["figure.facecolor"])
@@ -801,21 +848,55 @@ def run_full_suite(agent, ep, full_labels, calib_report=None):
 # ─────────────────────────────────────────────────────────────────────────
 
 def main():
+    global OUT_DIR
+
     parser = argparse.ArgumentParser(description="GBT Diagnostic Suite")
+    parser.add_argument("--symbol", default=DEFAULT_SYMBOL, choices=AVAILABLE_SYMBOLS,
+                        help=f"Trading pair whose data/checkpoint to diagnose "
+                             f"(default: %(default)s). Must match the symbol "
+                             f"the checkpoint under --checkpoint was actually "
+                             f"trained on — see main_gbt.py's --symbol.")
     parser.add_argument("--split", default="val", choices=["train", "val", "both"])
-    parser.add_argument("--checkpoint", default=CHECKPOINT_DEFAULT)
+    parser.add_argument("--checkpoint", default=None,
+                        help="Path to the .joblib checkpoint to diagnose. "
+                             "Defaults to outcomes/gbt/<symbol>/gbt_agent_best.joblib "
+                             "for whichever --symbol was given.")
+    parser.add_argument("--frozen-data", action="store_true",
+                        help="Use the existing master CSV(s) as-is instead of "
+                             "refetching/appending new raw data (mirrors "
+                             "main_gbt.py's --frozen-data).")
     args = parser.parse_args()
 
+    symbol = args.symbol
+
+    # MULTI-SYMBOL SUPPORT: every symbol's checkpoint/CPCV-summary/
+    # diagnostics live under their own subfolder — reuse main_gbt's
+    # symbol_out_dir() so the layout is guaranteed identical to what
+    # main_gbt.py actually wrote. OUT_DIR (this file's own diagnostics/
+    # output folder) is reassigned here — every plot/summary helper
+    # above reads the OUT_DIR global at call time, so this takes effect
+    # for the rest of the run without threading an out_dir parameter
+    # through each of them.
+    symbol_dir = gbt_cfg.symbol_out_dir(symbol)
+    OUT_DIR = os.path.join(symbol_dir, "diagnostics")
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    checkpoint = args.checkpoint or os.path.join(symbol_dir, "gbt_agent_best.joblib")
+    cpcv_summary_path = os.path.join(symbol_dir, "cpcv_summary.json")
+
     sep = "=" * 62
-    print(f"\n{sep}\n  GBT DIAGNOSTIC SUITE\n  Checkpoint: {args.checkpoint}\n"
-          f"  Split: {args.split}\n  Output: {OUT_DIR}\n{sep}\n")
+    print(f"\n{sep}\n  GBT DIAGNOSTIC SUITE\n  Symbol: {symbol}\n"
+          f"  Checkpoint: {checkpoint}\n  Split: {args.split}\n"
+          f"  Output: {OUT_DIR}\n{sep}\n")
 
     print("Loading data...")
-    df, indicators_arr, prices_arr, extra_context_arr, n = load_data()
+    df, indicators_arr, prices_arr, extra_context_arr, n = load_data(
+        symbol=symbol, frozen=args.frozen_data,
+    )
 
     print("Loading GBT checkpoint...")
     agent = GBTAgent(state_dim=1, action_dim=ACTION_DIM)  # placeholder, load() overwrites
-    agent.load(args.checkpoint)
+    agent.load(checkpoint)
 
     market_dim  = len(FEATURES) * 2 * len(PACES)
     context_dim = extra_context_arr.shape[1] if extra_context_arr is not None else 0
@@ -824,11 +905,14 @@ def main():
         raise RuntimeError(
             f"Checkpoint state_dim={agent.state_dim} doesn't match this codebase's "
             f"rebuilt state_dim={expected_state_dim} (market={market_dim}, "
-            f"context={context_dim}). Either ENABLE_MULTI_TIMEFRAME/CONTEXT_PACES/"
-            f"CONTEXT_TIMEFRAMES in main_gbt.py changed since this checkpoint was "
-            f"trained, or the raw data under data/raw/<timeframe>/ is different. "
-            f"Refusing to run diagnostics on a mismatched state — see "
-            f"gbt_agent.py's GBTAgent for what state_dim is actually used for."
+            f"context={context_dim}) for symbol='{symbol}'. Either "
+            f"ENABLE_MULTI_TIMEFRAME/CONTEXT_PACES/CONTEXT_TIMEFRAMES in "
+            f"main_gbt.py changed since this checkpoint was trained, the raw "
+            f"data under data/raw/{symbol}/<timeframe>/ is different, or "
+            f"--checkpoint/--symbol point at a checkpoint trained for a "
+            f"DIFFERENT symbol. Refusing to run diagnostics on a mismatched "
+            f"state — see gbt_agent.py's GBTAgent for what state_dim is "
+            f"actually used for."
         )
     print(f"  ✓  state_dim confirmed: {agent.state_dim}  "
           f"(multi_timeframe={'yes' if context_dim else 'no'})")
@@ -845,10 +929,10 @@ def main():
                                      sl_mult=SL_MULT, max_holding=MAX_HOLDING,
                                      commission=COMMISSION)
 
-    if os.path.exists(CPCV_SUMMARY_PATH):
-        with open(CPCV_SUMMARY_PATH) as f:
+    if os.path.exists(cpcv_summary_path):
+        with open(cpcv_summary_path) as f:
             cpcv = json.load(f)
-        print(f"\n{sep}\n  CPCV SUMMARY (from training — {CPCV_SUMMARY_PATH})\n{sep}")
+        print(f"\n{sep}\n  CPCV SUMMARY (from training — {cpcv_summary_path})\n{sep}")
         print(f"  Paths          : {cpcv['n_paths']}  ({cpcv['n_paths_positive']} positive)")
         print(f"  Mean test P/L  : {cpcv['mean_test_pnl']:+.4%}")
         print(f"  Std  test P/L  : {cpcv['std_test_pnl']:.4%}")
@@ -856,8 +940,9 @@ def main():
         print(f"  PBO            : {cpcv.get('pbo', float('nan')):.1%}")
         print(f"{sep}\n")
     else:
-        print(f"\n  ⚠  No {CPCV_SUMMARY_PATH} found — run main_gbt.py's full "
-              f"pipeline to generate CPCV robustness metrics.\n")
+        print(f"\n  ⚠  No {cpcv_summary_path} found — run "
+              f"`python main_gbt.py --symbol {symbol}`'s full pipeline to "
+              f"generate CPCV robustness metrics.\n")
 
     if args.split in ("val", "both"):
         print("\n" + "-" * 62 + "\n  Full diagnostic: VAL (held-out)\n" + "-" * 62)
@@ -884,5 +969,6 @@ if __name__ == "__main__":
     main()
 
 # python diagnostic_gbt.py - -split val
+# python diagnostic_gbt.py - -symbol BTCUSDT - -split val
 # python diagnostic_gbt.py - -split both - -checkpoint
-# outcomes / gbt / gbt_agent_best.joblib
+# outcomes / gbt / XRPUSDT / gbt_agent_best.joblib
