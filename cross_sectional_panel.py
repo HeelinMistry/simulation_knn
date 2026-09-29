@@ -57,6 +57,45 @@ panel arrays, it will only produce correct results because of this
 block structure — do not reorder Panel's arrays without updating every
 touch index accordingly.
 
+CHANGES IN THIS REVISION — GATE-HARDENING PARITY WITH main_gbt.py
+────────────────────────────────────────────────────────────────────
+The first 7-symbol cross-sectional run (main_cross_sectional_gbt.py)
+failed its own confirm_gate() on PBO (54.1% > 40% allowed) and mean
+test Sharpe (0.098 < 0.15 floor), and even the checks it did pass
+(directional consistency 74/148 = exactly 50.0%) did so with no
+margin at all. Reviewing that run also surfaced two real coverage
+gaps that had nothing to do with whether the strategy itself has an
+edge:
+
+  1. This module never checked whether the panel's edge is
+     concentrated in stale history (main_gbt.py's "recent-regime"
+     check, confirm_gate_nested()'s GATE HARDENING change 2, was never
+     ported here — see this module's own prior docstring note).
+  2. This module never ran the logistic-regression capacity-floor
+     baseline or the resulting baseline-edge gate (main_gbt.py's
+     run_logistic_baseline() + MIN_EDGE_OVER_BASELINE check), so there
+     was no way to tell whether a GBT-specific edge exists at all
+     versus the GBT merely rediscovering the same marginal, shared
+     signal a near-linear model would also find.
+  3. The excluded-path pattern in that run's cpcv_summary.json (path
+     ids 7, 8, 10, 17, 18, 22, 27 recurring as "too few test trades"
+     across MULTIPLE seeds) was invisible in the printed output —
+     random_state only ever reaches model fitting, never which rows
+     exist in a path's train/test mask, so a test_groups combination
+     excluded in most/all seeds is a structural data-coverage gap
+     (e.g. align_panel()'s strict inner-join leaving too few
+     overlapping, barrier-resolved rows for that calendar window
+     across every symbol at once), not per-seed noise, and is worth
+     surfacing distinctly from ordinary per-seed variance.
+
+This revision adds panel_extract_recent_regime_result() (item 1),
+run_panel_logistic_baseline() (item 2), and
+summarize_recurring_exclusions() (item 3) — all reusing existing
+main_gbt.py constants/functions so the panel pipeline can never
+silently drift out of sync with the single-symbol pipeline's own
+definitions of these checks. main_cross_sectional_gbt.py wires all
+three into confirm_gate()/main().
+
 Usage
 ──────
     from cross_sectional_panel import build_panel, run_panel_cpcv
@@ -166,6 +205,18 @@ def align_panel(symbol_data_list: list) -> Panel:
     at — losing a handful of boundary rows is far safer than silently
     feeding simulate_pnl() a touch index that means something
     different than it thinks.
+
+    NOTE (this revision): this strict inner join is also the leading
+    suspect for the recurring path exclusions surfaced by
+    summarize_recurring_exclusions() — a calendar window where even
+    ONE symbol has a data gap (holiday-thin volume, an exchange outage,
+    a listing that started later than the others) drops that window
+    for every symbol at once, shrinking the row count available to
+    CPCV's train/test masks for that window regardless of random_state.
+    Fixing that (if warranted) would mean loosening the join itself —
+    a real design decision with leakage implications, not something
+    this revision changes; see summarize_recurring_exclusions()'s
+    docstring for how to use its output to decide whether to.
     """
     common = None
     for sd in symbol_data_list:
@@ -344,6 +395,14 @@ def generate_panel_cpcv_paths(panel: Panel, n_groups: int = None,
     `lookback_ticks` here is a count of SHARED CALENDAR TICKS (each
     tick = one shared timestamp, i.e. one primary-timeframe candle),
     identical units to walkforward.compute_required_lookback_ticks().
+
+    NOTE: this function's `n_groups`/`n_test_groups` default to
+    gbt.N_GROUPS/gbt.N_TEST_GROUPS — the SAME constants
+    gbt.RECENT_REGIME_GROUPS is derived from. That's what lets
+    panel_extract_recent_regime_result() below identify "the panel's
+    own most-recently-observed regime" path by the exact same
+    test_groups tuple main_gbt.py uses for a single symbol, without
+    needing a separate panel-specific constant.
     """
     n_groups = gbt.N_GROUPS if n_groups is None else n_groups
     n_test_groups = gbt.N_TEST_GROUPS if n_test_groups is None else n_test_groups
@@ -454,6 +513,103 @@ def panel_evaluate_paths_at_threshold(panel: Panel, fitted_paths: list,
     return results
 
 
+def panel_extract_recent_regime_result(panel: Panel, fitted_paths: list,
+                                       threshold: float) -> dict:
+    """
+    GATE-HARDENING PARITY (this revision) — panel analogue of
+    main_gbt._extract_recent_regime_result().
+
+    Pulls the panel CPCV path whose test_groups equal
+    gbt.RECENT_REGIME_GROUPS (the last N_TEST_GROUPS groups on the
+    SHARED calendar-group axis — see generate_panel_cpcv_paths()'s
+    docstring on why the same constant applies unmodified here) out of
+    an already-fitted seed's `fitted_paths`, and scores it at
+    `threshold` via panel_simulate_pnl() — no additional model
+    fitting, mirroring how main_gbt.py reuses an already-fitted CPCV
+    path for this check at zero extra cost.
+
+    This is the piece that answers a question confirm_gate()'s core
+    checks (directional consistency / downside floor / PBO / Sharpe,
+    all pooled across every calendar window) cannot: is the panel's
+    apparent edge concentrated in the MOST RECENT shared regime, or
+    does it hold up there specifically — the calendar window closest,
+    among CPCV's paths, to the real final holdout.
+
+    Returns None if that exact test-group combination wasn't generated
+    for this panel/seed (e.g. a short shared timestamp grid, or the
+    combo happened to be pruned by generate_panel_cpcv_paths()'s
+    min_train_rows/min-test-rows checks) — callers treat that as "no
+    recent-regime signal available for this seed", exactly as
+    main_gbt.py's confirm_gate_nested() does.
+    """
+    for path, agent in fitted_paths:
+        if tuple(path.test_groups) == gbt.RECENT_REGIME_GROUPS:
+            res = panel_simulate_pnl(panel, path.test_mask, agent, prob_threshold=threshold)
+            return {
+                "test_groups": list(gbt.RECENT_REGIME_GROUPS),
+                "n_test_trades": res["n_trades"],
+                "test_avg_pnl": res["avg_pnl"],
+                "test_sharpe": gbt._sharpe_like(res["trade_returns"]),
+            }
+    return None
+
+
+def summarize_recurring_exclusions(per_seed_excluded: dict, n_seeds: int,
+                                   min_recur_frac: float = 0.5) -> list:
+    """
+    GATE-HARDENING PARITY (this revision) — diagnostic only, no gating
+    effect.
+
+    Given {seed: [excluded path_result, ...]} — the "excluded_paths"
+    list evaluate_gate() already produces per seed (test_groups combos
+    with < gbt.MIN_PATH_TEST_TRADES test trades that seed) — tallies
+    which test_groups combinations recur as excluded across MULTIPLE
+    seeds.
+
+    Why this matters: random_state only ever reaches model-fitting
+    randomness (max_features per-split subsampling, bagging bootstrap
+    resampling — see gbt_agent.py). It NEVER changes which rows exist
+    in a given path's train/test mask — that's determined purely by
+    generate_panel_cpcv_paths()'s row counts, which are seed-
+    independent. So a test_groups combo excluded for exactly ONE seed
+    is unremarkable (that seed's fitted model happened to trade
+    little in that window), but a combo excluded in
+    `min_recur_frac` or more of ALL seeds means every seed's model —
+    regardless of its own randomness — found too few resolvable
+    trades in that calendar window. That points at a structural data-
+    coverage gap (most likely align_panel()'s strict inner-join
+    dropping rows where even one symbol has a gap — see align_panel()'s
+    docstring), not per-seed noise, and is worth surfacing distinctly
+    so a low pooled trade count isn't misread as "the strategy rarely
+    trades" when it may really mean "the panel's calendar coverage is
+    thin in specific windows".
+
+    Returns a list of {test_groups, n_seeds_excluded, frac_seeds_excluded}
+    dicts for combos at or above `min_recur_frac`, sorted by recurrence
+    (most-recurring first).
+    """
+    tally = {}
+    for seed, excluded in per_seed_excluded.items():
+        seen_this_seed = set()
+        for r in excluded:
+            key = tuple(r["test_groups"])
+            if key in seen_this_seed:
+                continue
+            seen_this_seed.add(key)
+            tally[key] = tally.get(key, 0) + 1
+
+    recurring = []
+    for key, count in tally.items():
+        frac = count / n_seeds if n_seeds else float("nan")
+        if not np.isnan(frac) and frac >= min_recur_frac:
+            recurring.append({
+                "test_groups": list(key), "n_seeds_excluded": count,
+                "n_seeds_total": n_seeds, "frac_seeds_excluded": frac,
+            })
+    recurring.sort(key=lambda r: r["frac_seeds_excluded"], reverse=True)
+    return recurring
+
+
 def panel_sweep_entry_thresholds(panel: Panel, fitted_paths: list,
                                  verbose: bool = True) -> dict:
     """Panel analogue of main_gbt.sweep_entry_thresholds() — re-scores
@@ -487,11 +643,24 @@ def panel_sweep_entry_thresholds(panel: Panel, fitted_paths: list,
                   f"score={score:+.3f}{elig_str}")
 
     best_t = max(candidates, key=lambda k: candidates[k]["score"])
+    n_disqualified = sum(1 for c in candidates.values() if not c["eligible"])
     if candidates[best_t]["score"] == float("-inf"):
         if verbose:
             print(f"  ⚠ No threshold cleared MIN_SWEEP_TRADES={gbt.MIN_SWEEP_TRADES} "
                   f"— falling back to threshold=0.50.")
         best_t = 0.50
+    elif verbose and n_disqualified > 0:
+        # Surfaces the "degenerate threshold sweep" issue directly: if
+        # the higher-conviction candidates can't even be TESTED for
+        # lack of trades, entry_threshold selection is effectively
+        # constrained to whichever low bars still clear MIN_SWEEP_TRADES
+        # — the model isn't producing enough high-conviction
+        # predictions to exercise its own conviction-gating mechanism.
+        print(f"  ⚠ {n_disqualified}/{len(candidates)} candidate threshold(s) "
+              f"disqualified (< {gbt.MIN_SWEEP_TRADES} total test trades) — "
+              f"threshold selection is constrained to the surviving, looser "
+              f"candidates only; this pipeline cannot currently verify "
+              f"whether a stricter entry_threshold would help.")
     if verbose:
         print(f"  ✓ Selected entry_threshold={best_t:.2f}  "
               f"(score={candidates[best_t]['score']:+.3f}, "
@@ -587,6 +756,126 @@ def run_panel_cpcv(panel: Panel, random_state: int = 0, model_type: str = "hgb",
               f"seed={random_state}]")
 
     return path_results, fitted_paths
+
+
+# ─────────────────────────────────────────────
+# Logistic-regression capacity-floor baseline (GATE-HARDENING PARITY)
+# ─────────────────────────────────────────────
+
+def run_panel_logistic_baseline(panel: Panel, seeds: tuple = None,
+                                n_bagged_fits: int = None,
+                                n_groups: int = None, n_test_groups: int = None,
+                                max_paths: int = None, min_train_rows: int = None,
+                                out_dir: str = None) -> dict:
+    """
+    GATE-HARDENING PARITY (this revision) — panel analogue of
+    main_gbt.run_logistic_baseline().
+
+    Fits GBTAgent(model_type="logistic") — a near-minimal-capacity
+    baseline, see gbt_agent.py's module docstring — through the
+    IDENTICAL panel CPCV path generation / purge-embargo / triple-
+    barrier labels the panel GBT pipeline uses, at the default
+    entry_threshold (0.5, panel_simulate_pnl()'s own default), pooled
+    across `seeds` (defaults to gbt.DEFAULT_CONFIRMATION_SEEDS so it's
+    directly comparable to the panel GBT's own confirmation-pool
+    numbers).
+
+    Existing without this, main_cross_sectional_gbt.py's confirm_gate()
+    could report the GBT "passing" its own stability checks with no
+    way to tell whether that stability reflects a GBT-specific edge or
+    just the same marginal signal a near-linear model finds — exactly
+    the ambiguity main_gbt.py's MIN_EDGE_OVER_BASELINE gate exists to
+    resolve for the single-symbol pipeline.
+
+    Returns the pooled gbt.evaluate_gate() stats dict (with "per_seed",
+    "n_pass", "frac_pass" keys added) and writes
+    panel_logistic_baseline.json to `out_dir`, mirroring
+    main_gbt.run_logistic_baseline()'s output shape so
+    main_cross_sectional_gbt.py's baseline-edge gate can consume it
+    identically to the single-symbol pipeline.
+    """
+    out_dir = out_dir or os.path.join(gbt.OUT_DIR, "cross_sectional")
+    os.makedirs(out_dir, exist_ok=True)
+    seeds = gbt.DEFAULT_CONFIRMATION_SEEDS if seeds is None else seeds
+
+    print(f"\n{'#'*62}\n  PANEL LOGISTIC REGRESSION BASELINE (capacity floor check)  "
+          f"seeds={list(seeds)}\n{'#'*62}")
+
+    per_seed = []
+    pooled_results = []
+    for seed in seeds:
+        print(f"\n{'-'*62}\n  [panel baseline] seed {seed}\n{'-'*62}")
+        path_results, _ = run_panel_cpcv(
+            panel, random_state=seed, model_type="logistic", hyperparams={},
+            n_bagged_fits=n_bagged_fits, n_groups=n_groups, n_test_groups=n_test_groups,
+            max_paths=max_paths, min_train_rows=min_train_rows,
+        )
+        pooled_results.extend(path_results)
+
+        seed_passed, seed_stats = gbt.evaluate_gate(path_results)
+        per_seed.append({
+            "seed": seed, "passed": bool(seed_passed),
+            "n_total": seed_stats["n_total"], "n_pos": seed_stats.get("n_pos", 0),
+            "mean_test_avg_pnl": seed_stats["mean_test_avg_pnl"],
+            "min_test_avg_pnl": seed_stats["min_test_avg_pnl"],
+            "pbo": seed_stats["pbo"],
+        })
+        status = "PASS" if seed_passed else "FAIL"
+        pbo_seed_str = f"{seed_stats['pbo']:.1%}" if not np.isnan(seed_stats["pbo"]) else "n/a"
+        print(f"  [panel baseline] seed {seed}: {status}  "
+              f"mean_test_avg={seed_stats['mean_test_avg_pnl']:+.4%}  "
+              f"positive={seed_stats.get('n_pos', 0)}/{seed_stats['n_total']}  "
+              f"PBO={pbo_seed_str}")
+
+    passed, stats = gbt.evaluate_gate(pooled_results)
+    n_pass = sum(r["passed"] for r in per_seed)
+    frac_pass = n_pass / len(seeds) if seeds else float("nan")
+
+    print(f"\n{'='*62}\n  PANEL LOGISTIC BASELINE VERDICT  "
+          f"({stats['n_total']} reliable paths)\n{'='*62}")
+    print(f"  Per-seed stability  : {n_pass}/{len(seeds)} seeds passed ({frac_pass:.0%}) "
+          f"— compare directly against the panel GBT's own per-seed confirmation "
+          f"result.")
+    print(f"  Mean test avg/trade : {stats['mean_test_avg_pnl']:+.4%}")
+    print(f"  Std  test avg/trade : {stats['std_test_avg_pnl']:.4%}")
+    print(f"  Min  test avg/trade : {stats['min_test_avg_pnl']:+.4%}")
+    print(f"  Positive paths      : {stats.get('n_pos', 0)}/{stats['n_total']}")
+    pbo_str = f"{stats['pbo']:.1%}" if not np.isnan(stats["pbo"]) else "n/a"
+    print(f"  PBO                 : {pbo_str}")
+
+    if not np.isnan(stats["pbo"]) and stats["pbo"] > gbt.PBO_MAX_ALLOWED:
+        print(f"\n  → Baseline ALSO fails PBO<={gbt.PBO_MAX_ALLOWED:.0%} at near-minimal "
+              f"model capacity, pooled across the whole panel. This supports a "
+              f"label/regime explanation for the panel GBT's instability over a "
+              f"pure capacity/overfitting explanation.")
+    elif np.isnan(stats["pbo"]):
+        print(f"\n  → Not enough reliable logistic paths to compute a PBO verdict "
+              f"— treat as inconclusive, not a pass.")
+    else:
+        print(f"\n  → Baseline PASSES PBO<={gbt.PBO_MAX_ALLOWED:.0%} at near-minimal "
+              f"capacity. Whether this is good news for the panel GBT now ALSO "
+              f"depends on the baseline-edge gate in main_cross_sectional_gbt.py's "
+              f"main(): a GBT that doesn't outperform this near-linear model by "
+              f"at least {gbt.MIN_EDGE_OVER_BASELINE:.2%} avg/trade is treated as "
+              f"having found the same marginal signal, not a GBT-specific edge.")
+
+    with open(os.path.join(out_dir, "panel_logistic_baseline.json"), "w") as f:
+        json.dump({
+            "seeds": list(seeds),
+            "n_pass": n_pass, "frac_pass": frac_pass,
+            "per_seed": per_seed,
+            "mean_test_avg_pnl": stats["mean_test_avg_pnl"],
+            "std_test_avg_pnl": stats["std_test_avg_pnl"],
+            "min_test_avg_pnl": stats["min_test_avg_pnl"],
+            "n_total": stats["n_total"], "n_pos": stats.get("n_pos", 0),
+            "pbo": stats["pbo"], "logit_lambda": stats["logit_lambda"],
+        }, f, indent=2, default=gbt._json_default)
+    print(f"\n  ✓  Panel logistic baseline saved → {out_dir}/panel_logistic_baseline.json")
+
+    stats["per_seed"] = per_seed
+    stats["n_pass"] = n_pass
+    stats["frac_pass"] = frac_pass
+    return stats
 
 
 # ─────────────────────────────────────────────

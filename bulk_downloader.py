@@ -5,6 +5,6 @@ for interval in ['15m', '1h', '4h']:
         data_type="klines",
         data_frequency=interval,
         asset="spot",
-        symbols=["XRPUSDT"]
+        symbols=["XRPUSDT", "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "ADAUSDT", "LTCUSDT"]
     )
     downloader.run_download()
