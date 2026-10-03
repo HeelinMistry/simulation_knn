@@ -18,6 +18,11 @@ CHANGES IN THIS REVISION
   before this revision), loading fails loudly with rebuild instructions
   instead of a KeyError deep in pandas.
 
+* BB_Scaled removed from FEATURE_COLS (duplicate of MeanDev_Scaled).
+* N_STATES default is now 5 (--n-states to override). Artifacts are saved as
+  pooled_hmm_<tf>_k<K>.joblib so 4- and 5-state models can be compared
+  side by side. A heuristic tag (chop/low-vol, up, down) is printed per state.
+
 Unchanged from the previous revision: no look-ahead (forward filtering),
 fit-once-then-freeze, one global calendar train/test cutoff, canonical
 state ordering, non-overlapping-subsample significance tests.
@@ -46,23 +51,24 @@ from data.data_manager import update_master_data, SYMBOLS
 
 # ── Config ────────────────────────────────────────────────────────────────────
 FEATURE_COLS = [
-    "RSI_Scaled", "MACD_Scaled", "BB_Scaled",
+    "RSI_Scaled", "MACD_Scaled",
     "OBV_Scaled", "ATR_Scaled", "GK_Scaled", "MeanDev_Scaled",
 ]
 CANON_FEATURE = "MeanDev_Scaled"        # states are ordered by this feature's mean
 TIMEFRAME     = "4h"
 CANDLE        = pd.Timedelta(hours=4)
-N_STATES      = 4
+N_STATES      = 5                       # 5 = room for an explicit low-vol chop state
 N_INIT        = 5                       # random restarts; best train log-lik wins
 HORIZONS      = (1, 3, 6, 12, 24)       # candles (4h -> 4h, 12h, 1d, 2d, 4d)
 MODEL_DIR     = "models"
 OUT_DIR       = "data/processed"
 
 
-def _paths(timeframe: str):
+def _paths(timeframe: str, n_states: int = N_STATES):
+    # n_states in the filename so 4- and 5-state artifacts coexist for comparison
     return (
-        os.path.join(MODEL_DIR, f"pooled_hmm_{timeframe}.joblib"),
-        os.path.join(MODEL_DIR, f"pooled_hmm_{timeframe}_profile.json"),
+        os.path.join(MODEL_DIR, f"pooled_hmm_{timeframe}_k{n_states}.joblib"),
+        os.path.join(MODEL_DIR, f"pooled_hmm_{timeframe}_k{n_states}_profile.json"),
     )
 
 
@@ -203,8 +209,8 @@ def state_profile(model: GaussianHMM, canon_to_raw: np.ndarray) -> dict:
     return prof
 
 
-def fit_or_load(frames, cutoff, timeframe=TIMEFRAME, refit=False):
-    model_path, prof_path = _paths(timeframe)
+def fit_or_load(frames, cutoff, timeframe=TIMEFRAME, refit=False, n_states=N_STATES):
+    model_path, prof_path = _paths(timeframe, n_states)
     os.makedirs(MODEL_DIR, exist_ok=True)
 
     if os.path.exists(model_path) and not refit:
@@ -226,7 +232,7 @@ def fit_or_load(frames, cutoff, timeframe=TIMEFRAME, refit=False):
     X, lengths = build_train_matrix(frames, cutoff)
     print(f"  Fitting pooled HMM on TRAIN only: {len(X):,} obs, "
           f"{len(lengths)} sequence(s), cutoff {cutoff}")
-    model = fit_best_hmm(X, lengths)
+    model = fit_best_hmm(X, lengths, n_states=n_states)
     order = canonical_order(model)
     art = {
         "model": model,
@@ -335,8 +341,28 @@ def dwell_times(df: pd.DataFrame, K: int) -> pd.Series:
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
+def tag_states(model, canon_to_raw) -> dict:
+    """
+    Heuristic labels from the TRAIN-fit means (diagnostic only):
+      chop     = lowest GK_Scaled (quietest realised range) among states whose
+                 |MeanDev| is below the median |MeanDev| of all states
+      (falls back to the lowest-GK state if none qualify)
+      directional states are tagged by MeanDev sign: down / up.
+    """
+    gk = FEATURE_COLS.index("GK_Scaled")
+    md = FEATURE_COLS.index("MeanDev_Scaled")
+    K = len(canon_to_raw)
+    gk_m = np.array([model.means_[r, gk] for r in canon_to_raw])
+    md_m = np.array([model.means_[r, md] for r in canon_to_raw])
+    near = np.abs(md_m) <= np.median(np.abs(md_m))
+    cand = np.where(near)[0] if near.any() else np.arange(K)
+    chop = int(cand[np.argmin(gk_m[cand])])
+    return {k: ("chop/low-vol" if k == chop else ("up" if md_m[k] > 0 else "down"))
+            for k in range(K)}
+
+
 def run_pooled_hmm(train_frac=0.70, refit=False, primary_h=6, timeframe=TIMEFRAME,
-                   frozen_data=True):
+                   frozen_data=True, n_states=N_STATES):
     print(f"\n{'=' * 64}\n  POOLED HMM — STEP 1: OUT-OF-SAMPLE STATE CHECK\n{'=' * 64}")
     frames = load_symbol_frames(SYMBOLS, timeframe, frozen=frozen_data)
     if not frames:
@@ -346,14 +372,15 @@ def run_pooled_hmm(train_frac=0.70, refit=False, primary_h=6, timeframe=TIMEFRAM
     cutoff = global_cutoff(frames, train_frac)
     print(f"\n  Global train/test cutoff: {cutoff}  (train_frac={train_frac})")
 
-    art = fit_or_load(frames, cutoff, timeframe, refit=refit)
+    art = fit_or_load(frames, cutoff, timeframe, refit=refit, n_states=n_states)
     cutoff = pd.Timestamp(art["cutoff"])                # trust the frozen cutoff
     model = art["model"]
     K = model.n_components
 
-    print("\n  [Canonical state profile — TRAIN-fit means]")
-    print(pd.DataFrame(state_profile(model, art["canon_to_raw"])).T.drop(columns="raw_state")
-          .round(3).to_string())
+    print(f"\n  [Canonical state profile — TRAIN-fit means, K={K}]")
+    prof_df = pd.DataFrame(state_profile(model, art["canon_to_raw"])).T.drop(columns="raw_state")
+    prof_df["tag"] = pd.Series(tag_states(model, art["canon_to_raw"]))
+    print(prof_df.round(3).to_string())
 
     print("\n  [Transition matrix, canonical order]")
     o = art["canon_to_raw"]
@@ -423,11 +450,13 @@ if __name__ == "__main__":
     ap.add_argument("--train-frac", type=float, default=0.70)
     ap.add_argument("--primary-horizon", type=int, default=6, choices=HORIZONS)
     ap.add_argument("--timeframe", default=TIMEFRAME)
+    ap.add_argument("--n-states", type=int, default=N_STATES,
+                    help="number of HMM states (4 vs 5 artifacts are saved separately)")
     ap.add_argument("--rescan-raw", action="store_true",
                     help="let update_master_data() rescan raw files (default: frozen masters)")
     a = ap.parse_args()
     run_pooled_hmm(a.train_frac, a.refit, a.primary_horizon, a.timeframe,
-                   frozen_data=not a.rescan_raw)
+                   frozen_data=not a.rescan_raw, n_states=a.n_states)
 
 # Run standard evaluation using the frozen model or fit if missing
 # python pooled_hmm_pipeline.py
