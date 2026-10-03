@@ -1,94 +1,433 @@
 """
 pooled_hmm_pipeline.py
 ─────────────────────────────────────────────────────────────
-Trains a single pooled GaussianHMM across multiple cryptocurrency symbols
-using sequence lengths, and maps observations back to their generalized states.
+Pooled GaussianHMM across symbols — STEP 1: do the states predict anything
+out-of-sample?
+
+What changed vs. the previous revision
+──────────────────────────────────────
+1. NO LOOK-AHEAD. States are produced by the forward (filtering) algorithm,
+   alpha_t = P(s_t | x_1..x_t), never model.predict() / predict_proba().
+   `forward_filter()` / `filter_step()` are the same code a live loop will use.
+   Viterbi is still computed ONCE, purely as a diagnostic to show how much it
+   flatters the labels.
+2. FIT ONCE, THEN FREEZE. The fitted model + feature list + canonical state
+   map + train cutoff are saved to models/pooled_hmm_<tf>.joblib (+ a JSON
+   profile). Re-runs LOAD the artifact; pass --refit to deliberately retrain.
+   States are canonicalised (sorted by the mean of MeanDev_Scaled) so the
+   index has a deterministic meaning even if you do refit.
+3. OUT-OF-SAMPLE. One GLOBAL calendar cutoff (default: 70th percentile of all
+   timestamps) is applied to every symbol, so no symbol trains on a period
+   another symbol is tested on (crypto is highly correlated, so per-symbol
+   splits would leak). The model is fit on train rows only. Filtering runs
+   continuously through train -> test (it only ever looks backwards), and
+   evaluation uses test rows only.
+4/5. (Live inference + warm-up are NOT in this step.) `forward_filter` /
+   `filter_step` / `emission_logprob` have no dependency on update_master_data
+   and take plain arrays, so the live path can import them directly.
+
+Evaluation
+──────────
+For each causal state, forward log-returns over several horizons (in candles)
+are measured from the close of candle t (when the state becomes known) to the
+close of candle t+h. We report raw and EXCESS (vs. that symbol's unconditional
+test-period mean) returns. Overlapping windows inflate significance, so
+t-stats and Kruskal-Wallis use non-overlapping subsamples (every h-th candle
+per symbol).
+
+Run:
+    python pooled_hmm_pipeline.py                # fit once (or load), evaluate
+    python pooled_hmm_pipeline.py --refit        # force retrain
+    python pooled_hmm_pipeline.py --train-frac 0.6 --primary-horizon 12
 """
 
+import argparse
+import json
+import os
+from datetime import datetime, timezone
+
+import joblib
 import numpy as np
 import pandas as pd
 from hmmlearn.hmm import GaussianHMM
+from scipy import stats
+from scipy.stats import multivariate_normal
+
 from data.data_manager import update_master_data, SYMBOLS
 
+# ── Config ────────────────────────────────────────────────────────────────────
+FEATURE_COLS = [
+    "RSI_Scaled", "MACD_Scaled", "BB_Scaled",
+    "OBV_Scaled", "ATR_Scaled", "MeanDev_Scaled",
+]
+CANON_FEATURE = "MeanDev_Scaled"        # states are ordered by this feature's mean
+TIMEFRAME     = "4h"
+CANDLE        = pd.Timedelta(hours=4)
+N_STATES      = 4
+N_INIT        = 5                       # random restarts; best train log-lik wins
+HORIZONS      = (1, 3, 6, 12, 24)       # candles (4h -> 4h, 12h, 1d, 2d, 4d)
+MODEL_DIR     = "models"
+OUT_DIR       = "data/processed"
 
-def run_pooled_hmm():
-    feature_cols = [
-        "RSI_Scaled", "MACD_Scaled", "BB_Scaled",
-        "OBV_Scaled", "ATR_Scaled", "MeanDev_Scaled"
-    ]
 
-    all_X = []
-    sequence_lengths = []
-    coin_metadata = []  # Keeps track of which row belongs to which coin/timestamp
+def _paths(timeframe: str):
+    return (
+        os.path.join(MODEL_DIR, f"pooled_hmm_{timeframe}.joblib"),
+        os.path.join(MODEL_DIR, f"pooled_hmm_{timeframe}_profile.json"),
+    )
 
-    print(f"\n{'=' * 60}\n  POOLED HMM PIPELINE: Loading {len(SYMBOLS)} symbols\n{'=' * 60}")
 
-    # 1. Independent loading to avoid boundary pollution, aggregate for pooled training
-    for symbol in SYMBOLS:
+# ══════════════════════════════════════════════════════════════════════════════
+# Causal inference (reusable live)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def emission_logprob(model: GaussianHMM, X: np.ndarray) -> np.ndarray:
+    """(T, K) log p(x_t | state k). Uses public attributes only."""
+    covs = model.covars_
+    if covs.ndim == 2:                       # (K, F) diag stored compactly
+        covs = np.array([np.diag(c) for c in covs])
+    out = np.empty((len(X), model.n_components))
+    for k in range(model.n_components):
+        out[:, k] = multivariate_normal(
+            mean=model.means_[k], cov=covs[k], allow_singular=True
+        ).logpdf(X)
+    return out
+
+
+def filter_step(model: GaussianHMM, alpha_prev, log_b_t: np.ndarray) -> np.ndarray:
+    """
+    One forward-filtering update.
+      alpha_prev : P(s_{t-1} | x_1..t-1), or None for the first observation
+      log_b_t    : (K,) emission log-probs for x_t
+    Returns P(s_t | x_1..t). Uses ONLY past + current observation.
+    """
+    pred = model.startprob_ if alpha_prev is None else alpha_prev @ model.transmat_
+    a = pred * np.exp(log_b_t - log_b_t.max())      # max-shift for stability
+    s = a.sum()
+    return a / s if s > 0 else np.full_like(a, 1.0 / len(a))
+
+
+def forward_filter(model: GaussianHMM, X: np.ndarray) -> np.ndarray:
+    """(T, K) filtered posteriors P(s_t | x_1..t). No look-ahead."""
+    log_b = emission_logprob(model, X)
+    post = np.empty_like(log_b)
+    alpha = None
+    for t in range(len(X)):
+        alpha = filter_step(model, alpha, log_b[t])
+        post[t] = alpha
+    return post
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Data
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_symbol_frames(symbols, timeframe=TIMEFRAME, frozen=True) -> dict:
+    """
+    Research-time loader (reads the processed masters). frozen=True means no
+    raw-file scan / master rewrite. NOT for live use.
+    Each frame gets a `seg` id that increments at any gap > 1.5 candles, so
+    the HMM never treats a data hole as consecutive candles.
+    """
+    frames = {}
+    for sym in symbols:
         try:
-            df = update_master_data(timeframe="4h", symbol=symbol)
-            clean_data = df.dropna(subset=feature_cols).copy()
+            df = update_master_data(timeframe=timeframe, symbol=sym, frozen=frozen)
+        except FileNotFoundError as exc:
+            print(f"  ⚠ Skipping {sym}: {exc}")
+            continue
+        df = df.dropna(subset=FEATURE_COLS).copy()
+        if df.empty:
+            continue
+        df["Open_time"] = pd.to_datetime(df["Open_time"])
+        df = df.sort_values("Open_time").drop_duplicates("Open_time").reset_index(drop=True)
+        df["Symbol"] = sym
+        df["seg"] = (df["Open_time"].diff() > CANDLE * 1.5).cumsum()
+        df["t_idx"] = np.arange(len(df))
+        frames[sym] = df
+        print(f"  ✓ {sym}: {len(df):,} candles  "
+              f"{df['Open_time'].iloc[0]:%Y-%m-%d} → {df['Open_time'].iloc[-1]:%Y-%m-%d}  "
+              f"({df['seg'].nunique()} segment(s))")
+    return frames
 
-            if clean_data.empty:
+
+def global_cutoff(frames: dict, train_frac: float) -> pd.Timestamp:
+    all_ts = np.sort(np.concatenate([f["Open_time"].values for f in frames.values()]))
+    return pd.Timestamp(all_ts[int(len(all_ts) * train_frac)])
+
+
+def build_train_matrix(frames: dict, cutoff: pd.Timestamp):
+    """Stack train rows (Open_time < cutoff); lengths = one per (symbol, segment)."""
+    X_parts, lengths = [], []
+    for df in frames.values():
+        tr = df[df["Open_time"] < cutoff]
+        for _, seg_df in tr.groupby("seg", sort=True):
+            if len(seg_df) < 50:                    # ignore tiny fragments
                 continue
+            X_parts.append(seg_df[FEATURE_COLS].values)
+            lengths.append(len(seg_df))
+    return np.vstack(X_parts), lengths
 
-            X_coin = clean_data[feature_cols].values
-            all_X.append(X_coin)
-            sequence_lengths.append(len(X_coin))
 
-            # Store metadata for mapping states back to specific assets later
-            clean_data["Symbol"] = symbol
-            coin_metadata.append(clean_data[["Open_time", "Symbol", "Close"]])
+# ══════════════════════════════════════════════════════════════════════════════
+# Fit / freeze / load
+# ══════════════════════════════════════════════════════════════════════════════
 
-            print(f"  ✓ Loaded {symbol}: {len(X_coin):,} candles")
-        except FileNotFoundError:
-            print(f"  ⚠ Skipping {symbol}: Master data not found.")
+def fit_best_hmm(X, lengths, n_states=N_STATES, n_init=N_INIT) -> GaussianHMM:
+    best, best_ll = None, -np.inf
+    for seed in range(n_init):
+        m = GaussianHMM(n_components=n_states, covariance_type="diag",
+                        n_iter=300, tol=1e-4, random_state=42 + seed)
+        m.fit(X, lengths=lengths)
+        ll = m.score(X, lengths=lengths)
+        print(f"    init {seed}: train log-lik = {ll:,.1f}  "
+              f"(converged={m.monitor_.converged})")
+        if ll > best_ll:
+            best, best_ll = m, ll
+    print(f"  ✓ Best train log-lik: {best_ll:,.1f}")
+    return best
 
-    if not all_X:
-        print("❌ Error: No valid data found for any symbol.")
+
+def canonical_order(model: GaussianHMM) -> np.ndarray:
+    """canon_to_raw[k] = raw state index that becomes canonical state k."""
+    j = FEATURE_COLS.index(CANON_FEATURE)
+    return np.argsort(model.means_[:, j])
+
+
+def state_profile(model: GaussianHMM, canon_to_raw: np.ndarray) -> dict:
+    prof = {}
+    for k, raw in enumerate(canon_to_raw):
+        prof[str(k)] = {
+            "raw_state": int(raw),
+            **{f: round(float(model.means_[raw, i]), 4) for i, f in enumerate(FEATURE_COLS)},
+        }
+    return prof
+
+
+def fit_or_load(frames, cutoff, timeframe=TIMEFRAME, refit=False):
+    model_path, prof_path = _paths(timeframe)
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+    if os.path.exists(model_path) and not refit:
+        art = joblib.load(model_path)
+        print(f"  ✓ Loaded FROZEN model ← {model_path}  "
+              f"(fit {art['fit_utc']}, train cutoff {art['cutoff']})")
+        if pd.Timestamp(art["cutoff"]) != cutoff:
+            print(f"  ⚠ Frozen model's cutoff ({art['cutoff']}) != requested "
+                  f"cutoff ({cutoff}). Evaluating against the FROZEN cutoff.")
+        return art
+
+    X, lengths = build_train_matrix(frames, cutoff)
+    print(f"  Fitting pooled HMM on TRAIN only: {len(X):,} obs, "
+          f"{len(lengths)} sequence(s), cutoff {cutoff}")
+    model = fit_best_hmm(X, lengths)
+    order = canonical_order(model)
+    art = {
+        "model": model,
+        "feature_cols": FEATURE_COLS,
+        "canon_to_raw": order,
+        "raw_to_canon": np.argsort(order),
+        "cutoff": str(cutoff),
+        "timeframe": timeframe,
+        "symbols": list(frames.keys()),
+        "fit_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    joblib.dump(art, model_path)
+    with open(prof_path, "w") as f:
+        json.dump({k: v for k, v in art.items() if k not in ("model", "canon_to_raw", "raw_to_canon")}
+                  | {"state_profile": state_profile(model, order)}, f, indent=2)
+    print(f"  ✓ Saved frozen model → {model_path}\n  ✓ Saved profile      → {prof_path}")
+    return art
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Labelling (causal) + diagnostics
+# ══════════════════════════════════════════════════════════════════════════════
+
+def label_frames(frames: dict, art: dict) -> pd.DataFrame:
+    """
+    Per symbol, per segment: causal filtered posteriors -> hard state (argmax)
+    in CANONICAL numbering, plus a one-off Viterbi state for the look-ahead
+    diagnostic. Filtering runs through train AND test continuously (backward
+    looking only); the caller slices to test for evaluation.
+    """
+    model, r2c = art["model"], art["raw_to_canon"]
+    K = model.n_components
+    out = []
+    for sym, df in frames.items():
+        df = df.copy()
+        post = np.zeros((len(df), K))
+        vit = np.zeros(len(df), dtype=int)
+        for _, idx in df.groupby("seg").indices.items():
+            X = df.iloc[idx][FEATURE_COLS].values
+            post[idx] = forward_filter(model, X)
+            vit[idx] = model.predict(X)                 # DIAGNOSTIC ONLY (look-ahead)
+        canon_post = post[:, art["canon_to_raw"]]       # columns in canonical order
+        df["State"] = canon_post.argmax(1)
+        df["State_Conf"] = canon_post.max(1)
+        df["State_Viterbi"] = r2c[vit]
+        for k in range(K):
+            df[f"P_State_{k}"] = canon_post[:, k]
+        out.append(df)
+    return pd.concat(out, ignore_index=True)
+
+
+def add_forward_returns(df: pd.DataFrame, horizons=HORIZONS) -> pd.DataFrame:
+    """fwd_h = log(Close[t+h] / Close[t]); NaN if the h-th next candle isn't
+    exactly h*CANDLE later (gap) or runs past the end. Never crosses symbols."""
+    parts = []
+    for _, g in df.groupby("Symbol", sort=False):
+        g = g.sort_values("Open_time").copy()
+        for h in horizons:
+            ok = (g["Open_time"].shift(-h) - g["Open_time"]) == CANDLE * h
+            r = np.log(g["Close"].shift(-h) / g["Close"])
+            g[f"fwd_{h}"] = r.where(ok)
+        parts.append(g)
+    return pd.concat(parts, ignore_index=True)
+
+
+def evaluate_states(df: pd.DataFrame, horizons=HORIZONS) -> pd.DataFrame:
+    rows = []
+    for h in horizons:
+        col = f"fwd_{h}"
+        d = df.dropna(subset=[col]).copy()
+        d["ex"] = d[col] - d.groupby("Symbol")[col].transform("mean")
+        sub = d[d["t_idx"] % h == 0]                   # non-overlapping subsample
+        groups = [g["ex"].values for _, g in sub.groupby("State") if len(g) > 5]
+        kw_p = stats.kruskal(*groups).pvalue if len(groups) >= 2 else np.nan
+        for s, g in d.groupby("State"):
+            gs = sub[sub["State"] == s]["ex"]
+            t = (gs.mean() / (gs.std(ddof=1) / np.sqrt(len(gs)))) if len(gs) > 5 else np.nan
+            rows.append({
+                "horizon": h, "state": s, "n": len(g), "n_nonoverlap": len(gs),
+                "mean_bps": g[col].mean() * 1e4,
+                "excess_bps": g["ex"].mean() * 1e4,
+                "median_bps": g[col].median() * 1e4,
+                "hit_rate": (g[col] > 0).mean(),
+                "t_excess": t,
+                "KW_p_all_states": kw_p,
+            })
+    return pd.DataFrame(rows)
+
+
+def dwell_times(df: pd.DataFrame, K: int) -> pd.Series:
+    runs = {k: [] for k in range(K)}
+    for _, g in df.groupby(["Symbol", "seg"]):
+        s = g.sort_values("Open_time")["State"].values
+        if len(s) == 0:
+            continue
+        start = 0
+        for i in range(1, len(s) + 1):
+            if i == len(s) or s[i] != s[start]:
+                runs[s[start]].append(i - start)
+                start = i
+    return pd.Series({k: (np.mean(v) if v else np.nan) for k, v in runs.items()},
+                     name="avg_dwell_candles")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_pooled_hmm(train_frac=0.70, refit=False, primary_h=6, timeframe=TIMEFRAME,
+                   frozen_data=True):
+    print(f"\n{'=' * 64}\n  POOLED HMM — STEP 1: OUT-OF-SAMPLE STATE CHECK\n{'=' * 64}")
+    frames = load_symbol_frames(SYMBOLS, timeframe, frozen=frozen_data)
+    if not frames:
+        print("❌ No data loaded.")
         return
 
-    # Stack all observations into a massive unified matrix
-    X_pooled = np.vstack(all_X)
-    master_meta_df = pd.concat(coin_metadata, ignore_index=True)
+    cutoff = global_cutoff(frames, train_frac)
+    print(f"\n  Global train/test cutoff: {cutoff}  (train_frac={train_frac})")
 
-    print(
-        f"\n  Fitting Pooled GaussianHMM on {len(X_pooled):,} total observations across {len(sequence_lengths)} assets...")
+    art = fit_or_load(frames, cutoff, timeframe, refit=refit)
+    cutoff = pd.Timestamp(art["cutoff"])                # trust the frozen cutoff
+    model = art["model"]
+    K = model.n_components
 
-    # 2. Fit the Pooled HMM using 'lengths'
-    n_states = 4
-    model = GaussianHMM(
-        n_components=4,
-        covariance_type="diag",  # Changed from "full" to "diag"
-        n_iter=300,
-        random_state=42
-    )
-    model.fit(X_pooled, lengths=sequence_lengths)
+    print("\n  [Canonical state profile — TRAIN-fit means]")
+    print(pd.DataFrame(state_profile(model, art["canon_to_raw"])).T.drop(columns="raw_state")
+          .round(3).to_string())
 
-    # 3. Decode the hidden states across the entire pooled dataset
-    pooled_hidden_states = model.predict(X_pooled)
-    master_meta_df["Hidden_State"] = pooled_hidden_states
-    master_meta_df[feature_cols] = X_pooled
+    print("\n  [Transition matrix, canonical order]")
+    o = art["canon_to_raw"]
+    print(pd.DataFrame(model.transmat_[np.ix_(o, o)],
+                       index=[f"S{i}" for i in range(K)],
+                       columns=[f"S{i}" for i in range(K)]).round(3).to_string())
 
-    # 4. Display Generalized Transition Matrix
-    print(f"\n  [Universal Transition Probability Matrix (A)]")
-    transmat_df = pd.DataFrame(
-        model.transmat_,
-        index=[f"State_{i}" for i in range(n_states)],
-        columns=[f"State_{j}" for j in range(n_states)]
-    )
-    print(transmat_df.round(4).to_string())
+    # Causal labels over the full series, then split
+    lab = add_forward_returns(label_frames(frames, art))
+    train = lab[lab["Open_time"] < cutoff]
+    test = lab[lab["Open_time"] >= cutoff]
+    print(f"\n  Train rows: {len(train):,}   Test rows: {len(test):,}")
 
-    # 5. Universal State Characterization
-    print(f"\n  [Universal State Characterisation (Mean Feature Values Across All Coins)]")
-    state_means = master_meta_df.groupby("Hidden_State")[feature_cols].mean()
-    print(state_means.round(3).to_string())
+    # Diagnostics
+    print("\n  [State occupancy (causal)]  train vs test")
+    occ = pd.concat([train["State"].value_counts(normalize=True).sort_index().rename("train"),
+                     test["State"].value_counts(normalize=True).sort_index().rename("test")], axis=1)
+    print(occ.round(3).to_string())
+    print("\n  [Average dwell time, test, in candles]  (low => flickering)")
+    print(dwell_times(test, K).round(1).to_string())
+    agree = (test["State"] == test["State_Viterbi"]).mean()
+    print(f"\n  Causal vs Viterbi agreement on test: {agree:.1%}  "
+          f"(gap from 100% = how much look-ahead was changing your labels)")
 
-    # Save the generalized cross-asset dataset
-    output_path = "data/processed/universal_crypto_pooled_hmm_states.csv"
-    master_meta_df.to_csv(output_path, index=False)
-    print(f"\n  ✓ Saved universal state-labeled dataset to {output_path}")
+    # The actual question
+    ev_test = evaluate_states(test)
+    ev_train = evaluate_states(train)
+    show = ["horizon", "state", "n", "n_nonoverlap", "mean_bps", "excess_bps",
+            "hit_rate", "t_excess", "KW_p_all_states"]
+    print(f"\n{'─' * 64}\n  OUT-OF-SAMPLE (test) — forward returns by causal state\n{'─' * 64}")
+    print(ev_test[show].round(3).to_string(index=False))
+    print(f"\n{'─' * 64}\n  IN-SAMPLE (train) — for comparison only\n{'─' * 64}")
+    print(ev_train[show].round(3).to_string(index=False))
+
+    # Per-symbol consistency at the primary horizon
+    col = f"fwd_{primary_h}"
+    d = test.dropna(subset=[col]).copy()
+    d["ex"] = d[col] - d.groupby("Symbol")[col].transform("mean")
+    piv = (d.pivot_table(index="Symbol", columns="State", values="ex", aggfunc="mean") * 1e4)
+    piv.columns = [f"S{c}" for c in piv.columns]
+    print(f"\n{'─' * 64}\n  Per-symbol excess return (bps), test, horizon={primary_h} candles\n"
+          f"  (an edge worth trusting has the SAME sign pattern across most symbols)\n{'─' * 64}")
+    print(piv.round(1).to_string())
+
+    # Compact pass/fail read at the primary horizon
+    p = ev_test[ev_test["horizon"] == primary_h]
+    print(f"\n{'─' * 64}\n  READ (horizon={primary_h}): "
+          f"KW p={p['KW_p_all_states'].iloc[0]:.4f}  |  "
+          f"excess spread best-worst = {p['excess_bps'].max() - p['excess_bps'].min():.1f} bps\n"
+          f"  Proceed to the next step only if: spread is economically meaningful vs costs,\n"
+          f"  |t| is large for at least one state on non-overlapping data, the pattern\n"
+          f"  holds across symbols, AND it survives from train to test (same sign/order).\n{'─' * 64}")
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    ev_test.to_csv(os.path.join(OUT_DIR, "hmm_oos_eval_test.csv"), index=False)
+    ev_train.to_csv(os.path.join(OUT_DIR, "hmm_oos_eval_train.csv"), index=False)
+    keep = ["Open_time", "Symbol", "Close", "State", "State_Conf", "State_Viterbi"] + \
+           [f"P_State_{k}" for k in range(K)] + [f"fwd_{h}" for h in HORIZONS]
+    lab[keep].assign(Split=np.where(lab["Open_time"] < cutoff, "train", "test")) \
+        .to_csv(os.path.join(OUT_DIR, "universal_crypto_pooled_hmm_states_causal.csv"), index=False)
+    print(f"\n  ✓ Saved eval tables + causal labelled dataset to {OUT_DIR}/")
 
 
 if __name__ == "__main__":
-    run_pooled_hmm()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--refit", action="store_true", help="retrain and overwrite frozen model")
+    ap.add_argument("--train-frac", type=float, default=0.70)
+    ap.add_argument("--primary-horizon", type=int, default=6, choices=HORIZONS)
+    ap.add_argument("--timeframe", default=TIMEFRAME)
+    ap.add_argument("--rescan-raw", action="store_true",
+                    help="let update_master_data() rescan raw files (default: frozen masters)")
+    a = ap.parse_args()
+    run_pooled_hmm(a.train_frac, a.refit, a.primary_horizon, a.timeframe,
+                   frozen_data=not a.rescan_raw)
+
+# Run standard evaluation using the frozen model or fit if missing
+# python pooled_hmm_pipeline.py
+
+# Force a complete retrain of the pooled model and update the frozen artifacts
+# python pooled_hmm_pipeline.py --refit
+
+# Adjust the training split fraction or test a different primary horizon (e.g., 12 candles)
+# python pooled_hmm_pipeline.py --train-frac 0.75 --primary-horizon 12
