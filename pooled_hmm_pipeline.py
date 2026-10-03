@@ -4,40 +4,29 @@ pooled_hmm_pipeline.py
 Pooled GaussianHMM across symbols — STEP 1: do the states predict anything
 out-of-sample?
 
-What changed vs. the previous revision
-──────────────────────────────────────
-1. NO LOOK-AHEAD. States are produced by the forward (filtering) algorithm,
-   alpha_t = P(s_t | x_1..x_t), never model.predict() / predict_proba().
-   `forward_filter()` / `filter_step()` are the same code a live loop will use.
-   Viterbi is still computed ONCE, purely as a diagnostic to show how much it
-   flatters the labels.
-2. FIT ONCE, THEN FREEZE. The fitted model + feature list + canonical state
-   map + train cutoff are saved to models/pooled_hmm_<tf>.joblib (+ a JSON
-   profile). Re-runs LOAD the artifact; pass --refit to deliberately retrain.
-   States are canonicalised (sorted by the mean of MeanDev_Scaled) so the
-   index has a deterministic meaning even if you do refit.
-3. OUT-OF-SAMPLE. One GLOBAL calendar cutoff (default: 70th percentile of all
-   timestamps) is applied to every symbol, so no symbol trains on a period
-   another symbol is tested on (crypto is highly correlated, so per-symbol
-   splits would leak). The model is fit on train rows only. Filtering runs
-   continuously through train -> test (it only ever looks backwards), and
-   evaluation uses test rows only.
-4/5. (Live inference + warm-up are NOT in this step.) `forward_filter` /
-   `filter_step` / `emission_logprob` have no dependency on update_master_data
-   and take plain arrays, so the live path can import them directly.
+CHANGES IN THIS REVISION
+────────────────────────
+* Feature set now includes GK_Scaled (Garman-Klass range-based volatility).
+  All features are produced by preprocessing.py as trailing, per-asset
+  rolling z-scores (see that file), so pooled symbols share a comparable
+  "relative to my own recent regime" scale.
+* Frozen-model safety: if a saved artifact was fit on a different feature
+  list than FEATURE_COLS (e.g. the old 6-feature model), loading is refused
+  with a clear message — pass --refit. The old artifact is NOT silently
+  reused with mismatched columns.
+* Data safety: if a processed master lacks any FEATURE_COLS (masters built
+  before this revision), loading fails loudly with rebuild instructions
+  instead of a KeyError deep in pandas.
 
-Evaluation
-──────────
-For each causal state, forward log-returns over several horizons (in candles)
-are measured from the close of candle t (when the state becomes known) to the
-close of candle t+h. We report raw and EXCESS (vs. that symbol's unconditional
-test-period mean) returns. Overlapping windows inflate significance, so
-t-stats and Kruskal-Wallis use non-overlapping subsamples (every h-th candle
-per symbol).
+Unchanged from the previous revision: no look-ahead (forward filtering),
+fit-once-then-freeze, one global calendar train/test cutoff, canonical
+state ordering, non-overlapping-subsample significance tests.
 
 Run:
     python pooled_hmm_pipeline.py                # fit once (or load), evaluate
-    python pooled_hmm_pipeline.py --refit        # force retrain
+    python pooled_hmm_pipeline.py --refit        # force retrain (required once
+                                                 # after this feature change)
+    python pooled_hmm_pipeline.py --rescan-raw   # rebuild masters from raw files
     python pooled_hmm_pipeline.py --train-frac 0.6 --primary-horizon 12
 """
 
@@ -58,7 +47,7 @@ from data.data_manager import update_master_data, SYMBOLS
 # ── Config ────────────────────────────────────────────────────────────────────
 FEATURE_COLS = [
     "RSI_Scaled", "MACD_Scaled", "BB_Scaled",
-    "OBV_Scaled", "ATR_Scaled", "MeanDev_Scaled",
+    "OBV_Scaled", "ATR_Scaled", "GK_Scaled", "MeanDev_Scaled",
 ]
 CANON_FEATURE = "MeanDev_Scaled"        # states are ordered by this feature's mean
 TIMEFRAME     = "4h"
@@ -136,6 +125,16 @@ def load_symbol_frames(symbols, timeframe=TIMEFRAME, frozen=True) -> dict:
         except FileNotFoundError as exc:
             print(f"  ⚠ Skipping {sym}: {exc}")
             continue
+
+        missing = [c for c in FEATURE_COLS if c not in df.columns]
+        if missing:
+            raise RuntimeError(
+                f"Master CSV for {sym}/{timeframe} is missing feature column(s) "
+                f"{missing} — it was built before the rolling-standardization / "
+                f"Garman-Klass change. Rebuild it from raw files "
+                f"(back up the old master first, then run with --rescan-raw)."
+            )
+
         df = df.dropna(subset=FEATURE_COLS).copy()
         if df.empty:
             continue
@@ -210,6 +209,13 @@ def fit_or_load(frames, cutoff, timeframe=TIMEFRAME, refit=False):
 
     if os.path.exists(model_path) and not refit:
         art = joblib.load(model_path)
+        if list(art["feature_cols"]) != list(FEATURE_COLS):
+            raise RuntimeError(
+                f"Frozen model {model_path} was fit on features "
+                f"{list(art['feature_cols'])}, but FEATURE_COLS is now "
+                f"{FEATURE_COLS}. The old model cannot score the new feature "
+                f"set. Re-run with --refit to train and freeze a new one."
+            )
         print(f"  ✓ Loaded FROZEN model ← {model_path}  "
               f"(fit {art['fit_utc']}, train cutoff {art['cutoff']})")
         if pd.Timestamp(art["cutoff"]) != cutoff:
@@ -429,5 +435,5 @@ if __name__ == "__main__":
 # Force a complete retrain of the pooled model and update the frozen artifacts
 # python pooled_hmm_pipeline.py --refit
 
-# Adjust the training split fraction or test a different primary horizon (e.g., 12 candles)
-# python pooled_hmm_pipeline.py --train-frac 0.75 --primary-horizon 12
+# Rebuild masters from raw files, then retrain (needed once after this change)
+# python pooled_hmm_pipeline.py --rescan-raw --refit
