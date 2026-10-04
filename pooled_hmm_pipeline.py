@@ -57,7 +57,7 @@ FEATURE_COLS = [
 CANON_FEATURE = "MeanDev_Scaled"        # states are ordered by this feature's mean
 TIMEFRAME     = "4h"
 CANDLE        = pd.Timedelta(hours=4)
-N_STATES      = 5                       # 5 = room for an explicit low-vol chop state
+N_STATES      = 4                       # 5 = room for an explicit low-vol chop state
 N_INIT        = 5                       # random restarts; best train log-lik wins
 HORIZONS      = (1, 3, 6, 12, 24)       # candles (4h -> 4h, 12h, 1d, 2d, 4d)
 MODEL_DIR     = "models"
