@@ -912,7 +912,7 @@ if __name__ == "__main__":
     ap.add_argument("--extra-features", action="store_true",
                     help=f"also use {OPTIONAL_FEATURES} (must exist in the masters)")
     # 5. covariance
-    ap.add_argument("--cov-type", choices=["diag", "full"], default="diag")
+    ap.add_argument("--cov-type", choices=["diag", "full"], default="full")
     ap.add_argument("--min-covar", type=float, default=1e-3,
                     help="variance floor added/enforced by hmmlearn")
     a = ap.parse_args()
@@ -926,3 +926,20 @@ if __name__ == "__main__":
         wf_train_months=a.wf_train_months, drop_features=tuple(a.drop_features),
         extra_features=a.extra_features, feature_check=a.feature_check, ablate=a.ablate,
     ))
+
+# # Optional: feature diagnostics (train rows only, no model fit)
+# python pooled_hmm_pipeline.py --feature-check
+# python pooled_hmm_pipeline.py --ablate
+#
+# # Fit, freeze, and evaluate the baseline model
+# python pooled_hmm_pipeline.py --refit
+#
+# # Re-evaluate the frozen model with a different confidence threshold (no refit)
+# python pooled_hmm_pipeline.py --conf-threshold 0.8
+#
+# # Walk-forward comparison against the static model
+# python pooled_hmm_pipeline.py --walk-forward
+#
+# # Optional variants (each saves under its own artifact name)
+# python pooled_hmm_pipeline.py --cov-type full --min-covar 1e-3 --refit
+# python pooled_hmm_pipeline.py --sticky 500 --min-dwell 2 --refit
