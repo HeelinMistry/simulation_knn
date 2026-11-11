@@ -1,9 +1,0 @@
-
-numpy
-pandas
-matplotlib
-arcade
-requests
-torch
-scipy
-binance-bulk-downloader
