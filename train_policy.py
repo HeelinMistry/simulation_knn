@@ -21,10 +21,15 @@ FIXES vs. the Phase-3 sketch
  * Soft target was softmax over ALL actions, including illegal ones, and
    log_softmax of masked logits is ~ -3e38 there -> exploding loss. Target is now
    softmax over legal actions only.
- * Symbol / timeframe embeddings are OFF by default. Unseen coins / timeframes would
-   hit an untrained embedding row at test time, which defeats zero-shot evaluation
-   (features are already hour-denominated and per-asset scaled). Opt in with
-   --use-symbol-emb / --use-tf-emb.
+ * NO COIN IDENTITY. The symbol embedding was removed permanently: a universal policy
+   cannot depend on a lookup table of coin ids (an unseen coin has none). Anything the
+   model needs to know about a coin (volatility, liquidity, trendiness) must come from
+   trailing unit-free features (RealVol_Scaled, GK_Scaled, TakerImb_Scaled, ...).
+   The timeframe embedding stays opt-in (--use-tf-emb); only use it when every target
+   timeframe (15m / 1h / 4h) is in --train-tfs.
+ * ENTRY CONFIDENCE THRESHOLD (--buy-threshold, default 0.60). The backtest only opens a
+   position when the policy's probability over legal actions is >= threshold; otherwise it
+   stays flat. Exits and holds are never gated. Pick it on val, never on test.
  * Receptive field: dilated causal convolutions (1,2,4,8 => 31 candles) instead of
    two k=3 layers (5 candles).
 
@@ -58,7 +63,7 @@ import torch.nn.functional as F
 
 from data.preprocessing import timeframe_hours
 from data.torch_dataset import (
-    BUY, CLOSE, SELL, SYMBOL_IDS, TF_IDS, TIMEFRAMES,
+    BUY, CLOSE, SELL, TF_IDS, TIMEFRAMES,
     action_mask, apply_action_mask, load_frames, make_dataloaders,
     make_splits, n_actions, to_device,
 )
@@ -89,11 +94,9 @@ class CausalBlock(nn.Module):
 class UniversalTradingPolicy(nn.Module):
     def __init__(self, num_features: int, n_actions: int = 3, d_model: int = 128,
                  dilations=(1, 2, 4, 8), kernel: int = 3, dropout: float = 0.1,
-                 use_tf_emb: bool = False, use_symbol_emb: bool = False,
-                 num_timeframes: int = len(TIMEFRAMES), num_symbols: int = len(SYMBOL_IDS),
-                 seen_symbols=(), sym_drop: float = 0.3):
+                 use_tf_emb: bool = False, num_timeframes: int = len(TIMEFRAMES)):
         super().__init__()
-        self.use_tf_emb, self.use_symbol_emb = use_tf_emb, use_symbol_emb
+        self.use_tf_emb = use_tf_emb
         self.proj = nn.Linear(num_features, d_model)
         self.blocks = nn.ModuleList(CausalBlock(d_model, kernel, d, dropout) for d in dilations)
         self.pos_emb = nn.Embedding(3, 16)                       # position -1/0/+1
@@ -101,36 +104,18 @@ class UniversalTradingPolicy(nn.Module):
         if use_tf_emb:
             self.tf_emb = nn.Embedding(num_timeframes, 16)
             ctx += 16
-        if use_symbol_emb:
-            # last row = UNK. Coins not in `seen_symbols` always map to UNK, and during training
-            # a fraction `sym_drop` of samples is also mapped to UNK, so UNK is a trained row and
-            # unseen coins (XRP/LTC) do not hit a random-init embedding.
-            self.sym_emb = nn.Embedding(num_symbols + 1, 16)
-            seen = torch.zeros(num_symbols, dtype=torch.bool)
-            if len(seen_symbols):
-                seen[list(seen_symbols)] = True
-            self.register_buffer("seen_sym", seen)
-            self.unk, self.sym_drop = num_symbols, float(sym_drop)
-            ctx += 16
         self.head = nn.Sequential(
             nn.Linear(2 * d_model + ctx, 128), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(128, n_actions))
 
-    def forward(self, x, tf_id, position, sym_id=None):
-        """x [B,L,F], tf_id [B], position [B] in {-1,0,1}, sym_id [B] -> logits [B,A]."""
+    def forward(self, x, tf_id, position):
+        """x [B,L,F], tf_id [B], position [B] in {-1,0,1} -> logits [B,A]. No coin identity."""
         h = self.proj(x).transpose(1, 2)                         # [B, d, L]
         for blk in self.blocks:
             h = blk(h)
         feats = [h[:, :, -1], h.mean(dim=2), self.pos_emb(position + 1)]
         if self.use_tf_emb:
             feats.append(self.tf_emb(tf_id))
-        if self.use_symbol_emb:
-            sid = sym_id.clamp(min=0)
-            unk = torch.full_like(sid, self.unk)
-            sid = torch.where(self.seen_sym[sid] & (sym_id >= 0), sid, unk)
-            if self.training and self.sym_drop > 0:
-                sid = torch.where(torch.rand(sid.shape, device=sid.device) < self.sym_drop, unk, sid)
-            feats.append(self.sym_emb(sid))
         return self.head(torch.cat(feats, dim=-1))
 
 
@@ -154,8 +139,8 @@ def expected_value(logits: torch.Tensor, batch: dict) -> torch.Tensor:
     return (p * batch["action_values"]).sum(-1).mean()
 
 
-def _forward(model, batch, use_sym):
-    return model(batch["x"], batch["tf_id"], batch["position"], batch["sym_id"])
+def _forward(model, batch):
+    return model(batch["x"], batch["tf_id"], batch["position"])   # batch["sym_id"] deliberately unused
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -166,11 +151,17 @@ STATES = {False: [0, 1], True: [0, 1, -1]}
 
 
 @torch.no_grad()
-def predict_actions(model, ds, device, allow_short: bool, amp: bool, bs: int = 2048) -> dict:
+def predict_actions(model, ds, device, allow_short: bool, amp: bool, bs: int = 2048,
+                    entry_threshold: float = 0.0) -> dict:
     """
     Greedy (argmax over legal actions) action for EVERY anchor and EVERY position state,
     batched. The sequential state machine then runs on these tables, so the backtest needs
     no per-step forward pass. Returns {series_index: (anchor_rows, acts[n, n_states])}.
+
+    entry_threshold (hysteresis): a NEW entry (BUY from a non-long state, SELL from a
+    non-short state) is only taken if its probability over legal actions is >= threshold;
+    otherwise the action is downgraded to CLOSE (stay flat / exit). Holding an existing
+    position is never gated. 0.0 = plain argmax (original behaviour).
     """
     model.eval()
     states = STATES[allow_short]
@@ -186,14 +177,19 @@ def predict_actions(model, ds, device, allow_short: bool, amp: bool, bs: int = 2
             tt = torch.from_numpy(rows[a:a + bs]).to(device)
             x = X[tt[:, None] + offs]
             tf = torch.full((len(tt),), TF_IDS[s.timeframe], dtype=torch.long, device=device)
-            sy = torch.full((len(tt),), SYMBOL_IDS.get(s.symbol, 0), dtype=torch.long, device=device)
             for si, p in enumerate(states):
                 pos = torch.full((len(tt),), p, dtype=torch.long, device=device)
                 with torch.autocast(device_type=device.type, dtype=torch.float16,
                                     enabled=amp and device.type == "cuda"):
-                    logits = model(x, tf, pos, sy)
+                    logits = model(x, tf, pos)
                 logits = apply_action_mask(logits.float(), action_mask(pos, allow_short))
-                acts[a:a + bs, si] = logits.argmax(-1).cpu().numpy()
+                act = logits.argmax(-1)
+                if entry_threshold > 0.0:
+                    conf = F.softmax(logits, dim=-1).gather(-1, act[:, None]).squeeze(-1)
+                    entering = ((act == BUY) & (p != 1)) | ((act == SELL) & allow_short & (p != -1))
+                    act = torch.where(entering & (conf < entry_threshold),
+                                      torch.full_like(act, CLOSE), act)
+                acts[a:a + bs, si] = act.cpu().numpy()
         out[j] = (rows, acts)
     return out
 
@@ -246,7 +242,8 @@ def perf(rets: np.ndarray, ppy: float) -> dict:
 
 def backtest(model, ds, frames, device, args, label: str = "") -> pd.DataFrame:
     """Per-series strategy vs buy-and-hold table."""
-    preds = predict_actions(model, ds, device, args.allow_short, args.amp)
+    preds = predict_actions(model, ds, device, args.allow_short, args.amp,
+                            entry_threshold=getattr(args, "buy_threshold", 0.0))
     cost_side = (args.fee_bps + args.slippage_bps) / 1e4
     recs = []
     for j, (rows, acts) in preds.items():
@@ -289,7 +286,7 @@ def train_one_epoch(model, loader, opt, sched, scaler, device, args) -> dict:
         batch = to_device(batch, device)
         with torch.autocast(device_type=device.type, dtype=torch.float16,
                             enabled=args.amp and device.type == "cuda"):
-            logits = _forward(model, batch, args.use_symbol_emb)
+            logits = _forward(model, batch)
         loss = policy_loss(logits, batch, args.temp)
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -311,7 +308,7 @@ def eval_loss(model, loader, device, args) -> dict:
         batch = to_device(batch, device)
         with torch.autocast(device_type=device.type, dtype=torch.float16,
                             enabled=args.amp and device.type == "cuda"):
-            logits = _forward(model, batch, args.use_symbol_emb)
+            logits = _forward(model, batch)
         b = len(batch["x"])
         ls += policy_loss(logits, batch, args.temp).item() * b
         ev += expected_value(logits, batch).item() * b
@@ -330,7 +327,7 @@ def set_seed(seed: int) -> None:
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
-def parse_args():
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     d = make_splits.__defaults__  # noqa: F841  (defaults documented in torch_dataset)
     p.add_argument("--train-symbols", nargs="+", default=["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "ADAUSDT"])
@@ -346,13 +343,17 @@ def parse_args():
     p.add_argument("--slippage-bps", type=float, default=5.0)
     p.add_argument("--allow-short", action="store_true")
     p.add_argument("--p-in-position", type=float, default=0.5)
+    p.add_argument("--buy-threshold", type=float, default=0.60,
+                   help="min probability (over legal actions) to OPEN a position in the backtest "
+                        "(entry hysteresis): below it the policy stays flat, so the round-trip "
+                        "cost is only paid on high-conviction entries. Exits/holds are never "
+                        "gated. 0 = plain argmax. Applies to val-Sharpe checkpoint selection "
+                        "too. Choose it on val, never on test.")
     # model
     p.add_argument("--d-model", type=int, default=64)
     p.add_argument("--dropout", type=float, default=0.3)
-    p.add_argument("--use-tf-emb", action="store_true")
-    p.add_argument("--use-symbol-emb", action="store_true")
-    p.add_argument("--sym-drop", type=float, default=0.3,
-                   help="prob. of replacing the symbol id by UNK during training")
+    p.add_argument("--use-tf-emb", action="store_true",
+                   help="timeframe embedding; only valid when all target timeframes are in --train-tfs")
     # optimisation
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=256)
@@ -367,7 +368,21 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", default=None)
-    return p.parse_args()
+    return p
+
+
+def check_args(args) -> None:
+    if not 0.0 <= args.buy_threshold < 1.0:
+        raise SystemExit("--buy-threshold must be in [0, 1).")
+    if args.use_tf_emb and args.test_tfs:
+        raise SystemExit("--use-tf-emb with held-out --test-tfs would hit untrained timeframe "
+                         "embeddings; drop --use-tf-emb or train on every target timeframe.")
+
+
+def parse_args(argv=None):
+    args = build_parser().parse_args(argv)
+    check_args(args)
+    return args
 
 
 def main():
@@ -400,9 +415,7 @@ def main():
     # ── model / optimiser ─────────────────────────────────────────────────────
     model = UniversalTradingPolicy(
         datasets["train"].num_features, n_actions=n_actions(args.allow_short), d_model=args.d_model,
-        dropout=args.dropout, use_tf_emb=args.use_tf_emb, use_symbol_emb=args.use_symbol_emb,
-        seen_symbols=[SYMBOL_IDS[s] for s in args.train_symbols if s in SYMBOL_IDS],
-        sym_drop=args.sym_drop).to(device)
+        dropout=args.dropout, use_tf_emb=args.use_tf_emb).to(device)
     print(f"model params: {sum(p.numel() for p in model.parameters()):,}")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     total_steps = max(1, args.epochs * len(loaders["train"]))
@@ -472,4 +485,7 @@ def main():
 if __name__ == "__main__":
     main()
 
-#  python train_policy.py --cutoff 2025-06-01 --val-cutoff 2025-01-01 --epochs 30 --use-symbol-emb --use-tf-emb
+# walk-forward, no coin identity, entry threshold 0.60 (all of 15m/1h/4h are trained on):
+# python train_ensemble.py --walk-forward --wf-first-cutoff 2025-06-01 --wf-end 2026-11-01 \
+#     --wf-step-months 3 --wf-test-months 3 --wf-val-months 6 --epochs 30 --use-tf-emb \
+#     --seeds 0 1 2 --buy-threshold 0.6 --out-dir runs/wf_thr60
